@@ -12,3 +12,7 @@ AndroidApp/*.iml
 # Local working notes (contain local filesystem paths, keep local only)
 修改建议*.md
 技术架构*.md
+ 
+# Arduino build artifacts
+build/
+.build_tools/

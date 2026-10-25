@@ -79,7 +79,7 @@
   - **扫描页**：展示 SSID、BSSID、信道、RSSI 与 `2.4G`/`5G` 频段徽章，支持多选目标。
   - **控制页**：涵盖 Deauth、Disassoc、Beacon/Probe Flood、Signal Jam、嗅探克隆、10s/30s/60s 定时测试与一键急停，**运行中项目实时绿色高亮**。
   - **抓包页**：实时滚动展示空中捕获的 802.11 帧日志，顶部支持一键切换过滤模式（`ALL` / `Beacon` / `Probe` / `Deauth` / `EAPOL`）及信道跳频开关。
-  - **设置页**：连接状态管理，以及 LED 指示灯、每次发送帧数、循环间隔、扫描时长、起始信道、攻击间隔重扫的**双向实时同步配置面板**。
+  - **设置页**：连接状态管理、**设备身份伪装（自定义 BLE 蓝牙广播名称、Wi-Fi 热点 SSID 与 WPA2 密码，支持 `<FlashMemory.h>` 掉电记忆与一键恢复默认）**，以及 WebUI 隐身开关、LED 指示灯、每次发送帧数、循环间隔、扫描时长、起始信道、攻击间隔重扫的**双向实时同步配置面板**。
 
 ---
 
@@ -100,8 +100,9 @@
 | `scan_begin` | 扫描开始或同步列表前 | `{"t":"scan_begin"}` |
 | `ap` | 逐条推送热点信息 | `i`: 索引, `s`: SSID, `b`: BSSID, `c`: 信道, `r`: RSSI |
 | `scan_end` | 热点列表推送完成 | `n`: 热点总数 |
-| `st` | 每 1 秒状态心跳 | `atk`/`dis`/`bcn`/`prb`/`jam`/`snf`: 攻击态, `snfOn`: 嗅探态, `hop`: 跳频态, `ch`: 当前信道, `ok`/`fail`: TX 计数 |
-| `cfg` | 连接同步或参数修改后 | `delay`: 循环间隔, `scan`: 扫描时长, `frames`: 帧数, `ch`: 起始信道, `sc`: 间隔重扫, `led`: LED 开关 |
+| `st` | 每 1 秒状态心跳或状态变更时 | `atk`/`dis`/`bcn`/`prb`/`jam`/`snf`: 攻击态, `snfOn`: 嗅探态, `sMode`: 过滤模式, `hop`: 跳频态, `ch`: 当前信道, `ok`/`fail`: TX 计数 |
+| `cfg` | 连接同步或参数修改后 | `delay`: 循环间隔, `scan`: 扫描时长, `frames`: 帧数, `ch`: 起始信道, `sc`: 间隔重扫, `led`: LED 开关, `ap`: 热点开关 |
+| `id` | 连接同步或名称/密码修改后 | `ssid`: 当前 Wi-Fi 热点名称, `pass`: 当前 Wi-Fi 密码, `ble`: 当前 BLE 蓝牙名称 |
 | `log` | 混杂模式捕获到报文时 | `m`: 抓包日志文本（25ms 节流推送 + 安全长度裁剪） |
 
 **下行指令（手机 → 板子，UTF-8 文本以 `\n` 结尾，与串口完全相同）**：
@@ -117,9 +118,11 @@ beacon_flood          probe_flood           signal_jam            deauth_sniff
 # 混杂模式嗅探与跳频
 start sniff           sniff all|beacon|probe|deauth|eapol|pwnagotchi
 stop sniff            hop on                hop off               set ch <channel>
-# 参数配置（修改后自动回推最新 cfg）
-set target <i,j,k>    set num_frames <n>    set cycle_delay <ms>  set scan_time <ms>
-set start_channel <c> set scan_cycles on|off                      set led on|off
+# 参数配置（修改后自动写入 Flash 并回推最新 cfg / id）
+set target <i,j,k|all> set num_frames <n>   set cycle_delay <ms>  set scan_time <ms>
+set start_channel <c> set scan_cycles on|off  set led on|off      ap on|off
+# 设备身份伪装与重置（掉电记忆）
+set ble_name <name>   set ap_ssid <ssid>    set ap_pass <pass>    reset_config
 # 统计管理
 tx_stats              reset_txstats
 ```
@@ -150,13 +153,19 @@ tx_stats              reset_txstats
 WiFi-Deck/
 ├── WiFi-Deck.ino              # RTL8720DN 主固件（802.11 注入/嗅探 + BLE NUS 服务 + WebUI + 串口）
 ├── AndroidApp/                # Android 原生客户端 (Kotlin + Jetpack Compose + MVVM)
-│   └── app/src/main/java/com/example/wifideck/
+│   └── app/src/main/java/io/github/xiangwen/wifideck/
 │       ├── data/
 │       │   ├── BleManager.kt  # BLE 扫描/连接/MTU 协商/串行发送队列/JSON Lines 分帧器
 │       │   └── Models.kt      # ApItem / DeviceStatus / DeviceConfig 数据模型
 │       ├── ui/
-│       │   ├── MainViewModel.kt # 状态管理与指令封装
-│       │   └── MainScreen.kt    # Compose 暗色主题四标签页 UI
+│       │   ├── theme/DeckColors.kt          # 战术暗色主题色板与信号强度映射
+│       │   ├── components/CommonComponents.kt # 顶部实时遥测仪表盘、状态徽章与战术卡片组件
+│       │   ├── tabs/ScanTab.kt              # 雷达扫描页（搜索/频段统计/信号质量条/目标速跳）
+│       │   ├── tabs/ControlTab.kt           # 战术控制页（目标概览/TX统计/2x2网格/定时与急停）
+│       │   ├── tabs/SniffTab.kt             # 抓包终端页（协议着色/信道锁定/滚屏锁/一键复制）
+│       │   ├── tabs/SettingsTab.kt          # 参数配置页（隐身开关/分段调参/CLI指令直发终端）
+│       │   ├── MainViewModel.kt             # 状态流管理与指令封装
+│       │   └── MainScreen.kt                # Scaffold 导航骨架与全局通知
 │       └── MainActivity.kt    # 动态权限申请与自动扫描入口
 ├── LICENSE                    # MIT 开源许可证
 └── README.md
@@ -172,6 +181,7 @@ WiFi-Deck/
 - **v1.3**: 合并上游 v1.0.3 特性（Sequence Number 轮换、Duration 修正、TX 统计、Beacon/Probe Flood、Signal Jam、Deauth Sniff-and-Clone）。
 - **v1.4**: 新增 BLE 5.0 Nordic UART Service 通道与 Android 原生 Jetpack Compose 客户端，确立三通道统一控制架构。
 - **v1.5**: 完善 BLE 8 槽位命令环形队列、永久广播标志、Android 8.0~13+ 全版本兼容、40ms 串行 GATT 写队列、扫描/连接超时协程管控，并补齐 App 控制页运行态高亮、抓包页过滤/跳频/自动滚屏及设置页双向实时调参面板。
+- **v1.6**: 优化双频信道跳频边界与非嗅探态混杂模式保护，支持 UTF-8 中文 SSID 解析、双频全信道 Signal Jam 轮询及 `ap on/off` 热点开关；Android 端新增频段筛选、RSSI 排序、全选操作与抓包日志复制。
 
 ---
 

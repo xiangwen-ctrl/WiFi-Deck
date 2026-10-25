@@ -1,14 +1,19 @@
-package com.example.wifideck.ui
+package io.github.xiangwen.wifideck.ui
 
 import androidx.lifecycle.ViewModel
-import com.example.wifideck.data.ApItem
-import com.example.wifideck.data.BleManager
-import com.example.wifideck.data.DeviceConfig
-import com.example.wifideck.data.DeviceStatus
+import androidx.lifecycle.viewModelScope
+import io.github.xiangwen.wifideck.data.ApItem
+import io.github.xiangwen.wifideck.data.BleManager
+import io.github.xiangwen.wifideck.data.DeviceConfig
+import io.github.xiangwen.wifideck.data.DeviceStatus
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
 import org.json.JSONObject
+
+enum class BandFilter { ALL, G24, G5 }
+enum class SortMode { RSSI, CHANNEL }
 
 class MainViewModel : ViewModel() {
 
@@ -32,12 +37,32 @@ class MainViewModel : ViewModel() {
     private val _selected = MutableStateFlow<Set<Int>>(emptySet())
     val selected: StateFlow<Set<Int>> = _selected
 
+    private val _bandFilter = MutableStateFlow(BandFilter.ALL)
+    val bandFilter: StateFlow<BandFilter> = _bandFilter
+
+    private val _sortMode = MutableStateFlow(SortMode.RSSI)
+    val sortMode: StateFlow<SortMode> = _sortMode
+
+    private val _searchQuery = MutableStateFlow("")
+    val searchQuery: StateFlow<String> = _searchQuery
+
+    private val _autoScroll = MutableStateFlow(true)
+    val autoScroll: StateFlow<Boolean> = _autoScroll
+
     private val _toast = MutableStateFlow<String?>(null)
     val toast: StateFlow<String?> = _toast
 
     init {
         BleManager.onLine = ::handleLine
         BleManager.onScanError = { msg -> showToast(msg) }
+        viewModelScope.launch {
+            BleManager.connectionState.collect { state ->
+                if (state == BleManager.ConnectionState.DISCONNECTED) {
+                    _scanning.value = false
+                    _status.value = DeviceStatus()
+                }
+            }
+        }
     }
 
     private fun handleLine(line: String) {
@@ -71,6 +96,7 @@ class MainViewModel : ViewModel() {
                         signalJam = obj.optInt("jam") != 0,
                         deauthSniff = obj.optInt("snf") != 0,
                         sniffing = obj.optInt("snfOn") != 0,
+                        sniffMode = obj.optInt("sMode", 6),
                         hopping = obj.optInt("hop") != 0,
                         channel = obj.optInt("ch"),
                         txOk = obj.optLong("ok"),
@@ -78,14 +104,26 @@ class MainViewModel : ViewModel() {
                     )
                 }
                 "cfg" -> {
-                    _config.value = DeviceConfig(
-                        cycleDelayMs = obj.optLong("delay"),
-                        scanTimeMs = obj.optLong("scan"),
-                        numSendFrames = obj.optInt("frames"),
-                        startChannel = obj.optInt("ch"),
-                        scanBetweenCycles = obj.optInt("sc") != 0,
-                        ledEnabled = obj.optInt("led") != 0
-                    )
+                    _config.update {
+                        it.copy(
+                            cycleDelayMs = obj.optLong("delay"),
+                            scanTimeMs = obj.optLong("scan"),
+                            numSendFrames = obj.optInt("frames"),
+                            startChannel = obj.optInt("ch"),
+                            scanBetweenCycles = obj.optInt("sc") != 0,
+                            ledEnabled = obj.optInt("led") != 0,
+                            apEnabled = obj.optInt("ap", 1) != 0
+                        )
+                    }
+                }
+                "id" -> {
+                    _config.update {
+                        it.copy(
+                            apSsid = obj.optString("ssid", it.apSsid),
+                            apPass = obj.optString("pass", it.apPass),
+                            bleName = obj.optString("ble", it.bleName)
+                        )
+                    }
                 }
                 "log" -> {
                     val msg = obj.optString("m")
@@ -110,8 +148,43 @@ class MainViewModel : ViewModel() {
         _selected.value = if (cur.contains(index)) cur - index else cur + index
     }
 
+    fun setBandFilter(f: BandFilter) {
+        _bandFilter.value = f
+    }
+
+    fun setSortMode(s: SortMode) {
+        _sortMode.value = s
+    }
+
+    fun setSearchQuery(q: String) {
+        _searchQuery.value = q
+    }
+
+    fun toggleAutoScroll() {
+        _autoScroll.value = !_autoScroll.value
+    }
+
     fun clearSelection() {
         _selected.value = emptySet()
+    }
+
+    fun selectAll() {
+        val filter = _bandFilter.value
+        val query = _searchQuery.value.trim().lowercase()
+        _selected.value = _apList.value
+            .filter { ap ->
+                val bandMatch = when (filter) {
+                    BandFilter.ALL -> true
+                    BandFilter.G24 -> ap.channel < 36
+                    BandFilter.G5 -> ap.channel >= 36
+                }
+                val queryMatch = query.isEmpty() ||
+                    ap.ssid.lowercase().contains(query) ||
+                    ap.bssid.lowercase().contains(query)
+                bandMatch && queryMatch
+            }
+            .map { it.index }
+            .toSet()
     }
 
     fun clearLogs() {
@@ -126,6 +199,10 @@ class MainViewModel : ViewModel() {
     }
 
     fun sendStartDeauth() {
+        if (_status.value.attackEnabled) {
+            sendStopAll()
+            return
+        }
         if (_selected.value.isEmpty()) {
             showToast("请先在扫描页选择至少一个目标")
             return
@@ -135,6 +212,10 @@ class MainViewModel : ViewModel() {
     }
 
     fun sendDisassoc() {
+        if (_status.value.disassocEnabled) {
+            sendStopAll()
+            return
+        }
         if (_selected.value.isEmpty()) {
             showToast("请先在扫描页选择至少一个目标")
             return
@@ -144,15 +225,27 @@ class MainViewModel : ViewModel() {
     }
 
     fun sendRandomAttack() {
+        if (_apList.value.isEmpty()) {
+            showToast("请先扫描周围 Wi-Fi 网络")
+            return
+        }
         BleManager.sendCommand("random_attack")
+        showToast("已触发随机信道抽样测试")
     }
 
     fun sendStopAll() {
         BleManager.sendCommand("stop")
+        showToast("已发送停止指令")
     }
 
     fun sendTimedAttack(durationMs: Long) {
+        if (_selected.value.isEmpty()) {
+            showToast("请先在扫描页选择至少一个目标")
+            return
+        }
+        applyTargets()
         BleManager.sendCommand("attack_time $durationMs")
+        showToast("已启动 ${durationMs / 1000} 秒定时测试")
     }
 
     fun sendBeaconFlood() {
@@ -178,9 +271,19 @@ class MainViewModel : ViewModel() {
             return
         }
         BleManager.sendCommand("single_ap $first")
+        showToast("已对目标 #$first 突发测试帧")
+    }
+
+    fun sendResetTxStats() {
+        BleManager.sendCommand("reset_txstats")
+        showToast("TX 统计计数已清零")
     }
 
     fun sendStartSniff() {
+        if (_status.value.sniffing) {
+            sendStopSniff()
+            return
+        }
         BleManager.sendCommand("start sniff")
     }
 
@@ -196,8 +299,17 @@ class MainViewModel : ViewModel() {
         BleManager.sendCommand(if (on) "hop on" else "hop off")
     }
 
+    fun sendSetChannel(ch: Int) {
+        BleManager.sendCommand("set ch $ch")
+        showToast("已锁定信道 CH $ch")
+    }
+
     fun sendLedToggle(on: Boolean) {
         BleManager.sendCommand(if (on) "set led on" else "set led off")
+    }
+
+    fun sendApToggle(on: Boolean) {
+        BleManager.sendCommand(if (on) "ap on" else "ap off")
     }
 
     fun sendSetFrames(n: Int) {
@@ -220,8 +332,56 @@ class MainViewModel : ViewModel() {
         BleManager.sendCommand(if (on) "set scan_cycles on" else "set scan_cycles off")
     }
 
+    fun sendSetBleName(name: String) {
+        val trimmed = name.trim()
+        val byteLen = trimmed.toByteArray(Charsets.UTF_8).size
+        if (byteLen !in 1..26) {
+            showToast("BLE 蓝牙名称长度需为 1~26 字节")
+            return
+        }
+        BleManager.sendCommand("set ble_name $trimmed")
+        showToast("BLE 名称已保存 (断线重连后广播生效)")
+    }
+
+    fun sendSetApSsid(ssid: String) {
+        val trimmed = ssid.trim()
+        val byteLen = trimmed.toByteArray(Charsets.UTF_8).size
+        if (byteLen !in 1..32) {
+            showToast("Wi-Fi 热点名称长度需为 1~32 字节")
+            return
+        }
+        BleManager.sendCommand("set ap_ssid $trimmed")
+        showToast("Wi-Fi 热点名称已保存并重启热点")
+    }
+
+    fun sendSetApPass(pass: String) {
+        val trimmed = pass.trim()
+        if (trimmed.length !in 8..63) {
+            showToast("WPA2 热点密码长度需为 8~63 位字符")
+            return
+        }
+        BleManager.sendCommand("set ap_pass $trimmed")
+        showToast("Wi-Fi 热点密码已保存并重启热点")
+    }
+
+    fun sendResetConfig() {
+        BleManager.sendCommand("reset_config")
+        showToast("已恢复出厂默认名称与参数")
+    }
+
+    fun sendCustomCommand(rawCmd: String) {
+        val cmd = rawCmd.trim()
+        if (cmd.isEmpty()) return
+        BleManager.sendCommand(cmd)
+        showToast("已发送指令: $cmd")
+    }
+
     private fun applyTargets() {
-        val indices = _selected.value.sorted().joinToString(",")
-        BleManager.sendCommand("set target $indices")
+        if (_selected.value.size == _apList.value.size && _apList.value.isNotEmpty()) {
+            BleManager.sendCommand("set target all")
+        } else {
+            val indices = _selected.value.sorted().joinToString(",")
+            BleManager.sendCommand("set target $indices")
+        }
     }
 }

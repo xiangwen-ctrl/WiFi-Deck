@@ -1,4 +1,4 @@
-package com.example.wifideck.data
+package io.github.xiangwen.wifideck.data
 
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
@@ -135,6 +135,8 @@ object BleManager {
         connectTimeoutJob = null
         cmdQueue.clear()
         writing = false
+        // 清空残余半包，避免断线重连后第一条消息解析失败
+        synchronized(lineBuffer) { lineBuffer.clear() }
         try {
             @SuppressLint("MissingPermission")
             gatt?.disconnect()
@@ -149,6 +151,10 @@ object BleManager {
 
     /** 将命令入队并触发串行写出（写到 RX 特征值 6E400002，手机 -> 板子） */
     fun sendCommand(cmd: String) {
+        if (_connectionState.value != ConnectionState.CONNECTED) {
+            onScanError?.invoke("设备未连接，请先连接 WiFi-Deck")
+            return
+        }
         cmdQueue.offer(cmd)
         flushWriteQueue()
     }
@@ -191,6 +197,8 @@ object BleManager {
 
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
+            // 重入守卫：低延迟扫描下 stopScan 生效前可能连续回调，避免重复 connectGatt 泄漏句柄
+            if (_connectionState.value != ConnectionState.SCANNING) return
             val device = result.device
             Log.i(TAG, "Found: ${device.name} ${device.address}")
             stopScan()

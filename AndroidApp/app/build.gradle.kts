@@ -5,20 +5,21 @@ plugins {
 }
 
 android {
-    namespace = "com.example.wifideck"
+    namespace = "io.github.xiangwen.wifideck"
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.example.wifideck"
+        applicationId = "io.github.xiangwen.wifideck"
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 16
+        versionName = "1.6"
     }
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }

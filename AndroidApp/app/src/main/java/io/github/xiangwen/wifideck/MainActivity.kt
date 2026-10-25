@@ -1,4 +1,4 @@
-package com.example.wifideck
+package io.github.xiangwen.wifideck
 
 import android.Manifest
 import android.content.pm.PackageManager
@@ -9,9 +9,9 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.core.content.ContextCompat
-import com.example.wifideck.data.BleManager
-import com.example.wifideck.ui.MainScreen
-import com.example.wifideck.ui.MainViewModel
+import io.github.xiangwen.wifideck.data.BleManager
+import io.github.xiangwen.wifideck.ui.MainScreen
+import io.github.xiangwen.wifideck.ui.MainViewModel
 
 class MainActivity : ComponentActivity() {
 

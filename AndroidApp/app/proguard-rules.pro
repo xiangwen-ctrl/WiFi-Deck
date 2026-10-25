@@ -1,2 +1,2 @@
 # Add project specific ProGuard rules here.
--keep class com.example.wifideck.** { *; }
+-keep class io.github.xiangwen.wifideck.** { *; }
