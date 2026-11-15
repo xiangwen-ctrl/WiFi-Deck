@@ -10,24 +10,32 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.WindowInsetsSides
+import androidx.compose.foundation.layout.displayCutout
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.BluetoothSearching
 import androidx.compose.material.icons.filled.StopCircle
-import androidx.compose.material.icons.filled.WifiTethering
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
-import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -39,6 +47,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import io.github.xiangwen.wifideck.data.BleGatePrompt
 import io.github.xiangwen.wifideck.data.BleManager
 import io.github.xiangwen.wifideck.data.DeviceConfig
 import io.github.xiangwen.wifideck.data.DeviceStatus
@@ -52,78 +61,108 @@ fun TopStatusHeader(
     apCount: Int,
     selectedCount: Int,
     onConnect: () -> Unit,
+    onCancelConnect: () -> Unit = {},
     onStopAll: () -> Unit
 ) {
     val isBusy = status.attacking || status.sniffing
+    val (ledColor, statusText) = when (state) {
+        BleManager.ConnectionState.CONNECTED -> {
+            val c = when {
+                status.attacking -> DeckColors.Crimson
+                status.sniffing -> DeckColors.Purple
+                else -> DeckColors.BrightGreen
+            }
+            val sub = when {
+                status.attacking -> "射频注入运行中"
+                status.sniffing -> if (status.hopping) "混杂抓包 · 跳频中" else "混杂抓包 · 锁定 CH ${status.channel}"
+                else -> "BLE 链路就绪"
+            }
+            c to sub
+        }
+        BleManager.ConnectionState.CONNECTING -> DeckColors.Amber to "正在建立 GATT 握手..."
+        BleManager.ConnectionState.SCANNING -> DeckColors.Blue to "正在搜索附近设备..."
+        BleManager.ConnectionState.DISCONNECTED -> DeckColors.TextMuted to "未连接开发板"
+    }
+
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .background(DeckColors.BgSurface)
+            .windowInsetsPadding(
+                WindowInsets.statusBars
+                    .union(WindowInsets.displayCutout)
+                    .only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal)
+            ) // 自动避让系统状态栏与横屏/异形屏挖孔区域
     ) {
-        // 第一行：品牌标识 + 连接状态胶囊 + 快捷操作
+        // 第一行：硬件状态指示灯 + 设备名 + 动作胶囊
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 14.dp, vertical = 10.dp),
+                .padding(horizontal = 16.dp, vertical = 12.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
+            // 双层呼吸感指示灯
             Box(
                 modifier = Modifier
-                    .size(34.dp)
-                    .background(
-                        if (status.attacking) DeckColors.CrimsonDim else DeckColors.BlueDim,
-                        RoundedCornerShape(8.dp)
-                    )
-                    .border(
-                        1.dp,
-                        if (status.attacking) DeckColors.Crimson else DeckColors.Blue.copy(alpha = 0.5f),
-                        RoundedCornerShape(8.dp)
-                    ),
+                    .size(28.dp)
+                    .background(ledColor.copy(alpha = 0.14f), CircleShape),
                 contentAlignment = Alignment.Center
             ) {
-                Icon(
-                    imageVector = Icons.Default.WifiTethering,
-                    contentDescription = null,
-                    tint = if (status.attacking) DeckColors.Crimson else DeckColors.Blue,
-                    modifier = Modifier.size(20.dp)
+                Box(
+                    modifier = Modifier
+                        .size(10.dp)
+                        .background(ledColor, CircleShape)
                 )
             }
-            Spacer(modifier = Modifier.width(10.dp))
+
+            Spacer(modifier = Modifier.width(12.dp))
+
             Column(modifier = Modifier.weight(1f)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
                         text = config.bleName.ifBlank { "WiFi-Deck" },
                         color = DeckColors.TextPrimary,
-                        fontSize = 16.sp,
+                        fontSize = 17.sp,
                         fontWeight = FontWeight.Bold,
                         maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false)
                     )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(
-                        text = if (config.apEnabled) "2.4G / 5G" else "STEALTH",
-                        color = if (config.apEnabled) DeckColors.Cyan else DeckColors.Purple,
-                        fontSize = 9.sp,
-                        fontWeight = FontWeight.Bold,
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Box(
                         modifier = Modifier
                             .background(
-                                if (config.apEnabled) DeckColors.CyanDim else DeckColors.PurpleDim,
-                                RoundedCornerShape(4.dp)
+                                if (config.apEnabled) DeckColors.BgElevated else DeckColors.PurpleDim,
+                                RoundedCornerShape(5.dp)
                             )
-                            .padding(horizontal = 5.dp, vertical = 2.dp)
-                    )
+                            .padding(horizontal = 6.dp, vertical = 2.dp)
+                    ) {
+                        Text(
+                            text = if (config.apEnabled) "2.4G / 5G" else "STEALTH",
+                            color = if (config.apEnabled) DeckColors.TextSecondary else DeckColors.Purple,
+                            fontSize = 10.sp,
+                            fontFamily = FontFamily.Monospace,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
                 }
                 Spacer(modifier = Modifier.height(2.dp))
-                ConnectionBadge(state, status)
+                Text(
+                    text = statusText,
+                    color = DeckColors.TextSecondary,
+                    fontSize = 12.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
             }
 
             if (isBusy) {
                 Button(
                     onClick = onStopAll,
                     colors = ButtonDefaults.buttonColors(containerColor = DeckColors.Crimson),
-                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
                     shape = RoundedCornerShape(8.dp),
-                    modifier = Modifier.height(32.dp)
+                    modifier = Modifier.height(34.dp)
                 ) {
                     Icon(
                         imageVector = Icons.Default.StopCircle,
@@ -131,16 +170,35 @@ fun TopStatusHeader(
                         modifier = Modifier.size(15.dp),
                         tint = Color.White
                     )
-                    Spacer(modifier = Modifier.width(4.dp))
+                    Spacer(modifier = Modifier.width(5.dp))
                     Text("急停", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White)
                 }
-            } else if (state == BleManager.ConnectionState.DISCONNECTED) {
-                OutlinedButton(
-                    onClick = onConnect,
-                    border = BorderStroke(1.dp, DeckColors.Blue),
+            } else if (state == BleManager.ConnectionState.SCANNING || state == BleManager.ConnectionState.CONNECTING) {
+                Button(
+                    onClick = onCancelConnect,
+                    colors = ButtonDefaults.buttonColors(containerColor = DeckColors.BgElevated),
                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
                     shape = RoundedCornerShape(8.dp),
-                    modifier = Modifier.height(32.dp)
+                    modifier = Modifier
+                        .height(34.dp)
+                        .border(1.dp, DeckColors.BorderStrong, RoundedCornerShape(8.dp))
+                ) {
+                    Text(
+                        text = if (state == BleManager.ConnectionState.SCANNING) "取消搜索" else "取消连接",
+                        fontSize = 12.sp,
+                        color = DeckColors.Amber,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+            } else if (state == BleManager.ConnectionState.DISCONNECTED) {
+                Button(
+                    onClick = onConnect,
+                    colors = ButtonDefaults.buttonColors(containerColor = DeckColors.BgElevated),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+                    shape = RoundedCornerShape(8.dp),
+                    modifier = Modifier
+                        .height(34.dp)
+                        .border(1.dp, DeckColors.BorderStrong, RoundedCornerShape(8.dp))
                 ) {
                     Icon(
                         imageVector = Icons.AutoMirrored.Filled.BluetoothSearching,
@@ -148,45 +206,50 @@ fun TopStatusHeader(
                         modifier = Modifier.size(15.dp),
                         tint = DeckColors.Blue
                     )
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text("连接", fontSize = 12.sp, color = DeckColors.Blue, fontWeight = FontWeight.SemiBold)
+                    Spacer(modifier = Modifier.width(5.dp))
+                    Text("连接设备", fontSize = 12.sp, color = DeckColors.TextPrimary, fontWeight = FontWeight.Medium)
                 }
             }
         }
 
-        // 第二行：实时遥测仪表盘条
+        // 第二行：四格仪器遥测读数条
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .background(DeckColors.BgPrimary.copy(alpha = 0.55f))
-                .padding(horizontal = 14.dp, vertical = 6.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
+                .padding(horizontal = 16.dp)
+                .padding(bottom = 10.dp)
+                .clip(RoundedCornerShape(10.dp))
+                .background(DeckColors.BgPrimary)
+                .border(1.dp, DeckColors.BorderSubtle, RoundedCornerShape(10.dp))
+                .padding(vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            TelemetryPill(
-                label = "CH",
-                value = if (status.channel > 0) "${status.channel}" else "--",
-                accent = if (status.hopping) DeckColors.Purple else DeckColors.Blue
+            TelemetryCell(
+                label = "当前信道",
+                value = if (status.channel > 0) "CH ${status.channel}" else "--",
+                valueColor = if (status.hopping) DeckColors.Purple else DeckColors.Cyan,
+                modifier = Modifier.weight(1f)
             )
-            TelemetryPill(
-                label = "APs",
+            VerticalDividerLine()
+            TelemetryCell(
+                label = "发现热点",
                 value = "$apCount",
-                accent = DeckColors.Cyan
+                valueColor = DeckColors.TextPrimary,
+                modifier = Modifier.weight(1f)
             )
-            TelemetryPill(
-                label = "目标",
+            VerticalDividerLine()
+            TelemetryCell(
+                label = "锁定目标",
                 value = "$selectedCount",
-                accent = if (selectedCount > 0) DeckColors.Crimson else DeckColors.TextSecondary
+                valueColor = if (selectedCount > 0) DeckColors.Crimson else DeckColors.TextSecondary,
+                modifier = Modifier.weight(1f)
             )
-            TelemetryPill(
-                label = "TX OK",
-                value = "${status.txOk}",
-                accent = DeckColors.BrightGreen
-            )
-            TelemetryPill(
-                label = "FAIL",
-                value = "${status.txFail}",
-                accent = if (status.txFail > 0) DeckColors.Amber else DeckColors.TextMuted
+            VerticalDividerLine()
+            TelemetryCell(
+                label = "TX 成功/失败",
+                value = "${status.txOk}/${status.txFail}",
+                valueColor = if (status.txOk > 0) DeckColors.BrightGreen else DeckColors.TextSecondary,
+                modifier = Modifier.weight(1.25f)
             )
         }
 
@@ -197,7 +260,7 @@ fun TopStatusHeader(
                 modifier = Modifier
                     .fillMaxWidth()
                     .background(if (status.attacking) DeckColors.CrimsonDim else DeckColors.PurpleDim)
-                    .padding(horizontal = 14.dp, vertical = 5.dp),
+                    .padding(horizontal = 16.dp, vertical = 6.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Box(
@@ -211,8 +274,8 @@ fun TopStatusHeader(
                 Spacer(modifier = Modifier.width(8.dp))
                 Text(
                     text = activeTaskLabel,
-                    color = if (status.attacking) DeckColors.Crimson else DeckColors.TextPrimary,
-                    fontSize = 11.sp,
+                    color = DeckColors.TextPrimary,
+                    fontSize = 12.sp,
                     fontWeight = FontWeight.Medium,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
@@ -230,53 +293,42 @@ fun TopStatusHeader(
 }
 
 @Composable
-private fun ConnectionBadge(state: BleManager.ConnectionState, status: DeviceStatus) {
-    val (dotColor, text) = when (state) {
-        BleManager.ConnectionState.CONNECTED -> {
-            val c = when {
-                status.attacking -> DeckColors.Crimson
-                status.sniffing -> DeckColors.Purple
-                else -> DeckColors.BrightGreen
-            }
-            val modeTxt = if (status.hopping) "跳频中" else "就绪"
-            c to "BLE 已连接 · $modeTxt"
-        }
-        BleManager.ConnectionState.CONNECTING -> DeckColors.Amber to "正在建立 GATT 连接..."
-        BleManager.ConnectionState.SCANNING -> DeckColors.Blue to "正在搜索 WiFi-Deck..."
-        BleManager.ConnectionState.DISCONNECTED -> DeckColors.TextMuted to "设备未连接"
-    }
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Box(
-            modifier = Modifier
-                .size(7.dp)
-                .background(dotColor, CircleShape)
-        )
-        Spacer(modifier = Modifier.width(5.dp))
+private fun TelemetryCell(
+    label: String,
+    value: String,
+    valueColor: Color,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier = modifier,
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
         Text(
-            text = text,
-            color = DeckColors.TextSecondary,
-            fontSize = 11.sp
+            text = value,
+            color = valueColor,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.Bold,
+            fontFamily = FontFamily.Monospace,
+            maxLines = 1
+        )
+        Spacer(modifier = Modifier.height(1.dp))
+        Text(
+            text = label,
+            color = DeckColors.TextMuted,
+            fontSize = 10.sp,
+            maxLines = 1
         )
     }
 }
 
 @Composable
-private fun TelemetryPill(label: String, value: String, accent: Color) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Text(
-            text = "$label ",
-            color = DeckColors.TextMuted,
-            fontSize = 10.sp,
-            fontFamily = FontFamily.Monospace
-        )
-        Text(
-            text = value,
-            color = accent,
-            fontSize = 11.sp,
-            fontWeight = FontWeight.Bold,
-            fontFamily = FontFamily.Monospace
-        )
-    }
+private fun VerticalDividerLine() {
+    Box(
+        modifier = Modifier
+            .width(1.dp)
+            .height(22.dp)
+            .background(DeckColors.BorderSubtle)
+    )
 }
 
 private fun activeTaskDescription(status: DeviceStatus): String? {
@@ -285,7 +337,7 @@ private fun activeTaskDescription(status: DeviceStatus): String? {
     if (status.disassocEnabled) active.add("Disassoc 剥离")
     if (status.beaconFlood) active.add("Beacon 伪热点泛洪")
     if (status.probeFlood) active.add("Probe 探测泛洪")
-    if (status.signalJam) active.add("双频全信道阻塞 (Signal Jam)")
+    if (status.signalJam) active.add("双频全信道阻塞")
     if (status.deauthSniff) active.add("Deauth 嗅探克隆")
     if (status.sniffing && !status.deauthSniff) {
         val modeName = when (status.sniffMode) {
@@ -299,7 +351,9 @@ private fun activeTaskDescription(status: DeviceStatus): String? {
         }
         active.add("抓包监听 ($modeName)")
     }
-    return if (active.isEmpty()) null else "运行中: ${active.joinToString(" + ")}"
+    if (active.isEmpty()) return null
+    val suffix = if (status.timedRemainingSec > 0) " · 倒计时 ${status.timedRemainingSec}s" else ""
+    return "运行中: ${active.joinToString(" + ")}$suffix"
 }
 
 @Composable
@@ -308,23 +362,16 @@ fun SectionHeader(title: String, subtitle: String? = null) {
         modifier = Modifier
             .fillMaxWidth()
             .padding(top = 6.dp, bottom = 4.dp),
-        verticalAlignment = Alignment.CenterVertically
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween
     ) {
-        Box(
-            modifier = Modifier
-                .width(3.dp)
-                .height(13.dp)
-                .background(DeckColors.Crimson, RoundedCornerShape(2.dp))
-        )
-        Spacer(modifier = Modifier.width(7.dp))
         Text(
             text = title,
             color = DeckColors.TextPrimary,
-            fontSize = 13.sp,
+            fontSize = 14.sp,
             fontWeight = FontWeight.SemiBold
         )
         if (subtitle != null) {
-            Spacer(modifier = Modifier.width(8.dp))
             Text(
                 text = subtitle,
                 color = DeckColors.TextMuted,
@@ -341,25 +388,49 @@ fun DeckFilterChip(
     accentColor: Color = DeckColors.Crimson,
     onClick: () -> Unit
 ) {
-    val bgColor = if (selected) accentColor.copy(alpha = 0.18f) else DeckColors.BgSurface
-    val borderColor = if (selected) accentColor else DeckColors.BorderSubtle
-    val textColor = if (selected) accentColor else DeckColors.TextSecondary
+    val bgColor = if (selected) accentColor.copy(alpha = 0.16f) else DeckColors.BgSurface
+    val borderColor = if (selected) accentColor.copy(alpha = 0.65f) else DeckColors.BorderSubtle
+    val textColor = if (selected) DeckColors.TextPrimary else DeckColors.TextSecondary
     Box(
         modifier = Modifier
-            .height(30.dp)
-            .clip(RoundedCornerShape(7.dp))
+            .height(32.dp)
+            .clip(RoundedCornerShape(8.dp))
             .background(bgColor)
-            .border(1.dp, borderColor, RoundedCornerShape(7.dp))
+            .border(1.dp, borderColor, RoundedCornerShape(8.dp))
             .clickable { onClick() }
-            .padding(horizontal = 10.dp),
+            .padding(horizontal = 11.dp),
         contentAlignment = Alignment.Center
     ) {
         Text(
             text = label,
-            fontSize = 11.sp,
-            fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+            fontSize = 12.sp,
+            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
             color = textColor
         )
+    }
+}
+
+@Composable
+fun SignalStrengthBars(rssi: Int, modifier: Modifier = Modifier) {
+    val activeBars = DeckColors.rssiBars(rssi)
+    val barColor = DeckColors.rssiColor(rssi)
+    Row(
+        modifier = modifier.height(14.dp),
+        verticalAlignment = Alignment.Bottom,
+        horizontalArrangement = Arrangement.spacedBy(2.dp)
+    ) {
+        for (i in 1..4) {
+            val h = (4 + i * 2.5f).dp
+            Box(
+                modifier = Modifier
+                    .width(3.dp)
+                    .height(h)
+                    .background(
+                        if (i <= activeBars) barColor else DeckColors.BorderStrong,
+                        RoundedCornerShape(1.dp)
+                    )
+            )
+        }
     }
 }
 
@@ -379,34 +450,35 @@ fun TacticalActionCard(
 
     Card(
         modifier = modifier
-            .clip(RoundedCornerShape(10.dp))
+            .clip(RoundedCornerShape(12.dp))
             .clickable { onClick() },
         colors = CardDefaults.cardColors(containerColor = containerColor),
-        shape = RoundedCornerShape(10.dp),
+        shape = RoundedCornerShape(12.dp),
         border = BorderStroke(1.dp, strokeColor)
     ) {
-        Column(modifier = Modifier.padding(12.dp)) {
+        Column(modifier = Modifier.padding(14.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Box(
-                    modifier = Modifier
-                        .size(30.dp)
-                        .background(iconTint.copy(alpha = 0.15f), RoundedCornerShape(7.dp)),
-                    contentAlignment = Alignment.Center
+                Surface(
+                    modifier = Modifier.size(34.dp),
+                    shape = RoundedCornerShape(9.dp),
+                    color = iconTint.copy(alpha = 0.14f)
                 ) {
-                    Icon(
-                        imageVector = icon,
-                        contentDescription = null,
-                        tint = iconTint,
-                        modifier = Modifier.size(17.dp)
-                    )
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            imageVector = icon,
+                            contentDescription = null,
+                            tint = iconTint,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
                 }
                 Spacer(modifier = Modifier.weight(1f))
                 if (active) {
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         modifier = Modifier
-                            .background(DeckColors.BrightGreen.copy(alpha = 0.2f), RoundedCornerShape(4.dp))
-                            .padding(horizontal = 6.dp, vertical = 2.dp)
+                            .background(DeckColors.BrightGreen.copy(alpha = 0.18f), RoundedCornerShape(6.dp))
+                            .padding(horizontal = 7.dp, vertical = 3.dp)
                     ) {
                         Box(
                             modifier = Modifier
@@ -423,23 +495,106 @@ fun TacticalActionCard(
                     }
                 }
             }
-            Spacer(modifier = Modifier.height(8.dp))
+            Spacer(modifier = Modifier.height(10.dp))
             Text(
                 text = title,
                 color = DeckColors.TextPrimary,
-                fontSize = 13.sp,
+                fontSize = 14.sp,
                 fontWeight = FontWeight.SemiBold,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )
-            Spacer(modifier = Modifier.height(2.dp))
+            Spacer(modifier = Modifier.height(3.dp))
             Text(
-                text = if (active) "再次点击立即停止" else subtitle,
-                color = if (active) DeckColors.BrightGreen.copy(alpha = 0.85f) else DeckColors.TextSecondary,
-                fontSize = 10.sp,
+                text = if (active) "点击立即停止" else subtitle,
+                color = if (active) DeckColors.BrightGreen else DeckColors.TextSecondary,
+                fontSize = 11.sp,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )
         }
     }
+}
+
+@Composable
+fun BleGatePromptDialog(
+    prompt: BleGatePrompt,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    val (title, message, confirmLabel) = when (prompt) {
+        is BleGatePrompt.PermissionRationale -> Triple(
+            if (prompt.isAndroid12Plus) "需要蓝牙连接权限" else "需要蓝牙与定位权限",
+            if (prompt.isAndroid12Plus) {
+                "WiFi-Deck 需要「附近设备（蓝牙扫描与连接）」权限以发现并连接 BW16 (RTL8720DN) 开发板，仅用于 BLE 串口通信。"
+            } else {
+                "Android 8–11 系统要求授予「位置信息」权限才能执行 BLE 扫描。WiFi-Deck 仅用于搜索开发板，不会采集或上传位置。"
+            },
+            "继续授权"
+        )
+        is BleGatePrompt.PermissionPermanentlyDenied -> Triple(
+            "权限已被拒绝",
+            if (prompt.isAndroid12Plus) {
+                "缺少「附近设备」权限，无法扫描或连接开发板。请前往应用设置中手动开启蓝牙相关权限。"
+            } else {
+                "缺少「位置信息」权限，Android 8–11 无法执行 BLE 扫描。请前往应用设置中开启位置权限。"
+            },
+            "前往设置"
+        )
+        BleGatePrompt.BluetoothDisabled -> Triple(
+            "系统蓝牙未开启",
+            "检测到蓝牙开关处于关闭状态，请开启蓝牙以扫描并连接 WiFi-Deck 开发板。",
+            "开启蓝牙"
+        )
+        BleGatePrompt.LocationDisabled -> Triple(
+            "系统定位开关未开启",
+            "Android 8–11 需要开启系统「位置信息」总开关才能返回 BLE 扫描结果，请前往系统设置开启后返回。",
+            "开启定位"
+        )
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = DeckColors.BgSurface,
+        titleContentColor = DeckColors.TextPrimary,
+        textContentColor = DeckColors.TextSecondary,
+        shape = RoundedCornerShape(14.dp),
+        title = {
+            Text(
+                text = title,
+                fontSize = 16.sp,
+                fontWeight = FontWeight.Bold
+            )
+        },
+        text = {
+            Text(
+                text = message,
+                fontSize = 13.sp,
+                lineHeight = 19.sp
+            )
+        },
+        confirmButton = {
+            Button(
+                onClick = onConfirm,
+                colors = ButtonDefaults.buttonColors(containerColor = DeckColors.Blue),
+                shape = RoundedCornerShape(8.dp)
+            ) {
+                Text(
+                    text = confirmLabel,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color.White
+                )
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text(
+                    text = "暂不",
+                    fontSize = 13.sp,
+                    color = DeckColors.TextSecondary
+                )
+            }
+        }
+    )
 }

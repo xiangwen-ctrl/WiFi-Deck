@@ -12,8 +12,8 @@ android {
         applicationId = "io.github.xiangwen.wifideck"
         minSdk = 26
         targetSdk = 36
-        versionCode = 16
-        versionName = "1.6"
+        versionCode = 20
+        versionName = "2.0"
     }
 
     buildTypes {
@@ -50,4 +50,7 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.6")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("org.json:json:20240303")
+
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
 }
