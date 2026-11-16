@@ -10,6 +10,7 @@ import io.github.xiangwen.wifideck.data.BleTransport
 import io.github.xiangwen.wifideck.data.ConfigSyncState
 import io.github.xiangwen.wifideck.data.DeviceConfig
 import io.github.xiangwen.wifideck.data.DeviceStatus
+import io.github.xiangwen.wifideck.data.ReconnectUiState
 import io.github.xiangwen.wifideck.data.ScanListState
 import io.github.xiangwen.wifideck.data.SniffLogEntry
 import io.github.xiangwen.wifideck.data.SniffMode
@@ -56,10 +57,14 @@ class MainViewModel(
         private const val MAX_LINES_PER_TURN = 64
         private const val SETTING_DEBOUNCE_MS = 350L
         private const val MAX_FIRMWARE_SCAN_TIME_MS = 30_000L
+        private const val BT_OFF_RACE_WINDOW_MS = 5_000L
     }
 
     val connectionState: StateFlow<BleManager.ConnectionState> = ble.connectionState
     val mtu: StateFlow<Int> = ble.mtu
+
+    private val _reconnectState = MutableStateFlow(ReconnectUiState())
+    val reconnectState: StateFlow<ReconnectUiState> = _reconnectState
 
     private val _apList = MutableStateFlow<List<ApItem>>(emptyList())
     val apList: StateFlow<List<ApItem>> = _apList
@@ -81,9 +86,6 @@ class MainViewModel(
 
     private val _logs = MutableStateFlow<List<SniffLogEntry>>(emptyList())
     val logs: StateFlow<List<SniffLogEntry>> = _logs
-
-    private val _cliLogs = MutableStateFlow<List<String>>(emptyList())
-    val cliLogs: StateFlow<List<String>> = _cliLogs
 
     private val _scanning = MutableStateFlow(false)
     val scanning: StateFlow<Boolean> = _scanning
@@ -189,6 +191,11 @@ class MainViewModel(
     private var pendingClearDraftsOnConfirm: Boolean = false
 
     private var pendingReconnectOnBtOn = false
+    private var _connectionStateSnapshot: BleManager.ConnectionState = ble.connectionState.value
+    private var lastActiveDisconnectMs: Long = 0L
+    private var userDisconnectedExplicitly: Boolean = false
+    @Volatile
+    private var onClearedCleanup: (() -> Unit)? = null
     private val settingWriteTimestamps = HashMap<String, Long>()
 
     private val lineListener: (String) -> Unit = { line ->
@@ -220,10 +227,26 @@ class MainViewModel(
             }
         }
 
+        (ble as? BleManager)?.let { bleManager ->
+            viewModelScope.launch {
+                bleManager.reconnectState.collect { state ->
+                    _reconnectState.value = state
+                }
+            }
+        }
+
         viewModelScope.launch {
             ble.connectionState.collect { state ->
                 when (state) {
                     BleManager.ConnectionState.DISCONNECTED -> {
+                        if (!userDisconnectedExplicitly &&
+                            _connectionStateSnapshot != BleManager.ConnectionState.DISCONNECTED
+                        ) {
+                            lastActiveDisconnectMs = monotonicMs()
+                        } else {
+                            _connectionStateSnapshot = BleManager.ConnectionState.DISCONNECTED
+                            lastActiveDisconnectMs = 0L
+                        }
                         scanWatchdogJob?.cancel()
                         scanWatchdogJob = null
                         initialSyncProbeJob?.cancel()
@@ -238,10 +261,16 @@ class MainViewModel(
                         // 3.3：断连不递增 configResetSeq，保护未保存的本地编辑草稿
                     }
                     BleManager.ConnectionState.CONNECTING -> {
+                        userDisconnectedExplicitly = false
+                        _connectionStateSnapshot = state
+                        lastActiveDisconnectMs = 0L
                         resetSyncProgress()
                         _configSynced.value = false
                     }
                     BleManager.ConnectionState.CONNECTED -> {
+                        userDisconnectedExplicitly = false
+                        _connectionStateSnapshot = state
+                        lastActiveDisconnectMs = 0L
                         pendingReconnectOnBtOn = false
                         _bleGatePrompt.value = null
                         initialSyncProbeJob?.cancel()
@@ -253,11 +282,18 @@ class MainViewModel(
                         }
                     }
                     BleManager.ConnectionState.SCANNING -> {
+                        userDisconnectedExplicitly = false
+                        _connectionStateSnapshot = state
+                        lastActiveDisconnectMs = 0L
                         _bleGatePrompt.value = null
                     }
                 }
             }
         }
+    }
+
+    fun setOnClearedCleanup(cleanup: (() -> Unit)?) {
+        onClearedCleanup = cleanup
     }
 
     override fun onCleared() {
@@ -282,6 +318,8 @@ class MainViewModel(
         configConfirmJob?.cancel()
         configConfirmJob = null
         ble.disconnect(userInitiated = true)
+        onClearedCleanup?.invoke()
+        onClearedCleanup = null
         super.onCleared()
     }
 
@@ -294,8 +332,23 @@ class MainViewModel(
         _gateActions.trySend(BleGateAction.CheckAndConnect(autoTriggered))
     }
 
+    fun retryOrConnectBle() {
+        if (connectionState.value != BleManager.ConnectionState.DISCONNECTED) {
+            return
+        }
+        val bleManager = ble as? BleManager
+        if (bleManager != null && bleManager.retryReconnect()) {
+            _bleGatePrompt.value = null
+            return
+        }
+        requestBleConnect(autoTriggered = false)
+    }
+
     fun disconnectBle() {
+        userDisconnectedExplicitly = true
         pendingReconnectOnBtOn = false
+        _connectionStateSnapshot = BleManager.ConnectionState.DISCONNECTED
+        lastActiveDisconnectMs = 0L
         _bleGatePrompt.value = null
         ble.disconnect(userInitiated = true)
     }
@@ -325,10 +378,23 @@ class MainViewModel(
 
     fun onBluetoothStateChanged(enabled: Boolean) {
         if (!enabled) {
-            val wasActive = ble.onBluetoothAdapterOff()
-            if (wasActive) {
+            val stateBeforeOff = ble.connectionState.value
+            val wasReconnecting = _reconnectState.value.isReconnecting
+            val wasBleActive = ble.onBluetoothAdapterOff()
+            val wasSnapshotActive = !userDisconnectedExplicitly && (
+                stateBeforeOff != BleManager.ConnectionState.DISCONNECTED ||
+                    (_connectionStateSnapshot != BleManager.ConnectionState.DISCONNECTED &&
+                        lastActiveDisconnectMs > 0L &&
+                        monotonicMs() - lastActiveDisconnectMs <= BT_OFF_RACE_WINDOW_MS)
+                )
+            if (wasBleActive || wasReconnecting || wasSnapshotActive) {
+                val newlyLatched = !pendingReconnectOnBtOn
                 pendingReconnectOnBtOn = true
-                showToast("系统蓝牙已关闭，BLE 连接已断开")
+                _connectionStateSnapshot = BleManager.ConnectionState.DISCONNECTED
+                lastActiveDisconnectMs = 0L
+                if (newlyLatched) {
+                    showToast("系统蓝牙已关闭，BLE 连接已断开")
+                }
             }
         } else {
             ble.onBluetoothAdapterOn()
@@ -339,7 +405,7 @@ class MainViewModel(
             if (pendingReconnectOnBtOn) {
                 pendingReconnectOnBtOn = false
                 showToast("系统蓝牙已开启，正在重新连接 WiFi-Deck...")
-                requestBleConnect(autoTriggered = false)
+                retryOrConnectBle()
             } else if (wasWaitingBtPrompt) {
                 requestBleConnect(autoTriggered = false)
             }
@@ -368,7 +434,7 @@ class MainViewModel(
             } else {
                 MAX_FIRMWARE_SCAN_TIME_MS
             }
-            delay(maxOf(15_000L, maxScanMs + 8_000L))
+            delay(maxOf(15_000L, maxScanMs + 10_000L))
             if (_scanning.value) {
                 flushApBatchNow()
                 _scanning.value = false
@@ -439,9 +505,7 @@ class MainViewModel(
                     _apList.value = emptyList()
                     _selected.value = emptySet()
                     _scanning.value = true
-                    if (scanWatchdogJob?.isActive != true) {
-                        startScanWatchdog()
-                    }
+                    startScanWatchdog()
                 }
                 BleMessageType.SYNC_BEGIN -> {
                     // 攻击间隙同步 (scan_between_cycles) 与 results 回读均走 sync_begin/sync_end，绝不干扰主动扫描态
@@ -484,6 +548,9 @@ class MainViewModel(
                         if (prev?.selected == true) {
                             _selected.update { it - item.index }
                         }
+                    }
+                    if (_scanning.value && !inSyncMode) {
+                        startScanWatchdog()
                     }
                     scheduleApBatchFlush()
                 }
@@ -589,14 +656,11 @@ class MainViewModel(
                         logRingBuffer.addLast(entry)
                         logBatchDirty = true
                         scheduleOrFlushLogBatch()
-                    } else {
-                        _cliLogs.update { (it + msg).takeLast(30) }
-                        if (msg.startsWith("[ERROR]") || msg.startsWith("[WARN]") || msg.startsWith("TX Stats:")) {
-                            if (msg.startsWith("[ERROR]") && _savingConfig.value) {
-                                clearPendingConfigSave()
-                            }
-                            showToast(msg)
+                    } else if (msg.startsWith("[ERROR]") || msg.startsWith("[WARN]") || msg.startsWith("TX Stats:")) {
+                        if (msg.startsWith("[ERROR]") && _savingConfig.value) {
+                            clearPendingConfigSave()
                         }
+                        showToast(msg)
                     }
                 }
                 null -> Unit
@@ -710,10 +774,6 @@ class MainViewModel(
         } else {
             showToast("已清空本地抓包日志")
         }
-    }
-
-    fun clearCliLogs() {
-        _cliLogs.value = emptyList()
     }
 
     // ---- 命令发送（复用固件 executeCommand 指令集）----
@@ -1030,17 +1090,6 @@ class MainViewModel(
                 cfg.apPass == "12345678" &&
                 cfg.bleName == "WiFi-Deck"
         }
-    }
-
-    fun sendCustomCommand(rawCmd: String): Boolean {
-        val cmd = rawCmd.replace("\r", "").replace("\n", "").trim()
-        if (cmd.isEmpty()) return false
-        if (ble.sendCommand(cmd)) {
-            _cliLogs.update { (it + "> $cmd").takeLast(30) }
-            showToast("已发送指令: $cmd")
-            return true
-        }
-        return false
     }
 
     /** 原子下发带目标索引（或显式全量 all）的攻击指令，禁止无目标时回退全攻 */

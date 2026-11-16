@@ -1,4 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">WiFi-Deck</string>
+    <string name="ble_keepalive_channel_name">BLE 连接保活</string>
+    <string name="ble_keepalive_channel_desc">在后台保持与 WiFi-Deck 开发板的 BLE 连接</string>
+    <string name="ble_keepalive_title">WiFi-Deck</string>
+    <string name="ble_keepalive_text_connected">已连接至开发板</string>
+    <string name="ble_keepalive_text_connecting">正在连接 WiFi-Deck…</string>
+    <string name="ble_keepalive_text_reconnecting">正在重连 (%1$d/%2$d)…</string>
+    <string name="ble_keepalive_action_disconnect">断开</string>
+    <string name="ble_status_reconnecting">正在重连 (%1$d/%2$d)…</string>
+    <string name="ble_status_reconnecting_scan">正在重连 (%1$d/%2$d) · 搜索中…</string>
+    <string name="ble_status_reconnect_exhausted">重连失败，点击重试</string>
+    <string name="ble_retry_action">重试</string>
 </resources>

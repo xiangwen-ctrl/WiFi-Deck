@@ -7,6 +7,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceTimeBy
@@ -35,6 +36,7 @@ private class FakeBleTransport : BleTransport {
     val sentCommands = mutableListOf<String>()
     val sentTargetedCommands = mutableListOf<Pair<String, List<Int>>>()
     var emergencyStopCount = 0
+    var disconnectCalls = 0
 
     fun setState(state: BleManager.ConnectionState) {
         _connectionState.value = state
@@ -65,6 +67,7 @@ private class FakeBleTransport : BleTransport {
     }
 
     override fun disconnect(userInitiated: Boolean) {
+        disconnectCalls++
         _connectionState.value = BleManager.ConnectionState.DISCONNECTED
     }
 
@@ -296,5 +299,156 @@ class MainViewModelTest {
         fakeBle.emitLine("""{"t":"id","ssid":"WiFi-Deck","pass":"12345678","ble":"WiFi-Deck"}""")
         runCurrent()
         assertEquals(1L, viewModel.configResetSeq.value)
+    }
+
+    @Test
+    fun btOffRace_disconnectBeforeAdapterOffBroadcast_latchesPendingReconnectAndTriggersOnBtOn() = runTest(testDispatcher) {
+        val gateActions = mutableListOf<BleGateAction>()
+        val collectJob = launch {
+            viewModel.gateActions.collect { gateActions.add(it) }
+        }
+        try {
+            fakeBle.setState(BleManager.ConnectionState.CONNECTED)
+            runCurrent()
+
+            // STATE_DISCONNECTED arrives before ACTION_STATE_CHANGED(OFF) broadcast
+            fakeBle.setState(BleManager.ConnectionState.DISCONNECTED)
+            runCurrent()
+
+            viewModel.onBluetoothStateChanged(false)
+            runCurrent()
+            assertEquals("系统蓝牙已关闭，BLE 连接已断开", viewModel.toast.value)
+            viewModel.clearToast()
+
+            viewModel.onBluetoothStateChanged(true)
+            runCurrent()
+            assertEquals("系统蓝牙已开启，正在重新连接 WiFi-Deck...", viewModel.toast.value)
+            assertEquals(listOf(BleGateAction.CheckAndConnect(autoTriggered = false)), gateActions)
+
+            // Latched flag is consumed once: a second BT-ON event does not re-trigger
+            viewModel.clearToast()
+            viewModel.onBluetoothStateChanged(true)
+            runCurrent()
+            assertNull(viewModel.toast.value)
+            assertEquals(1, gateActions.size)
+        } finally {
+            collectJob.cancel()
+        }
+    }
+
+    @Test
+    fun disconnectBle_clearsPendingReconnectOnBtOn_andSuppressesAutoReconnect() = runTest(testDispatcher) {
+        val gateActions = mutableListOf<BleGateAction>()
+        val collectJob = launch {
+            viewModel.gateActions.collect { gateActions.add(it) }
+        }
+        try {
+            // Case 1: BT off latched pendingReconnectOnBtOn, then user calls disconnectBle()
+            fakeBle.setState(BleManager.ConnectionState.CONNECTED)
+            runCurrent()
+            fakeBle.setState(BleManager.ConnectionState.DISCONNECTED)
+            runCurrent()
+
+            viewModel.onBluetoothStateChanged(false)
+            runCurrent()
+            assertEquals("系统蓝牙已关闭，BLE 连接已断开", viewModel.toast.value)
+            viewModel.clearToast()
+
+            viewModel.disconnectBle()
+            runCurrent()
+
+            viewModel.onBluetoothStateChanged(true)
+            runCurrent()
+            assertNull(viewModel.toast.value)
+            assertTrue(gateActions.isEmpty())
+
+            // Case 2: User calls disconnectBle() before BT turns off -> no latch set
+            fakeBle.setState(BleManager.ConnectionState.CONNECTED)
+            runCurrent()
+            viewModel.disconnectBle()
+            runCurrent()
+            viewModel.onBluetoothStateChanged(false)
+            runCurrent()
+            assertNull(viewModel.toast.value)
+            viewModel.onBluetoothStateChanged(true)
+            runCurrent()
+            assertNull(viewModel.toast.value)
+            assertTrue(gateActions.isEmpty())
+        } finally {
+            collectJob.cancel()
+        }
+    }
+
+    @Test
+    fun scanWatchdog_usesScanTimePlus10sHeadroom_andResetsOnScanBeginAndApFrames() = runTest(testDispatcher) {
+        fakeBle.setState(BleManager.ConnectionState.CONNECTED)
+        runCurrent()
+
+        // Configure scanTimeMs = 12_000ms -> watchdog timeout = max(15_000, 12_000 + 10_000) = 22_000ms
+        fakeBle.emitLine("""{"t":"cfg","delay":1000,"scan":12000,"frames":4,"ch":1,"sc":0,"led":1,"ap":1}""")
+        runCurrent()
+
+        viewModel.sendScan()
+        runCurrent()
+        assertTrue(viewModel.scanning.value)
+
+        // At 15_000ms (past 15s floor, within 22s headroom), scan is still active; SCAN_BEGIN resets watchdog
+        advanceTimeBy(15_000L)
+        runCurrent()
+        assertTrue(viewModel.scanning.value)
+        assertNull(viewModel.toast.value)
+
+        fakeBle.emitLine("""{"t":"scan_begin"}""")
+        runCurrent()
+
+        // Advance 21_000ms (total 36_000ms, well past initial 22s deadline): still active, then AP frame resets again
+        advanceTimeBy(21_000L)
+        runCurrent()
+        assertTrue(viewModel.scanning.value)
+        assertNull(viewModel.toast.value)
+
+        fakeBle.emitLine("""{"t":"ap","i":0,"s":"StreamAP1","b":"AA:BB:CC:DD:EE:01","c":6,"r":-50}""")
+        runCurrent()
+
+        // Advance 21_000ms after first AP: still active, second AP resets watchdog again
+        advanceTimeBy(21_000L)
+        runCurrent()
+        assertTrue(viewModel.scanning.value)
+        assertNull(viewModel.toast.value)
+
+        fakeBle.emitLine("""{"t":"ap","i":1,"s":"StreamAP2","b":"AA:BB:CC:DD:EE:02","c":36,"r":-60}""")
+        runCurrent()
+
+        // Just before 22_000ms headroom expires: still scanning
+        advanceTimeBy(21_999L)
+        runCurrent()
+        assertTrue(viewModel.scanning.value)
+        assertNull(viewModel.toast.value)
+
+        // Crossing 22_000ms without scan_end triggers timeout and flushes buffered APs
+        advanceTimeBy(2L)
+        runCurrent()
+        assertFalse(viewModel.scanning.value)
+        assertEquals("扫描超时，未收到开发板返回", viewModel.toast.value)
+        assertEquals(2, viewModel.apList.value.size)
+    }
+
+    @Test
+    fun missingStatusHeartbeat_doesNotDropConnection() = runTest(testDispatcher) {
+        fakeBle.setState(BleManager.ConnectionState.CONNECTED)
+        runCurrent()
+        fakeBle.emitLine("""{"t":"cfg","delay":1500,"scan":4000,"frames":5,"ch":1,"sc":0,"led":1,"ap":1}""")
+        fakeBle.emitLine("""{"t":"id","ssid":"LabAP","pass":"secret123","ble":"Deck-01"}""")
+        runCurrent()
+        assertTrue(viewModel.configSynced.value)
+
+        // Advance 2 minutes with zero {"t":"st",...} heartbeat frames
+        advanceTimeBy(120_000L)
+        runCurrent()
+
+        assertEquals(BleManager.ConnectionState.CONNECTED, viewModel.connectionState.value)
+        assertEquals(0, fakeBle.disconnectCalls)
+        assertNull(viewModel.toast.value)
+        assertTrue(viewModel.configSynced.value)
     }
 }

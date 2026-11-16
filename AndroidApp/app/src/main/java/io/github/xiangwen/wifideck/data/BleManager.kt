@@ -1,5 +1,6 @@
 package io.github.xiangwen.wifideck.data
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
@@ -15,14 +16,17 @@ import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
+import android.content.pm.PackageManager
 import android.location.LocationManager
 import android.os.Build
 import android.os.ParcelUuid
 import android.os.SystemClock
 import android.util.Log
+import androidx.core.content.ContextCompat
 import androidx.core.location.LocationManagerCompat
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -48,7 +52,7 @@ object BleManager : BleTransport {
 
     private val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
-    private const val MAX_CMD_QUEUE_SIZE = 24
+    private const val MAX_CMD_QUEUE_SIZE = WriteAckTracker.MAX_CMD_QUEUE_SIZE
     private const val GATT_CLOSE_TIMEOUT_MS = 800L
     private const val MAX_WRITE_RETRIES = 5
     private const val MAX_URGENT_WRITE_RETRIES = 8
@@ -57,8 +61,17 @@ object BleManager : BleTransport {
 
     enum class ConnectionState { DISCONNECTED, SCANNING, CONNECTING, CONNECTED }
 
+    private class PendingGattClose(
+        val timeoutJob: Job,
+        val completed: CompletableDeferred<Unit> = CompletableDeferred()
+    )
+
     private val _connectionState = MutableStateFlow(ConnectionState.DISCONNECTED)
     override val connectionState: StateFlow<ConnectionState> = _connectionState
+
+    private val reconnectTracker = BleReconnectTracker()
+    private val _reconnectState = MutableStateFlow(ReconnectUiState())
+    val reconnectState: StateFlow<ReconnectUiState> = _reconnectState
 
     private val _mtu = MutableStateFlow(23)
     override val mtu: StateFlow<Int> = _mtu
@@ -74,14 +87,19 @@ object BleManager : BleTransport {
     private var appContext: Context? = null
     private var bluetoothAdapter: BluetoothAdapter? = null
     private val gattLock = Any()
+    private val scanLock = Any()
+    private var scanActive = false
+    private var scanGeneration = 0L
     @Volatile private var gatt: BluetoothGatt? = null
     @Volatile private var txCharacteristic: BluetoothGattCharacteristic? = null
     @Volatile private var rxCharacteristic: BluetoothGattCharacteristic? = null
-    private val pendingCloseGatts = HashMap<BluetoothGatt, Job>()
+    private val pendingCloseGatts = HashMap<BluetoothGatt, PendingGattClose>()
     private var lastDevice: BluetoothDevice? = null
     @Volatile private var userInitiatedDisconnect = false
     @Volatile private var btDisabledBySystem = false
     private var reconnectJob: Job? = null
+    private var connectJob: Job? = null
+    private var scanStartJob: Job? = null
 
     private val rxLock = Any()
     private val rxFramer = BleLineFramer(BleLineFramer.DEFAULT_MAX_LINE_BYTES)
@@ -90,6 +108,8 @@ object BleManager : BleTransport {
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val cmdQueue = ArrayDeque<String>()
     private val writeLock = Any()
+    private val writeAckTracker = WriteAckTracker()
+    private var activeWriteSeq: Long = 0L
     private var pendingEmergencyStop: String? = null
     private var pendingWriteAck: CompletableDeferred<Int>? = null
     private var urgentWakeSignal: CompletableDeferred<Unit>? = null
@@ -102,6 +122,9 @@ object BleManager : BleTransport {
     @Volatile private var discoveryStarted = false
     @Volatile private var retriedDiscovery = false
     @Volatile private var handshakeCompleted = false
+    @Volatile private var physicalConnected = false
+    @Volatile private var currentAttemptWasDirect = false
+    @Volatile private var currentAttemptWasManualRetryDirect = false
 
     /** 返回当前有效 ATT MTU 下单次写入允许的最大指令 UTF-8 字节数（始终受 (MTU - 3) 约束） */
     fun maxCommandPayloadBytes(): Int = BleCommandCodec.maxCommandPayloadBytes(_mtu.value)
@@ -124,25 +147,96 @@ object BleManager : BleTransport {
         return LocationManagerCompat.isLocationEnabled(lm)
     }
 
+    private fun hasBlePermissions(requireScan: Boolean = true): Boolean {
+        val ctx = appContext ?: return false
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val connectOk = ContextCompat.checkSelfPermission(
+                ctx,
+                Manifest.permission.BLUETOOTH_CONNECT
+            ) == PackageManager.PERMISSION_GRANTED
+            val scanOk = !requireScan || ContextCompat.checkSelfPermission(
+                ctx,
+                Manifest.permission.BLUETOOTH_SCAN
+            ) == PackageManager.PERMISSION_GRANTED
+            connectOk && scanOk
+        } else {
+            !requireScan || ContextCompat.checkSelfPermission(
+                ctx,
+                Manifest.permission.ACCESS_FINE_LOCATION
+            ) == PackageManager.PERMISSION_GRANTED
+        }
+    }
+
+    /** 手动重试重连：清除 EXHAUSTED 状态，有缓存设备时发起直连，否则回退扫描；蓝牙关闭或缺权限时返回 false */
+    fun retryReconnect(): Boolean {
+        val adapter = bluetoothAdapter ?: return false
+        if (!adapter.isEnabled || !hasBlePermissions(requireScan = true)) {
+            return false
+        }
+        val currentState = _connectionState.value
+        if (currentState == ConnectionState.CONNECTED ||
+            currentState == ConnectionState.CONNECTING ||
+            currentState == ConnectionState.SCANNING
+        ) {
+            return true
+        }
+        val cached = lastDevice
+        if (cached == null && !isLocationReadyForScan()) {
+            return false
+        }
+        btDisabledBySystem = false
+        userInitiatedDisconnect = false
+        _reconnectState.value = reconnectTracker.onManualRetry(hasCachedDevice = cached != null)
+        if (cached != null) {
+            connect(cached, fromReconnect = true, fromScan = false, fromManualRetry = true)
+        } else {
+            startScanInternal(fromReconnect = false)
+        }
+        return true
+    }
+
     fun startScan() {
+        startScanInternal(fromReconnect = false)
+    }
+
+    private fun startScanInternal(fromReconnect: Boolean) {
+        if (fromReconnect && (userInitiatedDisconnect || btDisabledBySystem || !reconnectTracker.shouldAutoReconnect)) {
+            return
+        }
         val adapter = bluetoothAdapter
         if (adapter == null) {
+            if (fromReconnect) {
+                _reconnectState.value = reconnectTracker.exhaustNow("当前设备不支持 BLE 或蓝牙不可用")
+            }
             _connectionState.value = ConnectionState.DISCONNECTED
             onScanError?.invoke("当前设备不支持 BLE 或蓝牙不可用")
             return
         }
         if (!adapter.isEnabled) {
+            if (fromReconnect) {
+                reconnectTracker.onDisconnectWhileBtOff(wasActiveSession = true)
+                _reconnectState.value = reconnectTracker.uiState
+            }
             _connectionState.value = ConnectionState.DISCONNECTED
-            onScanError?.invoke("请先打开蓝牙")
+            if (!fromReconnect) {
+                onScanError?.invoke("请先打开蓝牙")
+            }
             return
         }
         if (!isLocationReadyForScan()) {
+            val msg = "Android 8~11 扫描蓝牙设备需开启系统定位开关"
+            if (fromReconnect) {
+                _reconnectState.value = reconnectTracker.exhaustNow(msg)
+            }
             _connectionState.value = ConnectionState.DISCONNECTED
-            onScanError?.invoke("Android 8~11 扫描蓝牙设备需开启系统定位开关")
+            onScanError?.invoke(msg)
             return
         }
         val scanner = adapter.bluetoothLeScanner
         if (scanner == null) {
+            if (fromReconnect) {
+                _reconnectState.value = reconnectTracker.exhaustNow("当前设备不支持 BLE 或蓝牙不可用")
+            }
             _connectionState.value = ConnectionState.DISCONNECTED
             onScanError?.invoke("当前设备不支持 BLE 或蓝牙不可用")
             return
@@ -150,18 +244,26 @@ object BleManager : BleTransport {
 
         // 先清理上一次可能残留的扫描/握手状态与 GATT 句柄
         stopScan()
-        reconnectJob?.cancel()
-        reconnectJob = null
+        connectJob?.cancel()
+        connectJob = null
+        if (!fromReconnect) {
+            btDisabledBySystem = false
+            userInitiatedDisconnect = false
+            reconnectJob?.cancel()
+            reconnectJob = null
+            _reconnectState.value = reconnectTracker.onSessionAbandoned()
+        }
         cancelHandshakeJobs()
         resetWriteQueue()
         resetRxBuffer()
         _mtu.value = 23
-        closeCurrentGatt()
-        btDisabledBySystem = false
-        userInitiatedDisconnect = false
+        closeCurrentGatt(alreadyDisconnected = false)
         handshakeCompleted = false
+        physicalConnected = false
         discoveryStarted = false
         retriedDiscovery = false
+        currentAttemptWasDirect = false
+        currentAttemptWasManualRetryDirect = false
 
         _connectionState.value = ConnectionState.SCANNING
 
@@ -172,28 +274,123 @@ object BleManager : BleTransport {
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
 
-        try {
-            @SuppressLint("MissingPermission")
-            scanner.startScan(listOf(filter), settings, scanCallback)
-        } catch (e: SecurityException) {
-            _connectionState.value = ConnectionState.DISCONNECTED
-            onScanError?.invoke("缺少蓝牙权限，请在系统设置中授权")
-            return
-        }
-
-        // 10 秒扫描超时：没扫到设备自动停止，避免永久卡在 SCANNING
-        scanTimeoutJob?.cancel()
-        scanTimeoutJob = scope.launch {
-            delay(10_000)
-            if (_connectionState.value == ConnectionState.SCANNING) {
-                stopScan()
+        scanStartJob?.cancel()
+        val startJob = scope.launch(start = CoroutineStart.LAZY) {
+            val myJob = currentCoroutineContext()[Job]
+            awaitPendingGattClose(GATT_CLOSE_TIMEOUT_MS)
+            val myScanGen = synchronized(scanLock) {
+                if (!isActive ||
+                    scanStartJob !== myJob ||
+                    userInitiatedDisconnect ||
+                    btDisabledBySystem ||
+                    (fromReconnect && !reconnectTracker.shouldAutoReconnect) ||
+                    _connectionState.value != ConnectionState.SCANNING
+                ) {
+                    null
+                } else {
+                    scanActive = true
+                    ++scanGeneration
+                }
+            } ?: return@launch
+            try {
+                @SuppressLint("MissingPermission")
+                scanner.startScan(listOf(filter), settings, scanCallback)
+            } catch (e: SecurityException) {
+                synchronized(scanLock) {
+                    if (scanGeneration == myScanGen) {
+                        scanActive = false
+                        scanGeneration++
+                    }
+                }
+                val msg = "缺少蓝牙权限，请在系统设置中授权"
+                if (fromReconnect) {
+                    _reconnectState.value = reconnectTracker.exhaustNow(msg)
+                }
                 _connectionState.value = ConnectionState.DISCONNECTED
-                onScanError?.invoke("扫描超时，未找到设备（请确认板子已上电且未被系统蓝牙占用）")
+                onScanError?.invoke(msg)
+                return@launch
+            } catch (e: Exception) {
+                synchronized(scanLock) {
+                    if (scanGeneration == myScanGen) {
+                        scanActive = false
+                        scanGeneration++
+                    }
+                }
+                Log.e(TAG, "startScan failed: ${e.message}")
+                if (fromReconnect || reconnectTracker.shouldAutoReconnect) {
+                    handleReconnectFailure(
+                        status = -1,
+                        alreadyDisconnected = true,
+                        errorMessage = "启动 BLE 扫描失败",
+                        wasDirectAttempt = false,
+                        wasManualRetryDirect = false
+                    )
+                } else {
+                    _connectionState.value = ConnectionState.DISCONNECTED
+                    onScanError?.invoke("启动 BLE 扫描失败")
+                }
+                return@launch
+            }
+
+            // 10 秒扫描超时：没扫到设备自动停止，避免永久卡在 SCANNING
+            scanTimeoutJob?.cancel()
+            val timeoutJob = scope.launch(start = CoroutineStart.LAZY) {
+                val myTimeoutJob = currentCoroutineContext()[Job]
+                delay(BleReconnectTracker.SCAN_TIMEOUT_MS)
+                val timedOut = synchronized(scanLock) {
+                    if (isActive &&
+                        scanTimeoutJob === myTimeoutJob &&
+                        scanActive &&
+                        scanGeneration == myScanGen &&
+                        _connectionState.value == ConnectionState.SCANNING
+                    ) {
+                        scanActive = false
+                        scanGeneration++
+                        true
+                    } else {
+                        false
+                    }
+                }
+                if (!timedOut) return@launch
+                stopScan()
+                if (reconnectTracker.shouldAutoReconnect && !userInitiatedDisconnect && !btDisabledBySystem) {
+                    handleReconnectFailure(
+                        status = -1,
+                        alreadyDisconnected = true,
+                        errorMessage = "重连扫描超时，未找到设备",
+                        wasDirectAttempt = false,
+                        wasManualRetryDirect = false
+                    )
+                } else {
+                    _connectionState.value = ConnectionState.DISCONNECTED
+                    onScanError?.invoke("扫描超时，未找到设备（请确认板子已上电且未被系统蓝牙占用）")
+                }
+            }
+            val stillScanning = synchronized(scanLock) {
+                if (isActive && scanActive && scanGeneration == myScanGen && _connectionState.value == ConnectionState.SCANNING) {
+                    scanTimeoutJob = timeoutJob
+                    true
+                } else {
+                    false
+                }
+            }
+            if (stillScanning) {
+                timeoutJob.start()
+            } else {
+                timeoutJob.cancel()
             }
         }
+        scanStartJob = startJob
+        startJob.start()
     }
 
     fun stopScan() {
+        synchronized(scanLock) {
+            scanActive = false
+            scanGeneration++
+        }
+        scanStartJob?.cancel()
+        scanStartJob = null
         scanTimeoutJob?.cancel()
         scanTimeoutJob = null
         try {
@@ -204,8 +401,10 @@ object BleManager : BleTransport {
     }
 
     private fun cancelHandshakeJobs() {
-        connectTimeoutJob?.cancel()
-        connectTimeoutJob = null
+        val timeoutToCancel = synchronized(gattLock) {
+            connectTimeoutJob.also { connectTimeoutJob = null }
+        }
+        timeoutToCancel?.cancel()
         mtuSetupJob?.cancel()
         mtuSetupJob = null
         mtuFallbackJob?.cancel()
@@ -221,6 +420,8 @@ object BleManager : BleTransport {
     private fun resetWriteQueue() {
         synchronized(writeLock) {
             writeSession++
+            writeAckTracker.reset()
+            activeWriteSeq = 0L
             writeDrainJob?.cancel()
             writeDrainJob = null
             pendingWriteAck?.cancel()
@@ -238,54 +439,102 @@ object BleManager : BleTransport {
         }
     }
 
-    @SuppressLint("MissingPermission")
-    private fun closeCurrentGatt(alreadyDisconnected: Boolean = false) {
-        val current: BluetoothGatt?
-        synchronized(gattLock) {
-            current = gatt
-            gatt = null
-            txCharacteristic = null
-            rxCharacteristic = null
-        }
-        if (current != null) {
-            closeGattGracefully(current, alreadyDisconnected)
-        }
+    private fun isHandshakeTimerActive(): Boolean = synchronized(gattLock) {
+        connectTimeoutJob?.isActive == true
     }
 
     @SuppressLint("MissingPermission")
-    private fun closeGattGracefully(target: BluetoothGatt, alreadyDisconnected: Boolean) {
-        val existingTimeout: Job?
-        synchronized(gattLock) {
-            existingTimeout = pendingCloseGatts.remove(target)
+    private fun closeCurrentGatt(alreadyDisconnected: Boolean = false) {
+        claimAndCloseActiveGatt(expectedGatt = null, alreadyDisconnected = alreadyDisconnected)
+    }
+
+    /**
+     * 原子认领活跃 GATT 句柄并在需要时登记优雅关闭流程，避免 timeout 与 STATE_DISCONNECTED 并发重复清理/重连。
+     * @return 当 expectedGatt 非空但当前活跃句柄已变更时返回 false；其余情况返回 true。
+     */
+    @SuppressLint("MissingPermission")
+    private fun claimAndCloseActiveGatt(
+        expectedGatt: BluetoothGatt? = null,
+        alreadyDisconnected: Boolean = false
+    ): Boolean {
+        var claimed: BluetoothGatt? = null
+        var timeoutToCancel: Job? = null
+        var oldPending: PendingGattClose? = null
+        lateinit var pendingEntry: PendingGattClose
+        val lazyCloseTimeoutJob = if (!alreadyDisconnected) {
+            scope.launch(start = CoroutineStart.LAZY) {
+                delay(GATT_CLOSE_TIMEOUT_MS)
+                val target = claimed ?: return@launch
+                val removed = synchronized(gattLock) {
+                    if (pendingCloseGatts[target] === pendingEntry) {
+                        pendingCloseGatts.remove(target)
+                    } else {
+                        null
+                    }
+                }
+                if (removed != null) {
+                    Log.w(TAG, "GATT disconnect callback timeout (${GATT_CLOSE_TIMEOUT_MS}ms), closing GATT")
+                    try {
+                        target.close()
+                    } catch (_: Exception) {
+                    }
+                    removed.completed.complete(Unit)
+                }
+            }
+        } else {
+            null
         }
-        existingTimeout?.cancel()
+        if (lazyCloseTimeoutJob != null) {
+            pendingEntry = PendingGattClose(lazyCloseTimeoutJob)
+        }
+
+        val matched = synchronized(gattLock) {
+            val current = gatt
+            if (expectedGatt != null && current !== expectedGatt) {
+                false
+            } else {
+                claimed = current
+                gatt = null
+                txCharacteristic = null
+                rxCharacteristic = null
+                physicalConnected = false
+                timeoutToCancel = connectTimeoutJob
+                connectTimeoutJob = null
+                if (current != null && lazyCloseTimeoutJob != null) {
+                    oldPending = pendingCloseGatts.remove(current)
+                    pendingCloseGatts[current] = pendingEntry
+                }
+                true
+            }
+        }
+
+        timeoutToCancel?.cancel()
+        if (!matched) {
+            lazyCloseTimeoutJob?.cancel()
+            return false
+        }
+
+        if (oldPending != null) {
+            oldPending!!.timeoutJob.cancel()
+            oldPending!!.completed.complete(Unit)
+        }
+
+        val target = claimed
+        if (target == null) {
+            lazyCloseTimeoutJob?.cancel()
+            return true
+        }
 
         if (alreadyDisconnected) {
+            lazyCloseTimeoutJob?.cancel()
             try {
                 target.close()
             } catch (_: Exception) {
             }
-            return
+            return true
         }
 
-        val timeoutJob = scope.launch {
-            delay(GATT_CLOSE_TIMEOUT_MS)
-            val shouldClose = synchronized(gattLock) {
-                pendingCloseGatts.remove(target) != null
-            }
-            if (shouldClose) {
-                Log.w(TAG, "GATT disconnect callback timeout (${GATT_CLOSE_TIMEOUT_MS}ms), closing GATT")
-                try {
-                    target.close()
-                } catch (_: Exception) {
-                }
-            }
-        }
-
-        synchronized(gattLock) {
-            pendingCloseGatts[target] = timeoutJob
-        }
-
+        lazyCloseTimeoutJob?.start()
         val disconnectOk = try {
             target.disconnect()
             true
@@ -295,12 +544,33 @@ object BleManager : BleTransport {
 
         if (!disconnectOk) {
             val removed = synchronized(gattLock) {
-                pendingCloseGatts.remove(target)
+                if (pendingCloseGatts[target] === pendingEntry) {
+                    pendingCloseGatts.remove(target)
+                } else {
+                    null
+                }
             }
-            removed?.cancel()
-            try {
-                target.close()
-            } catch (_: Exception) {
+            if (removed != null) {
+                removed.timeoutJob.cancel()
+                try {
+                    target.close()
+                } catch (_: Exception) {
+                }
+                removed.completed.complete(Unit)
+            }
+        }
+        return true
+    }
+
+    /** 挂起等待正在关闭的旧 GATT 回调或 800ms 超时完成，避免并发 connectGatt / startScan 争抢唯一硬件槽位 */
+    suspend fun awaitPendingGattClose(timeoutMs: Long = GATT_CLOSE_TIMEOUT_MS) {
+        val pendingDeferreds = synchronized(gattLock) {
+            pendingCloseGatts.values.map { it.completed }
+        }
+        if (pendingDeferreds.isEmpty()) return
+        withTimeoutOrNull(timeoutMs) {
+            for (deferred in pendingDeferreds) {
+                deferred.await()
             }
         }
     }
@@ -310,40 +580,62 @@ object BleManager : BleTransport {
         performDisconnect(userInitiated = userInitiated, alreadyDisconnected = false)
     }
 
-    /** 系统蓝牙关闭广播到来时立即清理连接并阻断无意义的自动重连；返回关闭前是否处于连接/扫描活动态 */
+    /** 系统蓝牙关闭广播到来时立即清理连接并阻断无意义的自动重连；返回关闭前是否处于连接/扫描/重连活动态 */
     override fun onBluetoothAdapterOff(): Boolean {
         btDisabledBySystem = true
-        val wasActive = _connectionState.value != ConnectionState.DISCONNECTED
+        val currentActive = _connectionState.value != ConnectionState.DISCONNECTED
+        val wasActive = reconnectTracker.onBluetoothAdapterOff(currentActive)
+        _reconnectState.value = reconnectTracker.uiState
         reconnectJob?.cancel()
         reconnectJob = null
         performDisconnect(
             userInitiated = false,
-            alreadyDisconnected = (bluetoothAdapter?.isEnabled != true)
+            alreadyDisconnected = (bluetoothAdapter?.isEnabled != true),
+            resetTracker = false
         )
         return wasActive
     }
 
     override fun onBluetoothAdapterOn() {
         btDisabledBySystem = false
+        _reconnectState.value = reconnectTracker.onBluetoothAdapterOn()
     }
 
-    private fun performDisconnect(userInitiated: Boolean, alreadyDisconnected: Boolean) {
-        if (userInitiated) {
-            userInitiatedDisconnect = true
-            lastDevice = null
-            reconnectJob?.cancel()
-            reconnectJob = null
-        }
+    private fun cleanupConnectionResources(alreadyDisconnected: Boolean) {
         stopScan()
+        connectJob?.cancel()
+        connectJob = null
         cancelHandshakeJobs()
         handshakeCompleted = false
+        physicalConnected = false
         discoveryStarted = false
         retriedDiscovery = false
+        currentAttemptWasDirect = false
+        currentAttemptWasManualRetryDirect = false
         _mtu.value = 23
         resetWriteQueue()
         // 清空残余半包，避免断线重连后第一条消息解析失败
         resetRxBuffer()
         closeCurrentGatt(alreadyDisconnected = alreadyDisconnected)
+    }
+
+    private fun performDisconnect(
+        userInitiated: Boolean,
+        alreadyDisconnected: Boolean,
+        resetTracker: Boolean = true
+    ) {
+        if (userInitiated) {
+            userInitiatedDisconnect = true
+            lastDevice = null
+            reconnectJob?.cancel()
+            reconnectJob = null
+            _reconnectState.value = reconnectTracker.onUserDisconnect()
+        } else if (resetTracker) {
+            reconnectJob?.cancel()
+            reconnectJob = null
+            _reconnectState.value = reconnectTracker.onSessionAbandoned()
+        }
+        cleanupConnectionResources(alreadyDisconnected = alreadyDisconnected)
         _connectionState.value = ConnectionState.DISCONNECTED
     }
 
@@ -518,6 +810,7 @@ object BleManager : BleTransport {
             var currentGatt: BluetoothGatt? = null
             var currentRx: BluetoothGattCharacteristic? = null
             var ackDeferred: CompletableDeferred<Int>? = null
+            var writeSeq = 0L
 
             synchronized(writeLock) {
                 if (writeSession != expectedSession || _connectionState.value != ConnectionState.CONNECTED) {
@@ -548,6 +841,8 @@ object BleManager : BleTransport {
                     lastAttemptCmd = cmdToSend
                     lastAttemptWasUrgent = isUrgent
                 }
+                writeSeq = writeAckTracker.nextSeq()
+                activeWriteSeq = writeSeq
                 ackDeferred = CompletableDeferred()
                 pendingWriteAck = ackDeferred
             }
@@ -561,6 +856,8 @@ object BleManager : BleTransport {
             val maxAllowed = maxCommandPayloadBytes()
             if (wireBytes.size > maxAllowed) {
                 synchronized(writeLock) {
+                    writeAckTracker.disarm(writeSeq)
+                    if (activeWriteSeq == writeSeq) activeWriteSeq = 0L
                     if (pendingWriteAck === ack) pendingWriteAck = null
                     dequeueHandledCommandLocked(expectedSession, isUrgent, cmd)
                 }
@@ -573,36 +870,63 @@ object BleManager : BleTransport {
             val writeStartMs = SystemClock.elapsedRealtime()
             when (val result = writeCharacteristicCompat(g, rx, wireBytes)) {
                 WriteAttemptResult.Accepted -> {
-                    synchronized(writeLock) {
-                        if (writeSession != expectedSession) {
-                            if (pendingWriteAck === ack) pendingWriteAck = null
-                            return
-                        }
-                        dequeueHandledCommandLocked(expectedSession, isUrgent, cmd)
-                    }
-                    lastAttemptCmd = null
-                    retryCount = 0
-
                     val ackStatus = withTimeoutOrNull(WRITE_ACK_TIMEOUT_MS) {
                         ack.await()
                     }
-                    synchronized(writeLock) {
+                    val sessionValid = synchronized(writeLock) {
+                        writeAckTracker.disarm(writeSeq)
+                        if (activeWriteSeq == writeSeq) activeWriteSeq = 0L
                         if (pendingWriteAck === ack) {
                             pendingWriteAck = null
                         }
+                        writeSession == expectedSession
                     }
-                    val elapsedMs = SystemClock.elapsedRealtime() - writeStartMs
-                    val minGapMs = if (ackStatus != null && ackStatus != BluetoothGatt.GATT_SUCCESS) {
-                        60L
+                    if (!sessionValid) {
+                        return
+                    }
+
+                    if (ackStatus != null && ackStatus != BluetoothGatt.GATT_SUCCESS) {
+                        val preemptedByUrgent = !isUrgent && synchronized(writeLock) { pendingEmergencyStop != null }
+                        if (preemptedByUrgent) {
+                            lastAttemptCmd = null
+                            retryCount = 0
+                            continue
+                        }
+                        retryCount++
+                        val maxRetries = if (isUrgent) MAX_URGENT_WRITE_RETRIES else MAX_WRITE_RETRIES
+                        if (retryCount > maxRetries) {
+                            synchronized(writeLock) {
+                                dequeueHandledCommandLocked(expectedSession, isUrgent, cmd)
+                            }
+                            lastAttemptCmd = null
+                            retryCount = 0
+                            onScanError?.invoke("BLE 写入失败 (code=$ackStatus)，指令未能发出: $cmd")
+                        } else {
+                            val baseDelay = if (isUrgent) 25L else 60L
+                            val backoffMs = (baseDelay shl (retryCount - 1)).coerceAtMost(240L)
+                            Log.w(TAG, "GATT write ack status=$ackStatus for '$cmd', retry #$retryCount in ${backoffMs}ms")
+                            if (isUrgent) {
+                                delay(backoffMs)
+                            } else {
+                                delayInterruptibleForUrgent(backoffMs, expectedSession)
+                            }
+                        }
                     } else {
-                        MIN_WRITE_INTERVAL_MS
+                        synchronized(writeLock) {
+                            dequeueHandledCommandLocked(expectedSession, isUrgent, cmd)
+                        }
+                        lastAttemptCmd = null
+                        retryCount = 0
+                        val elapsedMs = SystemClock.elapsedRealtime() - writeStartMs
+                        val waitMs = (MIN_WRITE_INTERVAL_MS - elapsedMs).coerceAtLeast(0L)
+                        delayInterruptibleForUrgent(waitMs, expectedSession)
                     }
-                    val waitMs = (minGapMs - elapsedMs).coerceAtLeast(0L)
-                    delayInterruptibleForUrgent(waitMs, expectedSession)
                 }
 
                 WriteAttemptResult.Busy -> {
                     synchronized(writeLock) {
+                        writeAckTracker.disarm(writeSeq)
+                        if (activeWriteSeq == writeSeq) activeWriteSeq = 0L
                         if (pendingWriteAck === ack) {
                             pendingWriteAck = null
                         }
@@ -637,6 +961,8 @@ object BleManager : BleTransport {
 
                 is WriteAttemptResult.Failed -> {
                     synchronized(writeLock) {
+                        writeAckTracker.disarm(writeSeq)
+                        if (activeWriteSeq == writeSeq) activeWriteSeq = 0L
                         if (pendingWriteAck === ack) {
                             pendingWriteAck = null
                         }
@@ -658,74 +984,301 @@ object BleManager : BleTransport {
 
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
-            // 重入守卫：低延迟扫描下 stopScan 生效前可能连续回调，避免重复 connectGatt 泄漏句柄
-            if (_connectionState.value != ConnectionState.SCANNING) return
             val device = result.device
+            // 原子重入与目标守卫：
+            // 1) 自动重连阶段按 lastDevice MAC 匹配，避免周边无关 NUS 设备劫持重连会话；
+            // 2) 通过 scanLock 原子消费本次扫描，防止低延迟连续回调或扫描超时竞争触发重复 connectGatt。
+            val captured = synchronized(scanLock) {
+                if (!scanActive || _connectionState.value != ConnectionState.SCANNING) {
+                    false
+                } else {
+                    val expectedAddress = if (reconnectTracker.shouldAutoReconnect) lastDevice?.address else null
+                    if (expectedAddress != null && device.address != expectedAddress) {
+                        false
+                    } else {
+                        scanActive = false
+                        scanGeneration++
+                        true
+                    }
+                }
+            }
+            if (!captured) return
             Log.i(TAG, "Found: ${device.name} ${device.address}")
             stopScan()
-            connect(device)
+            connect(device, fromReconnect = reconnectTracker.shouldAutoReconnect, fromScan = true)
         }
 
         override fun onScanFailed(errorCode: Int) {
             Log.e(TAG, "Scan failed: $errorCode")
+            synchronized(scanLock) {
+                scanActive = false
+                scanGeneration++
+            }
+            scanStartJob?.cancel()
+            scanStartJob = null
             scanTimeoutJob?.cancel()
             scanTimeoutJob = null
-            _connectionState.value = ConnectionState.DISCONNECTED
-            onScanError?.invoke("扫描失败 (code=$errorCode)")
-        }
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun connect(device: BluetoothDevice) {
-        cancelHandshakeJobs()
-        reconnectJob?.cancel()
-        reconnectJob = null
-        resetWriteQueue()
-        resetRxBuffer()
-        closeCurrentGatt(alreadyDisconnected = false)
-
-        userInitiatedDisconnect = false
-        lastDevice = device
-        handshakeCompleted = false
-        discoveryStarted = false
-        retriedDiscovery = false
-        _mtu.value = 23
-        _connectionState.value = ConnectionState.CONNECTING
-
-        val ctx = appContext ?: run {
-            _connectionState.value = ConnectionState.DISCONNECTED
-            return
-        }
-        val newGatt = try {
-            device.connectGatt(ctx, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
-        } catch (e: SecurityException) {
-            _connectionState.value = ConnectionState.DISCONNECTED
-            onScanError?.invoke("缺少蓝牙连接权限，请在系统设置中授权")
-            return
-        }
-        if (newGatt == null) {
-            _connectionState.value = ConnectionState.DISCONNECTED
-            onScanError?.invoke("无法发起 BLE GATT 连接")
-            return
-        }
-        synchronized(gattLock) {
-            gatt = newGatt
-        }
-
-        // 15 秒总握手超时：覆盖物理连接、MTU 协商、服务发现和 Notify 订阅，直到进入 CONNECTED 才取消
-        connectTimeoutJob = scope.launch {
-            delay(15_000)
-            if (gatt === newGatt && _connectionState.value == ConnectionState.CONNECTING) {
-                failHandshake("GATT 握手超时，请复位开发板或取消后重试", newGatt)
+            if (reconnectTracker.shouldAutoReconnect && !userInitiatedDisconnect && !btDisabledBySystem) {
+                handleReconnectFailure(
+                    status = errorCode,
+                    alreadyDisconnected = true,
+                    errorMessage = "扫描失败 (code=$errorCode)",
+                    wasDirectAttempt = false,
+                    wasManualRetryDirect = false
+                )
+            } else {
+                _connectionState.value = ConnectionState.DISCONNECTED
+                onScanError?.invoke("扫描失败 (code=$errorCode)")
             }
         }
     }
 
-    private fun failHandshake(reason: String, targetGatt: BluetoothGatt? = null) {
-        if (targetGatt != null && targetGatt != gatt) return
+    @SuppressLint("MissingPermission")
+    private fun connect(
+        device: BluetoothDevice,
+        fromReconnect: Boolean = false,
+        fromScan: Boolean = false,
+        fromManualRetry: Boolean = false
+    ) {
+        if (fromReconnect && (userInitiatedDisconnect || btDisabledBySystem || !reconnectTracker.shouldAutoReconnect)) {
+            return
+        }
+        cancelHandshakeJobs()
+        connectJob?.cancel()
+        connectJob = null
+        if (!fromReconnect) {
+            btDisabledBySystem = false
+            userInitiatedDisconnect = false
+            reconnectJob?.cancel()
+            reconnectJob = null
+        }
+        resetWriteQueue()
+        resetRxBuffer()
+        closeCurrentGatt(alreadyDisconnected = false)
+
+        lastDevice = device
+        handshakeCompleted = false
+        physicalConnected = false
+        discoveryStarted = false
+        retriedDiscovery = false
+        currentAttemptWasDirect = !fromScan
+        currentAttemptWasManualRetryDirect = fromManualRetry && !fromScan
+        _mtu.value = 23
+        _connectionState.value = ConnectionState.CONNECTING
+
+        val ctx = appContext ?: run {
+            currentAttemptWasDirect = false
+            currentAttemptWasManualRetryDirect = false
+            _connectionState.value = ConnectionState.DISCONNECTED
+            return
+        }
+
+        val job = scope.launch(start = CoroutineStart.LAZY) {
+            val myJob = currentCoroutineContext()[Job]
+            awaitPendingGattClose(GATT_CLOSE_TIMEOUT_MS)
+            if (!isActive ||
+                connectJob !== myJob ||
+                userInitiatedDisconnect ||
+                btDisabledBySystem ||
+                (fromReconnect && !reconnectTracker.shouldAutoReconnect) ||
+                _connectionState.value != ConnectionState.CONNECTING
+            ) {
+                return@launch
+            }
+
+            val newGatt = try {
+                device.connectGatt(ctx, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+            } catch (e: SecurityException) {
+                currentAttemptWasDirect = false
+                currentAttemptWasManualRetryDirect = false
+                val msg = "缺少蓝牙连接权限，请在系统设置中授权"
+                if (reconnectTracker.shouldAutoReconnect) {
+                    _reconnectState.value = reconnectTracker.exhaustNow(msg)
+                }
+                _connectionState.value = ConnectionState.DISCONNECTED
+                onScanError?.invoke(msg)
+                return@launch
+            }
+            if (newGatt == null) {
+                if (reconnectTracker.shouldAutoReconnect && !userInitiatedDisconnect && !btDisabledBySystem) {
+                    handleReconnectFailure(
+                        status = BleReconnectTracker.GATT_ERROR_133,
+                        alreadyDisconnected = true,
+                        errorMessage = "无法发起 BLE GATT 连接",
+                        wasDirectAttempt = currentAttemptWasDirect,
+                        wasManualRetryDirect = currentAttemptWasManualRetryDirect
+                    )
+                } else {
+                    currentAttemptWasDirect = false
+                    currentAttemptWasManualRetryDirect = false
+                    _connectionState.value = ConnectionState.DISCONNECTED
+                    onScanError?.invoke("无法发起 BLE GATT 连接")
+                }
+                return@launch
+            }
+
+            // 两阶段超时保护：物理建链采用短超时（直连 4.5s / 扫描 8s），进入 STATE_CONNECTED 后在 gattLock 下无缝切换为 10s GATT 握手超时。
+            val physicalTimeoutMs = BleReconnectTracker.physicalConnectTimeoutMs(fromScan)
+            lateinit var lazyTimeoutJob: Job
+            lazyTimeoutJob = scope.launch(start = CoroutineStart.LAZY) {
+                delay(physicalTimeoutMs)
+                val shouldTimeout = synchronized(gattLock) {
+                    isActive &&
+                        connectTimeoutJob === lazyTimeoutJob &&
+                        gatt === newGatt &&
+                        !physicalConnected &&
+                        !handshakeCompleted &&
+                        _connectionState.value == ConnectionState.CONNECTING
+                }
+                if (shouldTimeout) {
+                    val timeoutReason = if (!fromScan && reconnectTracker.shouldAutoReconnect) {
+                        "BLE 直连超时，正在切换扫描重连"
+                    } else {
+                        "GATT 连接超时，请复位开发板或取消后重试"
+                    }
+                    failHandshake(
+                        reason = timeoutReason,
+                        targetGatt = newGatt,
+                        status = BleReconnectTracker.GATT_ERROR_CONNECT_TIMEOUT
+                    )
+                }
+            }
+
+            var prevTimeoutJob: Job? = null
+            val adopted = synchronized(gattLock) {
+                if (isActive &&
+                    connectJob === myJob &&
+                    !userInitiatedDisconnect &&
+                    !btDisabledBySystem &&
+                    (!fromReconnect || reconnectTracker.shouldAutoReconnect) &&
+                    _connectionState.value == ConnectionState.CONNECTING
+                ) {
+                    gatt = newGatt
+                    physicalConnected = false
+                    prevTimeoutJob = connectTimeoutJob
+                    connectTimeoutJob = lazyTimeoutJob
+                    true
+                } else {
+                    false
+                }
+            }
+            prevTimeoutJob?.cancel()
+            if (!adopted) {
+                lazyTimeoutJob.cancel()
+                try {
+                    newGatt.close()
+                } catch (_: Exception) {
+                }
+                return@launch
+            }
+            lazyTimeoutJob.start()
+        }
+        connectJob = job
+        job.start()
+    }
+
+    private fun handleReconnectFailure(
+        status: Int,
+        alreadyDisconnected: Boolean,
+        errorMessage: String,
+        wasDirectAttempt: Boolean = currentAttemptWasDirect,
+        wasManualRetryDirect: Boolean = currentAttemptWasManualRetryDirect
+    ) {
+        val savedDev = lastDevice
+        cleanupConnectionResources(alreadyDisconnected = alreadyDisconnected)
+        val step = reconnectTracker.nextReconnectStep(
+            status = status,
+            hasCachedDevice = savedDev != null,
+            errorMessage = errorMessage,
+            forceScanFallback = wasDirectAttempt
+        )
+        when (step) {
+            ReconnectStep.Ignore -> {
+                _reconnectState.value = reconnectTracker.uiState
+                _connectionState.value = ConnectionState.DISCONNECTED
+                onScanError?.invoke(errorMessage)
+            }
+            is ReconnectStep.Retry -> {
+                _reconnectState.value = reconnectTracker.uiState
+                _connectionState.value = if (step.useScan) {
+                    ConnectionState.SCANNING
+                } else {
+                    ConnectionState.CONNECTING
+                }
+                if (step.attempt == 1) {
+                    val toastMsg = if (wasManualRetryDirect) {
+                        "直连未成功，正在切换扫描重连..."
+                    } else {
+                        "蓝牙连接意外断开，正在自动重连..."
+                    }
+                    onScanError?.invoke(toastMsg)
+                }
+                reconnectJob?.cancel()
+                val delayJob = scope.launch(start = CoroutineStart.LAZY) {
+                    val myReconnectJob = currentCoroutineContext()[Job]
+                    delay(step.delayMs)
+                    if (!isActive ||
+                        reconnectJob !== myReconnectJob ||
+                        userInitiatedDisconnect ||
+                        btDisabledBySystem ||
+                        !reconnectTracker.shouldAutoReconnect
+                    ) {
+                        return@launch
+                    }
+                    if (step.useScan || savedDev == null) {
+                        startScanInternal(fromReconnect = true)
+                    } else {
+                        connect(savedDev, fromReconnect = true, fromScan = false)
+                    }
+                }
+                reconnectJob = delayJob
+                delayJob.start()
+            }
+            is ReconnectStep.Exhausted -> {
+                _reconnectState.value = step.uiState
+                _connectionState.value = ConnectionState.DISCONNECTED
+                onScanError?.invoke(step.uiState.lastError ?: "自动重连失败，请点击重试")
+            }
+        }
+    }
+
+    private fun failHandshake(
+        reason: String,
+        targetGatt: BluetoothGatt? = null,
+        status: Int = BluetoothGatt.GATT_FAILURE
+    ) {
+        val btOff = btDisabledBySystem || (bluetoothAdapter?.isEnabled != true)
+        val wasDirectAttempt = currentAttemptWasDirect
+        val wasManualRetryDirect = currentAttemptWasManualRetryDirect
+        if (!claimAndCloseActiveGatt(expectedGatt = targetGatt, alreadyDisconnected = btOff)) {
+            return
+        }
         Log.e(TAG, "Handshake failed: $reason")
-        disconnect(userInitiated = false)
-        onScanError?.invoke(reason)
+        if (btOff) {
+            if (!userInitiatedDisconnect) {
+                reconnectTracker.onDisconnectWhileBtOff(
+                    wasActiveSession = _connectionState.value != ConnectionState.DISCONNECTED
+                )
+                _reconnectState.value = reconnectTracker.uiState
+            }
+            reconnectJob?.cancel()
+            reconnectJob = null
+            cleanupConnectionResources(alreadyDisconnected = true)
+            _connectionState.value = ConnectionState.DISCONNECTED
+            return
+        }
+        if (!userInitiatedDisconnect && reconnectTracker.shouldAutoReconnect) {
+            handleReconnectFailure(
+                status = status,
+                alreadyDisconnected = false,
+                errorMessage = reason,
+                wasDirectAttempt = wasDirectAttempt,
+                wasManualRetryDirect = wasManualRetryDirect
+            )
+        } else {
+            performDisconnect(userInitiated = false, alreadyDisconnected = false)
+            onScanError?.invoke(reason)
+        }
     }
 
     private fun refreshGattCache(gatt: BluetoothGatt): Boolean {
@@ -740,7 +1293,7 @@ object BleManager : BleTransport {
 
     @SuppressLint("MissingPermission")
     private fun startServiceDiscovery(gatt: BluetoothGatt) {
-        if (gatt != this.gatt || discoveryStarted) return
+        if (gatt !== this.gatt || discoveryStarted || _connectionState.value != ConnectionState.CONNECTING) return
         discoveryStarted = true
         mtuFallbackJob?.cancel()
         mtuFallbackJob = null
@@ -752,6 +1305,33 @@ object BleManager : BleTransport {
         if (!started) {
             failHandshake("无法启动 GATT 服务发现", gatt)
         }
+    }
+
+    /** 服务发现失败或服务列表暂未就绪时刷新 GATT 缓存并安排一次延迟重试 */
+    private fun retryServiceDiscoveryIfEligible(
+        gatt: BluetoothGatt,
+        reasonFormatter: (refreshed: Boolean) -> String
+    ): Boolean {
+        if (retriedDiscovery || !isHandshakeTimerActive()) return false
+        retriedDiscovery = true
+        discoveryStarted = false
+        val refreshed = refreshGattCache(gatt)
+        Log.w(TAG, reasonFormatter(refreshed))
+        mtuSetupJob?.cancel()
+        val retryJob = scope.launch(start = CoroutineStart.LAZY) {
+            val myRetryJob = currentCoroutineContext()[Job]
+            delay(300)
+            if (isActive &&
+                mtuSetupJob === myRetryJob &&
+                gatt === this@BleManager.gatt &&
+                _connectionState.value == ConnectionState.CONNECTING
+            ) {
+                startServiceDiscovery(gatt)
+            }
+        }
+        mtuSetupJob = retryJob
+        retryJob.start()
+        return true
     }
 
     @SuppressLint("MissingPermission")
@@ -775,9 +1355,30 @@ object BleManager : BleTransport {
     }
 
     private fun markConnected(gatt: BluetoothGatt) {
-        if (gatt != this.gatt) return
-        cancelHandshakeJobs()
-        handshakeCompleted = true
+        var timeoutToCancel: Job? = null
+        val accepted = synchronized(gattLock) {
+            if (gatt !== this.gatt ||
+                userInitiatedDisconnect ||
+                btDisabledBySystem ||
+                _connectionState.value != ConnectionState.CONNECTING
+            ) {
+                false
+            } else {
+                handshakeCompleted = true
+                timeoutToCancel = connectTimeoutJob
+                connectTimeoutJob = null
+                currentAttemptWasDirect = false
+                currentAttemptWasManualRetryDirect = false
+                true
+            }
+        }
+        if (!accepted) return
+        timeoutToCancel?.cancel()
+        mtuSetupJob?.cancel()
+        mtuSetupJob = null
+        mtuFallbackJob?.cancel()
+        mtuFallbackJob = null
+        _reconnectState.value = reconnectTracker.markConnected()
         _connectionState.value = ConnectionState.CONNECTED
         Log.i(TAG, "Notify channel ready")
         syncAfterConnect()
@@ -787,16 +1388,17 @@ object BleManager : BleTransport {
         @SuppressLint("MissingPermission")
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                val closingTimeout = synchronized(gattLock) {
+                val pending = synchronized(gattLock) {
                     pendingCloseGatts.remove(gatt)
                 }
-                if (closingTimeout != null) {
-                    closingTimeout.cancel()
+                if (pending != null) {
+                    pending.timeoutJob.cancel()
                     Log.i(TAG, "Graceful disconnect completed (status=$status), closing GATT")
                     try {
                         gatt.close()
                     } catch (_: Exception) {
                     }
+                    pending.completed.complete(Unit)
                     return
                 }
             }
@@ -804,14 +1406,59 @@ object BleManager : BleTransport {
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
                     if (status == BluetoothGatt.GATT_SUCCESS) {
+                        lateinit var handshakeTimeoutJob: Job
+                        handshakeTimeoutJob = scope.launch(start = CoroutineStart.LAZY) {
+                            delay(BleReconnectTracker.GATT_HANDSHAKE_TIMEOUT_MS)
+                            val shouldTimeout = synchronized(gattLock) {
+                                isActive &&
+                                    connectTimeoutJob === handshakeTimeoutJob &&
+                                    this@BleManager.gatt === gatt &&
+                                    !handshakeCompleted &&
+                                    _connectionState.value == ConnectionState.CONNECTING
+                            }
+                            if (shouldTimeout) {
+                                failHandshake("GATT 握手超时，请复位开发板或取消后重试", gatt)
+                            }
+                        }
+                        var prevTimeoutJob: Job? = null
+                        val stillActive = synchronized(gattLock) {
+                            if (gatt === this@BleManager.gatt &&
+                                !userInitiatedDisconnect &&
+                                !btDisabledBySystem &&
+                                _connectionState.value == ConnectionState.CONNECTING
+                            ) {
+                                physicalConnected = true
+                                prevTimeoutJob = connectTimeoutJob
+                                connectTimeoutJob = handshakeTimeoutJob
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        prevTimeoutJob?.cancel()
+                        if (!stillActive) {
+                            handshakeTimeoutJob.cancel()
+                            return
+                        }
+                        handshakeTimeoutJob.start()
                         reconnectJob?.cancel()
                         reconnectJob = null
+                        // 仅允许 BALANCED（避免 HIGH 触发固件 appGapCallback 拒绝），随后交由固件 1.5s 协商接管
+                        try {
+                            gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_BALANCED)
+                        } catch (_: Exception) {
+                        }
                         Log.i(TAG, "Connected, scheduling MTU 247 & service discovery")
                         // 留出 400ms 错开板子端 slave_init_mtu_req 协商，避免双向 MTU Exchange 冲突；2.2s 兜底继续发现服务
                         mtuSetupJob?.cancel()
-                        mtuSetupJob = scope.launch {
+                        val setupJob = scope.launch(start = CoroutineStart.LAZY) {
+                            val myMtuJob = currentCoroutineContext()[Job]
                             delay(400)
-                            if (gatt !== this@BleManager.gatt || _connectionState.value != ConnectionState.CONNECTING) {
+                            if (!isActive ||
+                                mtuSetupJob !== myMtuJob ||
+                                gatt !== this@BleManager.gatt ||
+                                _connectionState.value != ConnectionState.CONNECTING
+                            ) {
                                 return@launch
                             }
                             val ok = try {
@@ -824,10 +1471,16 @@ object BleManager : BleTransport {
                                 startServiceDiscovery(gatt)
                             }
                         }
+                        mtuSetupJob = setupJob
+                        setupJob.start()
+
                         mtuFallbackJob?.cancel()
-                        mtuFallbackJob = scope.launch {
+                        val fallbackJob = scope.launch(start = CoroutineStart.LAZY) {
+                            val myFallbackJob = currentCoroutineContext()[Job]
                             delay(2_200)
-                            if (gatt === this@BleManager.gatt &&
+                            if (isActive &&
+                                mtuFallbackJob === myFallbackJob &&
+                                gatt === this@BleManager.gatt &&
                                 _connectionState.value == ConnectionState.CONNECTING &&
                                 !discoveryStarted
                             ) {
@@ -835,34 +1488,57 @@ object BleManager : BleTransport {
                                 startServiceDiscovery(gatt)
                             }
                         }
+                        mtuFallbackJob = fallbackJob
+                        fallbackJob.start()
                     } else {
                         Log.e(TAG, "Connected with error status=$status")
-                        failHandshake("连接失败 (code=$status)", gatt)
+                        failHandshake("连接失败 (code=$status)", gatt, status = status)
                     }
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     val btOff = btDisabledBySystem || (bluetoothAdapter?.isEnabled != true)
                     val unexpected = !userInitiatedDisconnect && !btOff
-                    val wasConnected = handshakeCompleted
-                    val savedDev = lastDevice
-                    Log.i(TAG, "Disconnected (status=$status, btOff=$btOff, unexpected=$unexpected, wasConnected=$wasConnected)")
-                    performDisconnect(userInitiated = false, alreadyDisconnected = true)
-                    if (btOff) {
+                    val wasActiveSession =
+                        _connectionState.value != ConnectionState.DISCONNECTED ||
+                            reconnectTracker.wasSessionActiveForBtOff()
+                    val wasDirectAttempt = currentAttemptWasDirect
+                    val wasManualRetryDirect = currentAttemptWasManualRetryDirect
+                    if (!claimAndCloseActiveGatt(expectedGatt = gatt, alreadyDisconnected = true)) {
                         return
                     }
-                    if (unexpected && wasConnected && savedDev != null) {
-                        onScanError?.invoke("蓝牙连接意外断开，正在自动重连...")
-                        reconnectJob?.cancel()
-                        reconnectJob = scope.launch {
-                            delay(1500)
-                            if (isActive && !userInitiatedDisconnect && _connectionState.value == ConnectionState.DISCONNECTED) {
-                                connect(savedDev)
-                            }
+                    Log.i(
+                        TAG,
+                        "Disconnected (status=$status, btOff=$btOff, unexpected=$unexpected, shouldReconnect=${reconnectTracker.shouldAutoReconnect})"
+                    )
+                    if (btOff) {
+                        if (!userInitiatedDisconnect && wasActiveSession) {
+                            reconnectTracker.onDisconnectWhileBtOff(wasActiveSession = true)
+                            _reconnectState.value = reconnectTracker.uiState
                         }
-                    } else if (unexpected) {
-                        onScanError?.invoke("连接/GATT 握手中断 (code=$status)，请确认未在系统蓝牙配对并重试")
-                    } else if (status != BluetoothGatt.GATT_SUCCESS) {
-                        onScanError?.invoke("连接失败 (code=$status)")
+                        reconnectJob?.cancel()
+                        reconnectJob = null
+                        cleanupConnectionResources(alreadyDisconnected = true)
+                        _connectionState.value = ConnectionState.DISCONNECTED
+                        return
+                    }
+                    if (unexpected) {
+                        val msg = if (reconnectTracker.shouldAutoReconnect) {
+                            "蓝牙连接断开 (code=$status)"
+                        } else {
+                            "连接/GATT 握手中断 (code=$status)，请确认未在系统蓝牙配对并重试"
+                        }
+                        handleReconnectFailure(
+                            status = status,
+                            alreadyDisconnected = true,
+                            errorMessage = msg,
+                            wasDirectAttempt = wasDirectAttempt,
+                            wasManualRetryDirect = wasManualRetryDirect
+                        )
+                    } else {
+                        performDisconnect(userInitiated = false, alreadyDisconnected = true)
+                        if (status != BluetoothGatt.GATT_SUCCESS) {
+                            onScanError?.invoke("连接失败 (code=$status)")
+                        }
                     }
                 }
             }
@@ -876,34 +1552,32 @@ object BleManager : BleTransport {
             }
             mtuFallbackJob?.cancel()
             mtuFallbackJob = null
-            startServiceDiscovery(gatt)
+            if (_connectionState.value == ConnectionState.CONNECTING) {
+                startServiceDiscovery(gatt)
+            }
         }
 
         @SuppressLint("MissingPermission")
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-            if (gatt != this@BleManager.gatt) return
+            if (gatt !== this@BleManager.gatt || _connectionState.value != ConnectionState.CONNECTING) return
             if (status != BluetoothGatt.GATT_SUCCESS) {
-                Log.e(TAG, "Service discovery failed: $status")
-                failHandshake("GATT 服务发现失败 (code=$status)", gatt)
+                if (!retryServiceDiscoveryIfEligible(gatt) { refreshed ->
+                        "Service discovery failed (status=$status, refreshed=$refreshed), retrying in 300ms"
+                    }
+                ) {
+                    Log.e(TAG, "Service discovery failed: $status")
+                    failHandshake("GATT 服务发现失败 (code=$status)", gatt, status = status)
+                }
                 return
             }
             val service = gatt.getService(SERVICE_UUID)
             val tx = service?.getCharacteristic(CHAR_TX_UUID)
             val rx = service?.getCharacteristic(CHAR_RX_UUID)
             if (service == null || tx == null || rx == null) {
-                if (!retriedDiscovery) {
-                    retriedDiscovery = true
-                    discoveryStarted = false
-                    val refreshed = refreshGattCache(gatt)
-                    Log.w(TAG, "NUS service not ready (refreshed=$refreshed), retrying service discovery")
-                    mtuSetupJob?.cancel()
-                    mtuSetupJob = scope.launch {
-                        delay(300)
-                        if (gatt == this@BleManager.gatt && _connectionState.value == ConnectionState.CONNECTING) {
-                            startServiceDiscovery(gatt)
-                        }
+                if (!retryServiceDiscoveryIfEligible(gatt) { refreshed ->
+                        "NUS service not ready (refreshed=$refreshed), retrying service discovery"
                     }
-                } else {
+                ) {
                     failHandshake("未发现 WiFi-Deck NUS 服务，请检查固件并重试", gatt)
                 }
                 return
@@ -920,14 +1594,21 @@ object BleManager : BleTransport {
                 if (!writeCccd(gatt, descriptor)) {
                     Log.w(TAG, "writeCccd returned false, retrying once after 200ms")
                     mtuSetupJob?.cancel()
-                    mtuSetupJob = scope.launch {
+                    val retryJob = scope.launch(start = CoroutineStart.LAZY) {
+                        val myRetryJob = currentCoroutineContext()[Job]
                         delay(200)
-                        if (gatt == this@BleManager.gatt && _connectionState.value == ConnectionState.CONNECTING) {
+                        if (isActive &&
+                            mtuSetupJob === myRetryJob &&
+                            gatt === this@BleManager.gatt &&
+                            _connectionState.value == ConnectionState.CONNECTING
+                        ) {
                             if (!writeCccd(gatt, descriptor)) {
                                 failHandshake("订阅 Notify CCCD 失败", gatt)
                             }
                         }
                     }
+                    mtuSetupJob = retryJob
+                    retryJob.start()
                 }
             } else {
                 markConnected(gatt)
@@ -940,12 +1621,12 @@ object BleManager : BleTransport {
             descriptor: BluetoothGattDescriptor,
             status: Int
         ) {
-            if (gatt != this@BleManager.gatt) return
+            if (gatt !== this@BleManager.gatt || _connectionState.value != ConnectionState.CONNECTING) return
             if (status == BluetoothGatt.GATT_SUCCESS) {
                 markConnected(gatt)
             } else {
                 Log.e(TAG, "onDescriptorWrite failed: $status")
-                failHandshake("开启数据通知失败 (code=$status)", gatt)
+                failHandshake("开启数据通知失败 (code=$status)", gatt, status = status)
             }
         }
 
@@ -958,7 +1639,15 @@ object BleManager : BleTransport {
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 Log.e(TAG, "Write callback failed: $status")
             }
-            val ack = synchronized(writeLock) { pendingWriteAck }
+            val ack = synchronized(writeLock) {
+                if (writeAckTracker.matches(activeWriteSeq, characteristic.uuid, CHAR_RX_UUID)) {
+                    writeAckTracker.disarm(activeWriteSeq)
+                    activeWriteSeq = 0L
+                    pendingWriteAck.also { pendingWriteAck = null }
+                } else {
+                    null
+                }
+            }
             ack?.complete(status)
         }
 

@@ -42,25 +42,30 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import io.github.xiangwen.wifideck.R
 import io.github.xiangwen.wifideck.data.BleGatePrompt
 import io.github.xiangwen.wifideck.data.BleManager
 import io.github.xiangwen.wifideck.data.DeviceConfig
 import io.github.xiangwen.wifideck.data.DeviceStatus
+import io.github.xiangwen.wifideck.data.ReconnectUiState
 import io.github.xiangwen.wifideck.ui.theme.DeckColors
 
 @Composable
 fun TopStatusHeader(
     state: BleManager.ConnectionState,
+    reconnectState: ReconnectUiState = ReconnectUiState(),
     status: DeviceStatus,
     config: DeviceConfig,
     apCount: Int,
     selectedCount: Int,
     onConnect: () -> Unit,
+    onRetryReconnect: () -> Unit = onConnect,
     onCancelConnect: () -> Unit = {},
     onStopAll: () -> Unit
 ) {
@@ -79,9 +84,39 @@ fun TopStatusHeader(
             }
             c to sub
         }
-        BleManager.ConnectionState.CONNECTING -> DeckColors.Amber to "正在建立 GATT 握手..."
-        BleManager.ConnectionState.SCANNING -> DeckColors.Blue to "正在搜索附近设备..."
-        BleManager.ConnectionState.DISCONNECTED -> DeckColors.TextMuted to "未连接开发板"
+        BleManager.ConnectionState.CONNECTING -> {
+            val sub = if (reconnectState.isReconnecting) {
+                stringResource(
+                    R.string.ble_status_reconnecting,
+                    reconnectState.attempt.coerceAtLeast(1),
+                    reconnectState.maxAttempts
+                )
+            } else {
+                "正在建立 GATT 握手..."
+            }
+            DeckColors.Amber to sub
+        }
+        BleManager.ConnectionState.SCANNING -> {
+            val sub = if (reconnectState.isReconnecting) {
+                stringResource(
+                    R.string.ble_status_reconnecting_scan,
+                    reconnectState.attempt.coerceAtLeast(1),
+                    reconnectState.maxAttempts
+                )
+            } else {
+                "正在搜索附近设备..."
+            }
+            DeckColors.Blue to sub
+        }
+        BleManager.ConnectionState.DISCONNECTED -> when {
+            reconnectState.isReconnecting -> DeckColors.Amber to stringResource(
+                R.string.ble_status_reconnecting,
+                reconnectState.attempt.coerceAtLeast(1),
+                reconnectState.maxAttempts
+            )
+            reconnectState.isExhausted -> DeckColors.Crimson to stringResource(R.string.ble_status_reconnect_exhausted)
+            else -> DeckColors.TextMuted to "未连接开发板"
+        }
     }
 
     Column(
@@ -173,7 +208,10 @@ fun TopStatusHeader(
                     Spacer(modifier = Modifier.width(5.dp))
                     Text("急停", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.White)
                 }
-            } else if (state == BleManager.ConnectionState.SCANNING || state == BleManager.ConnectionState.CONNECTING) {
+            } else if (state == BleManager.ConnectionState.SCANNING ||
+                state == BleManager.ConnectionState.CONNECTING ||
+                reconnectState.isReconnecting
+            ) {
                 Button(
                     onClick = onCancelConnect,
                     colors = ButtonDefaults.buttonColors(containerColor = DeckColors.BgElevated),
@@ -184,7 +222,11 @@ fun TopStatusHeader(
                         .border(1.dp, DeckColors.BorderStrong, RoundedCornerShape(8.dp))
                 ) {
                     Text(
-                        text = if (state == BleManager.ConnectionState.SCANNING) "取消搜索" else "取消连接",
+                        text = when {
+                            reconnectState.isReconnecting -> "取消重连"
+                            state == BleManager.ConnectionState.SCANNING -> "取消搜索"
+                            else -> "取消连接"
+                        },
                         fontSize = 12.sp,
                         color = DeckColors.Amber,
                         fontWeight = FontWeight.Medium
@@ -192,7 +234,7 @@ fun TopStatusHeader(
                 }
             } else if (state == BleManager.ConnectionState.DISCONNECTED) {
                 Button(
-                    onClick = onConnect,
+                    onClick = if (reconnectState.isExhausted) onRetryReconnect else onConnect,
                     colors = ButtonDefaults.buttonColors(containerColor = DeckColors.BgElevated),
                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
                     shape = RoundedCornerShape(8.dp),
@@ -204,10 +246,15 @@ fun TopStatusHeader(
                         imageVector = Icons.AutoMirrored.Filled.BluetoothSearching,
                         contentDescription = null,
                         modifier = Modifier.size(15.dp),
-                        tint = DeckColors.Blue
+                        tint = if (reconnectState.isExhausted) DeckColors.Amber else DeckColors.Blue
                     )
                     Spacer(modifier = Modifier.width(5.dp))
-                    Text("连接设备", fontSize = 12.sp, color = DeckColors.TextPrimary, fontWeight = FontWeight.Medium)
+                    Text(
+                        text = if (reconnectState.isExhausted) stringResource(R.string.ble_retry_action) else "连接设备",
+                        fontSize = 12.sp,
+                        color = DeckColors.TextPrimary,
+                        fontWeight = FontWeight.Medium
+                    )
                 }
             }
         }
@@ -279,6 +326,46 @@ fun TopStatusHeader(
                     fontWeight = FontWeight.Medium,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+
+        // 第四行：3A 自动重连耗尽后的非阻塞重试提示条
+        if (state == BleManager.ConnectionState.DISCONNECTED && reconnectState.isExhausted) {
+            val detail = reconnectState.lastError?.takeIf { it.isNotBlank() }
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(DeckColors.CrimsonDim)
+                    .clickable { onRetryReconnect() }
+                    .padding(horizontal = 16.dp, vertical = 7.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(7.dp)
+                        .background(DeckColors.Crimson, CircleShape)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = if (detail != null) {
+                        "${stringResource(R.string.ble_status_reconnect_exhausted)} · $detail"
+                    } else {
+                        stringResource(R.string.ble_status_reconnect_exhausted)
+                    },
+                    color = DeckColors.TextPrimary,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = stringResource(R.string.ble_retry_action),
+                    color = DeckColors.Amber,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold
                 )
             }
         }

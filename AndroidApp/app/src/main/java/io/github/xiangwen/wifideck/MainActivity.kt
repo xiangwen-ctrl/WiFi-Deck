@@ -25,10 +25,12 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import io.github.xiangwen.wifideck.data.BleGatePrompt
+import io.github.xiangwen.wifideck.data.BleKeepAliveService
 import io.github.xiangwen.wifideck.data.BleManager
 import io.github.xiangwen.wifideck.ui.BleGateAction
 import io.github.xiangwen.wifideck.ui.MainScreen
 import io.github.xiangwen.wifideck.ui.MainViewModel
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
@@ -36,6 +38,7 @@ class MainActivity : ComponentActivity() {
     companion object {
         private const val PREFS_NAME = "wifideck_ble_gate_prefs"
         private const val KEY_BLE_PERMS_PERMANENTLY_DENIED = "ble_perms_permanently_denied"
+        private const val KEY_NOTIFICATION_PERM_REQUESTED = "notification_perm_requested"
     }
 
     private val viewModel: MainViewModel by viewModels()
@@ -70,6 +73,12 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private val notificationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { _ ->
+        // POST_NOTIFICATIONS 仅用于展示前台保活通知，拒绝也绝不阻塞 BLE 扫描/连接
+    }
+
     private val enableBluetoothLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { _ ->
@@ -101,11 +110,36 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         BleManager.init(this)
         registerBluetoothStateReceiver()
+        val appContext = applicationContext
+        viewModel.setOnClearedCleanup {
+            BleKeepAliveService.stop(appContext)
+        }
 
         lifecycleScope.launch {
             repeatOnLifecycle(Lifecycle.State.STARTED) {
-                viewModel.gateActions.collect { action ->
-                    handleGateAction(action)
+                launch {
+                    viewModel.gateActions.collect { action ->
+                        handleGateAction(action)
+                    }
+                }
+                launch {
+                    combine(
+                        viewModel.connectionState,
+                        viewModel.reconnectState
+                    ) { connState, reconnectState ->
+                        connState to reconnectState
+                    }.collect { (connState, reconnectState) ->
+                        val shouldKeepAlive =
+                            connState == BleManager.ConnectionState.CONNECTING ||
+                                connState == BleManager.ConnectionState.CONNECTED ||
+                                reconnectState.isReconnecting
+                        if (shouldKeepAlive && hasBluetoothConnectPermission()) {
+                            BleKeepAliveService.start(this@MainActivity)
+                        }
+                        if (connState == BleManager.ConnectionState.CONNECTED) {
+                            maybeRequestOptionalNotificationPermission()
+                        }
+                    }
                 }
             }
         }
@@ -139,6 +173,9 @@ class MainActivity : ComponentActivity() {
             } catch (_: IllegalArgumentException) {
             }
             btStateReceiverRegistered = false
+        }
+        if (isFinishing) {
+            BleKeepAliveService.stop(applicationContext)
         }
         super.onDestroy()
     }
@@ -186,6 +223,29 @@ class MainActivity : ComponentActivity() {
     private fun missingBlePermissions(): List<String> {
         return requiredBlePermissions().filter { perm ->
             ContextCompat.checkSelfPermission(this, perm) != PackageManager.PERMISSION_GRANTED
+        }
+    }
+
+    private fun hasBluetoothConnectPermission(): Boolean {
+        return Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
+            ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) ==
+            PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun maybeRequestOptionalNotificationPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) ==
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            return
+        }
+        if (gatePrefs.getBoolean(KEY_NOTIFICATION_PERM_REQUESTED, false)) {
+            return
+        }
+        gatePrefs.edit().putBoolean(KEY_NOTIFICATION_PERM_REQUESTED, true).apply()
+        try {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        } catch (_: IllegalStateException) {
         }
     }
 

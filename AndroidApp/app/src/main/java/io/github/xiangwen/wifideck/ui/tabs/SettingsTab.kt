@@ -14,7 +14,6 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -23,10 +22,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.BluetoothConnected
 import androidx.compose.material.icons.filled.BluetoothDisabled
-import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -464,172 +461,12 @@ fun SettingsTab(viewModel: MainViewModel) {
             }
         }
 
-        // 5. 串口级自定义指令直发终端
-        CliTerminalSection(viewModel = viewModel, isConnected = isConnected)
-    }
-}
-
-@Composable
-private fun CliTerminalSection(
-    viewModel: MainViewModel,
-    isConnected: Boolean
-) {
-    val cliLogs by viewModel.cliLogs.collectAsStateWithLifecycle()
-    var customCmd by rememberSaveable { mutableStateOf("") }
-
-    SectionHeader(
-        title = "CLI 指令直发终端",
-        subtitle = if (isConnected) "兼容全部串口 handleCommand 指令" else "未连接 · 连接后可下发串口指令"
-    )
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = DeckColors.BgSurface),
-        shape = RoundedCornerShape(12.dp),
-        border = BorderStroke(1.dp, DeckColors.BorderSubtle)
-    ) {
-        Column(modifier = Modifier.padding(14.dp)) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Row(
-                    modifier = Modifier
-                        .weight(1f)
-                        .height(40.dp)
-                        .background(DeckColors.BgTerminal, RoundedCornerShape(8.dp))
-                        .border(1.dp, DeckColors.BorderSubtle, RoundedCornerShape(8.dp))
-                        .padding(horizontal = 10.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Terminal,
-                        contentDescription = null,
-                        tint = DeckColors.Cyan,
-                        modifier = Modifier.size(14.dp)
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.CenterStart) {
-                        if (customCmd.isEmpty()) {
-                            Text(
-                                text = "输入如: set ch 149 / info / reset_txstats",
-                                color = DeckColors.TextMuted,
-                                fontSize = 11.sp,
-                                fontFamily = FontFamily.Monospace
-                            )
-                        }
-                        BasicTextField(
-                            value = customCmd,
-                            onValueChange = { raw ->
-                                customCmd = sanitizeSingleLineInput(raw)
-                            },
-                            singleLine = true,
-                            textStyle = TextStyle(
-                                color = DeckColors.TextPrimary,
-                                fontSize = 12.sp,
-                                fontFamily = FontFamily.Monospace
-                            ),
-                            cursorBrush = SolidColor(DeckColors.Cyan),
-                            modifier = Modifier.fillMaxWidth()
-                        )
-                    }
-                }
-
-                val sendEnabled = isConnected && customCmd.isNotBlank()
-                Button(
-                    onClick = {
-                        if (viewModel.sendCustomCommand(customCmd)) {
-                            customCmd = ""
-                        }
-                    },
-                    enabled = sendEnabled,
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = DeckColors.Cyan,
-                        disabledContainerColor = DeckColors.BgElevated
-                    ),
-                    shape = RoundedCornerShape(8.dp),
-                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 0.dp),
-                    modifier = Modifier.height(40.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.AutoMirrored.Filled.Send,
-                        contentDescription = null,
-                        tint = if (sendEnabled) DeckColors.BgPrimary else DeckColors.TextMuted,
-                        modifier = Modifier.size(15.dp)
-                    )
-                }
-            }
-
-            if (cliLogs.isNotEmpty()) {
-                Spacer(modifier = Modifier.height(10.dp))
-                val cliScrollState = rememberScrollState()
-                LaunchedEffect(cliLogs.size, cliLogs.lastOrNull()) {
-                    cliScrollState.animateScrollTo(cliScrollState.maxValue)
-                }
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .background(DeckColors.BgTerminal, RoundedCornerShape(8.dp))
-                        .border(1.dp, DeckColors.BorderSubtle, RoundedCornerShape(8.dp))
-                        .padding(10.dp)
-                ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = "CLI 回显 (${cliLogs.size})",
-                            color = DeckColors.TextMuted,
-                            fontSize = 10.sp,
-                            fontFamily = FontFamily.Monospace
-                        )
-                        Text(
-                            text = "清空",
-                            color = DeckColors.Cyan,
-                            fontSize = 10.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            modifier = Modifier
-                                .clip(RoundedCornerShape(4.dp))
-                                .clickable { viewModel.clearCliLogs() }
-                                .padding(horizontal = 4.dp, vertical = 2.dp)
-                        )
-                    }
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(max = 140.dp)
-                            .verticalScroll(cliScrollState),
-                        verticalArrangement = Arrangement.spacedBy(2.dp)
-                    ) {
-                        cliLogs.forEach { line ->
-                            val lineColor = when {
-                                line.startsWith("> ") -> DeckColors.Cyan
-                                line.contains("[ERROR]", ignoreCase = true) ||
-                                    line.startsWith("Unknown", ignoreCase = true) -> DeckColors.Crimson
-                                line.contains("[WARN]", ignoreCase = true) -> DeckColors.Amber
-                                else -> DeckColors.BrightGreen
-                            }
-                            Text(
-                                text = line,
-                                color = lineColor,
-                                fontSize = 11.sp,
-                                lineHeight = 15.sp,
-                                fontFamily = FontFamily.Monospace
-                            )
-                        }
-                    }
-                }
-            }
-
-            Spacer(modifier = Modifier.height(10.dp))
-            Text(
-                text = "免责声明：本工具仅用于无线网络安全教学、802.11 协议分析与合法授权测试。",
-                color = DeckColors.TextMuted,
-                fontSize = 11.sp
-            )
-        }
+        Text(
+            text = "免责声明：本工具仅用于无线网络安全教学、802.11 协议分析与合法授权测试。",
+            color = DeckColors.TextMuted,
+            fontSize = 11.sp,
+            modifier = Modifier.padding(horizontal = 4.dp)
+        )
     }
 }
 

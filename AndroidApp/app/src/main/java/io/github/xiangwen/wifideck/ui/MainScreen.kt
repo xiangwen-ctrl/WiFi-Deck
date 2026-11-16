@@ -140,6 +140,7 @@ private fun BleGatePromptHost(viewModel: MainViewModel) {
 @Composable
 private fun TopStatusHeaderContainer(viewModel: MainViewModel) {
     val connectionState by viewModel.connectionState.collectAsStateWithLifecycle()
+    val reconnectState by viewModel.reconnectState.collectAsStateWithLifecycle()
     val status by viewModel.status.collectAsStateWithLifecycle()
     val config by viewModel.config.collectAsStateWithLifecycle()
     val apCount by viewModel.apCount.collectAsStateWithLifecycle()
@@ -147,11 +148,13 @@ private fun TopStatusHeaderContainer(viewModel: MainViewModel) {
 
     TopStatusHeader(
         state = connectionState,
+        reconnectState = reconnectState,
         status = status,
         config = config,
         apCount = apCount,
         selectedCount = selectedCount,
         onConnect = { viewModel.requestBleConnect() },
+        onRetryReconnect = { viewModel.retryOrConnectBle() },
         onCancelConnect = { viewModel.disconnectBle() },
         onStopAll = { viewModel.sendStopAll() }
     )
