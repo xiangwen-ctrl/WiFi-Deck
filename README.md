@@ -186,6 +186,10 @@ flowchart LR
 
 ### 烧录固件
 
+**方式一：Windows 一键烧录（无需安装 Arduino IDE）**  
+前往 [GitHub Releases](https://github.com/xiangwen-ctrl/WiFi-Deck/releases/latest) 下载 **`WiFi-Deck-v2.0-FlashTool.zip`** 并完整解压；按住板载 **`BURN`** 键不放 → 短按一下 **`RST`** 键 → 松开 **`BURN`** 键进入下载模式，双击 **`一键烧录固件.bat`**，按提示输入串口号回车即可完成烧录。
+
+**方式二：Arduino IDE / 命令行源码烧录**
 1. Arduino IDE 打开根目录 `WiFi-Deck.ino`，开发板选 **`Ai-Thinker BW16 (RTL8720DN)`**。
 2. **进入下载模式**：按住板载 **`BURN`** 键不放 → 短按一下 **`RST`** 键 → 松开 **`BURN`** 键。
 3. 选好串口点上传即可（串口监视器波特率 **`115200`**）。
