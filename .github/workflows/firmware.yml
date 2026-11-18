@@ -1,0 +1,39 @@
+name: Firmware CI
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  compile-bw16:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify gzipped WebUI header is up to date
+        run: |
+          python3 tools/pack_webui.py
+          git diff --exit-code webui_gz.h
+
+      - name: Install arduino-cli
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Install Realtek AmebaD core
+        run: |
+          arduino-cli config init --overwrite
+          arduino-cli config add board_manager.additional_urls https://github.com/ambiot/ambd_arduino/raw/master/Arduino_package/package_realtek_amebad_index.json
+          arduino-cli core update-index
+          arduino-cli core install realtek:AmebaD
+
+      - name: Compile WiFi-Deck firmware (BW16 / RTL8720DN)
+        run: |
+          arduino-cli compile --clean \
+            --fqbn realtek:AmebaD:Ai-Thinker_BW16 \
+            --warnings all \
+            .

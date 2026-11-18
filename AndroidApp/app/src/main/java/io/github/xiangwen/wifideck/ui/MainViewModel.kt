@@ -1,7 +1,9 @@
 package io.github.xiangwen.wifideck.ui
 
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.viewmodel.CreationExtras
 import io.github.xiangwen.wifideck.data.ApItem
 import io.github.xiangwen.wifideck.data.BleGatePrompt
 import io.github.xiangwen.wifideck.data.BleManager
@@ -50,6 +52,23 @@ class MainViewModel(
 
     constructor() : this(BleManager)
 
+    class Factory(
+        private val ble: BleTransport = BleManager
+    ) : ViewModelProvider.Factory {
+        @Suppress("UNCHECKED_CAST")
+        override fun <T : ViewModel> create(modelClass: Class<T>): T {
+            require(modelClass.isAssignableFrom(MainViewModel::class.java)) {
+                "Unknown ViewModel class: ${modelClass.name}"
+            }
+            return MainViewModel(ble) as T
+        }
+
+        @Suppress("UNCHECKED_CAST")
+        override fun <T : ViewModel> create(modelClass: Class<T>, extras: CreationExtras): T {
+            return create(modelClass)
+        }
+    }
+
     companion object {
         private const val MAX_SNIFF_LOGS = 500
         private const val AP_BATCH_INTERVAL_MS = 75L
@@ -61,10 +80,8 @@ class MainViewModel(
     }
 
     val connectionState: StateFlow<BleManager.ConnectionState> = ble.connectionState
+    val reconnectState: StateFlow<ReconnectUiState> = ble.reconnectState
     val mtu: StateFlow<Int> = ble.mtu
-
-    private val _reconnectState = MutableStateFlow(ReconnectUiState())
-    val reconnectState: StateFlow<ReconnectUiState> = _reconnectState
 
     private val _apList = MutableStateFlow<List<ApItem>>(emptyList())
     val apList: StateFlow<List<ApItem>> = _apList
@@ -227,14 +244,6 @@ class MainViewModel(
             }
         }
 
-        (ble as? BleManager)?.let { bleManager ->
-            viewModelScope.launch {
-                bleManager.reconnectState.collect { state ->
-                    _reconnectState.value = state
-                }
-            }
-        }
-
         viewModelScope.launch {
             ble.connectionState.collect { state ->
                 when (state) {
@@ -336,8 +345,7 @@ class MainViewModel(
         if (connectionState.value != BleManager.ConnectionState.DISCONNECTED) {
             return
         }
-        val bleManager = ble as? BleManager
-        if (bleManager != null && bleManager.retryReconnect()) {
+        if (ble.retryReconnect()) {
             _bleGatePrompt.value = null
             return
         }
@@ -379,7 +387,7 @@ class MainViewModel(
     fun onBluetoothStateChanged(enabled: Boolean) {
         if (!enabled) {
             val stateBeforeOff = ble.connectionState.value
-            val wasReconnecting = _reconnectState.value.isReconnecting
+            val wasReconnecting = reconnectState.value.isReconnecting
             val wasBleActive = ble.onBluetoothAdapterOff()
             val wasSnapshotActive = !userDisconnectedExplicitly && (
                 stateBeforeOff != BleManager.ConnectionState.DISCONNECTED ||
@@ -598,7 +606,12 @@ class MainViewModel(
                             startChannel = obj.optInt("ch"),
                             scanBetweenCycles = obj.optInt("sc") != 0,
                             ledEnabled = obj.optInt("led") != 0,
-                            apEnabled = obj.optInt("ap", 1) != 0
+                            apEnabled = obj.optInt("ap", 1) != 0,
+                            firmwareVersion = if (obj.has("ver")) {
+                                obj.optString("ver", it.firmwareVersion)
+                            } else {
+                                it.firmwareVersion
+                            }
                         )
                     }
                     configSyncState = configSyncState.copy(cfgReceived = true)

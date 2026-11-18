@@ -1,5 +1,6 @@
 # WiFi-Deck
 
+[![Firmware CI](https://github.com/xiangwen-ctrl/WiFi-Deck/actions/workflows/firmware.yml/badge.svg)](https://github.com/xiangwen-ctrl/WiFi-Deck/actions/workflows/firmware.yml)
 [![Android CI](https://github.com/xiangwen-ctrl/WiFi-Deck/actions/workflows/android.yml/badge.svg)](https://github.com/xiangwen-ctrl/WiFi-Deck/actions/workflows/android.yml)
 ![Platform](https://img.shields.io/badge/Platform-BW16--Kit%20(RTL8720DN)-blue)
 ![Band](https://img.shields.io/badge/Wi--Fi-2.4GHz%20%26%205GHz-crimson)
@@ -149,27 +150,55 @@ flowchart LR
     class HUB,BLE_TX,HTTP_TX,UART_TX uplink
 ```
 
-### 固件端实现细节（`WiFi-Deck.ino`）
+### 固件端实现细节（多模块架构）
 
+- **模块化拆分与零堆碎片热路径**  
+  固件按职责拆分为 `WiFi-Deck.ino` 主控调度与 `config`、`ble`、`wifi_scan`、`wifi_attack`、`sniff`、`web`、`command`、`utils` 共 9 个模块，将 `<lwip/sockets.h>` 宏污染严格隔离在 `web.cpp` 编译单元内。扫描结构体 `WiFiScanResult` 使用定长 `char ssid[33]` 与 `char bssid_str[18]`（配合 `std::sort` 原地排序），消除 `scanMutex` 临界区内的动态堆分配；HTTP 大报文（`/api/scan`、`/api/logs`）采用两遍精确计算 `Content-Length` + `1KB` 栈缓冲流式写出，杜绝长期运行堆内存碎片。
 - **指令入口与跨通道急停**  
   BLE 写回调 `bleWriteCB` 运行在蓝牙协议栈线程中，收到指令后会写入带临界区保护的16槽环形队列 `cmdRing`，避免阻塞蓝牙任务；串口输入由 `pollSerialInput` 非阻塞读入8槽队列 `serialCmdQueue`，两者都在主循环 `loop()` 里交给 `handleCommand` / `executeCommand` 顺序执行。Web 端请求（`handleWebClient`）则在解析 `/api/command` 等接口后同步调用 `executeCommand(..., fromHttp = true)`，以便立即返回 HTTP `200`/`400`/`403` JSON 状态。  
   只要任意通道收到 `stop`，就会立刻置位 `emergencyStopRequested` 和 `priorityStopPending`。发包循环由时间片状态机 `stepSlicedTxCycle` 驱动（每次最多切片发送8帧并喂狗），配合 `shouldAbortCycle()` 在扫描等待与发包间隙检查急停标志，实现随时打断。
 - **并发安全与防误攻**  
-  异步扫描回调 `scanResultHandler` 与主循环之间通过 FreeRTOS 互斥锁 `scanMutex` 同步；通过 `pumpBleScanPush` 游标状态机在主循环里分步推送热点列表，防止热点较多时阻塞主循环。混杂抓包引入了在途回调计数 `PromiscFlightGuard`（`promiscCallbackInFlight`），切信道、发送克隆帧或退出混杂模式前会等在途回调完全结束；抓包文本经 UTF-8 裁剪后分别写入24槽实时流缓冲 `sniffLogRing`（推给 BLE/串口）和32槽历史缓冲 `webLogHistory`（供 `/api/logs` 单次拷贝 4KB 快照后拼装 JSON）。  
+  异步扫描回调 `scanResultHandler` 与主循环之间通过 FreeRTOS 互斥锁 `scanMutex` 同步；通过 `pumpBleScanPush` 游标状态机在主循环里分步推送热点列表，防止热点较多时阻塞主循环。混杂抓包引入了在途回调计数 `PromiscFlightGuard`（`promiscCallbackInFlight`），切信道、发送克隆帧或退出混杂模式前会等在途回调完全结束；抓包文本经 UTF-8 裁剪后分别写入24槽实时流缓冲 `sniffLogRing`（推给 BLE/串口）和32槽历史缓冲 `webLogHistory`（递增全局序号 `webLogTotalSeq` 供 `/api/logs?since=` 增量拉取）。  
   `wifi_tx_raw_frame` 对驱动内部结构体做逐级判空与帧长（`<= 1500B`）校验，Beacon/Probe 构造器限制 SSID `<= 32B` 与96B 栈缓冲边界；App 与 WebUI 下发攻击时必须带目标索引（如 `start deauther 0,2,5`），未选目标直接拒绝，全量发包需要显式传 `all`。
 - **BLE 上行分级背压限流**  
   抓包高峰期如果无限制地发 Notify 会耗尽协议栈 TX credit，把每秒1次的 `st` 心跳饿死并触发 `0x0108` 超时断连。`bleSendSniffLog` 和主循环对此做了分级流控：`EAPOL`、`Deauth`、`Disassoc` 与 `Pwnagotchi` 帧只要还有 `>= 1` 个 credit（间隔 `>= 15ms`）就优先发送；普通日志则要求至少保留3个 credit 给心跳和命令响应，并根据 ATT MTU 在 `100ms–800ms` 之间动态退避。
-- **WebUI 端口自愈与 Flash 掉电记忆**  
-  Web 服务直接使用 lwIP BSD Socket（开启 `SO_REUSEADDR` 和连接排空，用 `#undef` 隔离宏冲突）。纯 WebUI 用户点抓包时，固件先完整发出 HTTP 200 再关闭热点进入15秒定时抓包，结束后自动拉起 SoftAP 并重绑80端口，网页倒计时结束自动重连读取 `/api/logs`。配置保存使用 `PersistConfig`（含 `CFG_MAGIC` `0x57444B33`、版本号与 `CRC32` 校验），`saveConfigToFlash` 会先用 `memcmp` 比对，参数没变时不重复擦写 Flash。
+- **WebUI Gzip 压缩、增量轮询与 Flash 掉电记忆**  
+  前端源码独立维护于 `tools/webui/index.html`，通过 `tools/pack_webui.py` 预压缩为 `webui_gz.h`（`Content-Encoding: gzip`，体积缩减约 `70.7%`）；`/api/status` 支持 FNV-1a `ETag` / `304 Not Modified` 协商，`/api/logs?since=<seq>` 仅回传新增报文并在无新帧时跳过 4KB 缓冲分配。纯 WebUI 用户点抓包时，固件先完整发出 HTTP 200 再关闭热点进入15秒定时抓包，结束后自动拉起 SoftAP 并重绑80端口。配置保存使用 `PersistConfig`（含 `CFG_MAGIC` `0x57444B33`、版本号与 `CRC32` 校验），`saveConfigToFlash` 会先用 `memcmp` 比对，参数没变时不重复擦写 Flash。
 
 ### Android 客户端实现细节（`AndroidApp/`）
 
-- **GATT 串行状态机与断线重连**  
-  `BleManager` 把“扫描 NUS Service UUID → 发起 `TRANSPORT_LE` 建链 → 错峰400ms 请求 `MTU = 247` → 发现服务 → 写 CCCD 开启 Notify → 自动下发 `info` 与 `results` 同步状态”串成带超时的单线流水线，并通过有界写队列与 `WriteAckTracker`（`60ms` 写确认超时、最小 `25ms` 间隔，`stop` 队首插队）控制下发节奏。意外断线后，`BleReconnectTracker` 会先用缓存设备尝试1次 `4.5s` 快速直连，失败立刻切回 BLE 扫描（按 MAC 地址锁定刚才那块板子，最多退避重试5轮），同时监听系统蓝牙开关广播防止竞态卡死。
+- **GATT 四阶段串行握手与断线重连状态机**  
+  `BleManager`（实现 `BleTransport` 接口并通过 `MainViewModel.Factory` 注入）把扫描、建链、错峰 `400ms` MTU 协商、服务发现、写 CCCD 开启 Notify 与初始状态同步串成带超时的单线流水线，并通过有界写队列与 `WriteAckTracker`（`60ms` 写确认超时、最小 `25ms` 间隔，`stop` 队首插队）控制下发节奏。意外断线后，`BleReconnectTracker` 会先用缓存设备尝试1次 `4.5s` 快速直连，失败立刻切回 BLE 扫描（按 MAC 锁定原设备，最多退避重试5轮）：
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant VM as MainViewModel
+    participant BM as BleManager
+    participant FW as BW16 Firmware (BLE NUS)
+
+    VM->>BM: requestBleConnect() -> startScan()
+    BM->>FW: ScanFilter(NUS UUID 6E400001...)
+    FW-->>BM: ScanResult (lastDevice cached)
+    BM->>FW: connectGatt(TRANSPORT_LE)
+    FW-->>BM: onConnectionStateChange(STATE_CONNECTED)
+    Note over BM,FW: Delay 400ms to avoid slave_init_mtu_req collision (2.2s fallback)
+    BM->>FW: requestMtu(247)
+    FW-->>BM: onMtuChanged(mtu=247)
+    BM->>FW: discoverServices()
+    FW-->>BM: onServicesDiscovered(NUS RX/TX)
+    BM->>FW: writeDescriptor(CCCD = ENABLE_NOTIFICATION)
+    FW-->>BM: onDescriptorWrite(GATT_SUCCESS)
+    BM->>VM: connectionState = CONNECTED
+    BM->>FW: sendCommand("info") + sendCommand("results")
+    FW-->>VM: Notify {"t":"cfg","ver":"2.1.0",...} + {"t":"id",...} + {"t":"sync_begin"..."sync_end"}
+    Note over BM,FW: On unexpected disconnect: 1x 4.5s direct connect -> up to 5x scan fallback
+```
+
 - **后台保活与 UTF-8 字节分帧**  
   连接或重连期间自动启动 `connectedDevice` 类型前台服务 `BleKeepAliveService`，防止手机息屏或切后台后系统断掉蓝牙；上行分片由 `BleLineFramer`（单行上限 `4096B`）先按字节攒够整行 `\n` 再解码 UTF-8，避免中文热点名跨包被切坏成乱码。
-- **主线程顺序消费与 75ms 合批渲染**  
-  BLE 回调收到的数据先写入 `Channel`，由 `MainViewModel` 在主线程顺序消费（每轮最多处理64条后 `yield()`），避免多线程读写状态冲突；抓包日志和扫描列表通过500槽 `ArrayDeque` 与 `LinkedHashMap` 按 `75ms` 周期合批刷新，配合派生 `StateFlow` 与 `SaveableStateProvider` 隔离各页重组，高负载抓包下界面也能保持流畅。
+- **主线程顺序消费与 Compose 渲染优化**  
+  BLE 回调收到的数据先写入 `Channel`，由 `MainViewModel` 在主线程顺序消费（每轮最多处理64条后 `yield()`），避免多线程读写状态冲突；数据模型均标记 `@Immutable`，抓包日志和扫描列表通过500槽 `ArrayDeque` 与 `LinkedHashMap` 按 `75ms` 周期合批刷新，配合预缓存日志配色表、`LazyRow` 目标芯片与 `SaveableStateProvider` 隔离各页重组，高负载抓包下界面也能保持流畅。
 
 ---
 
@@ -220,7 +249,19 @@ arduino-cli upload -p COM6 --fqbn realtek:AmebaD:Ai-Thinker_BW16 .
 
 ```text
 WiFi-Deck/
-├── WiFi-Deck.ino                          # RTL8720DN 固件源码（射频收发/混杂抓包/BLE NUS/lwIP WebUI/UART CLI）
+├── WiFi-Deck.ino                          # 主控入口：setup() 初始化与 loop() 时间片调度
+├── config.h / config.cpp                  # PersistConfig (Magic + CRC32) Flash 读写、固件版本与全局参数
+├── ble.h / ble.cpp                        # BLE GATT NUS 服务、异步指令队列与 TX Credit 分级流控
+├── wifi_scan.h / wifi_scan.cpp            # 2.4G/5G 双频扫描、定长无堆结构体与 scanMutex 并发保护
+├── wifi_attack.h / wifi_attack.cpp        # Deauth / Disassoc / Beacon / Probe 帧构造与时间片注入
+├── sniff.h / sniff.cpp                    # 802.11 混杂抓包、PromiscFlightGuard 与双环形日志缓冲
+├── web.h / web.cpp                        # lwIP BSD Socket HTTP 服务、Gzip 响应、ETag 304 与增量日志流
+├── command.h / command.cpp                # UART / BLE / HTTP 三端统一命令解析与分发
+├── utils.h / utils.cpp                    # UTF-8 安全截断、JSON 转义、MAC 解析与 LED 状态控制
+├── webui_gz.h                             # 由 pack_webui.py 生成的 Gzip 压缩 WebUI PROGMEM 头文件
+├── tools/
+│   ├── pack_webui.py                      # WebUI 确定性 Gzip 打包与完整性自检脚本
+│   └── webui/index.html                   # 板载暗色 WebUI 独立前端源码
 ├── AndroidApp/                            # Android 客户端 (Kotlin + Jetpack Compose + MVVM)
 │   └── app/src/
 │       ├── main/java/io/github/xiangwen/wifideck/
@@ -228,11 +269,11 @@ WiFi-Deck/
 │       │   ├── data/
 │       │   │   ├── BleManager.kt          # BLE 扫描、连接、MTU 协商、串行写队列与超时控制
 │       │   │   ├── BleReconnectTracker.kt # 断线重连状态机（快速直连切扫描 + 退避）与 ACK 追踪
-│       │   │   ├── BleProtocol.kt         # UTF-8 字节级换行分帧器与 MTU 载荷编解码
+│       │   │   ├── BleProtocol.kt         # BleTransport 契约、UTF-8 换行分帧器与 MTU 载荷编解码
 │       │   │   ├── BleKeepAliveService.kt # connectedDevice 前台保活服务
-│       │   │   └── Models.kt              # 状态、配置、热点与抓包日志数据模型
+│       │   │   └── Models.kt              # @Immutable 状态、配置、热点与抓包日志数据模型
 │       │   └── ui/
-│       │       ├── MainViewModel.kt       # 业务状态流、75ms 日志合批节流与防误攻校验
+│       │       ├── MainViewModel.kt       # Factory 依赖注入、业务状态流、75ms 合批节流与防误攻校验
 │       │       ├── MainScreen.kt          # 底部四标签页导航与页面状态保持
 │       │       ├── components/            # 顶部遥测仪表盘、门禁弹窗与公共卡片
 │       │       ├── tabs/                  # ScanTab / ControlTab / SniffTab / SettingsTab
@@ -245,7 +286,9 @@ WiFi-Deck/
 ├── docs/
 │   ├── hardware/                          # BW16-Kit 官方规格书与原理图 PDF
 │   └── screenshots/                       # Android 客户端与 WebUI 界面截图
-├── .github/workflows/android.yml          # 单元测试、APK 构建与 Tag 自动发版 CI
+├── .github/workflows/
+│   ├── firmware.yml                       # WebUI Gzip 一致性校验与 Realtek AmebaD 固件编译 CI
+│   └── android.yml                        # 单元测试、APK 构建与 Tag 自动发版 CI
 ├── LICENSE
 └── README.md
 ```
@@ -288,17 +331,17 @@ set ble_name <name>         set ap_ssid <ssid>          set ap_pass <pass>      
 | `sync_begin` / `sync_end` | `results` 回读或间隙重扫同步 | `n`：热点数量（不触发主动扫描超时） |
 | `ap` | 单条扫描热点 | `i`：索引，`s`：SSID，`b`：BSSID，`c`：信道，`r`：RSSI，`sel`：选中标志 |
 | `st` | 每秒或状态变更心跳 | `atk`/`dis`/`bcn`/`prb`/`jam`/`snf`、`snfOn`、`sMode`、`hop`、`ch`、`ok`/`fail`、`rem` |
-| `cfg` / `id` | 运行配置与设备身份同步 | `delay`、`scan`、`frames`、`ch`、`sc`、`led`、`ap` / `ssid`、`pass`、`ble` |
+| `cfg` / `id` | 运行配置与设备身份同步 | `delay`、`scan`、`frames`、`ch`、`sc`、`led`、`ap`、`ver` / `ssid`、`pass`、`ble` |
 | `log` | 抓包报文与系统提示 | `m`：单行日志文本 |
 
 #### 3. WebUI HTTP API（`192.168.1.1:80`，同源访问）
 | 路由 | 方法 | 说明 |
 |---|---|---|
-| `/` | `GET` | 内置暗色 WebUI 页面 |
-| `/api/scan` | `GET` / `POST` | 读取扫描缓存 / 触发双频扫描 |
-| `/api/status` | `GET` | 查询运行状态、当前信道、TX 统计与 `ble_connected` |
-| `/api/info` | `GET` | 查询配置参数（`pass` 字段脱敏返回空字符串） |
-| `/api/logs` / `/api/logs/clear` | `GET` / `POST` | 读取抓包历史 / 双端同步清空日志 |
+| `/` | `GET` | 内置暗色 WebUI 页面（`Content-Encoding: gzip` 预压缩传输） |
+| `/api/scan` | `GET` / `POST` | 流式读取扫描缓存 / 触发双频扫描 |
+| `/api/status` | `GET` | 查询运行状态、信道、TX 统计与 `ble_connected`（支持 `If-None-Match` / `304 Not Modified`） |
+| `/api/info` | `GET` | 查询配置参数与固件 `version`（`pass` 字段脱敏返回空字符串） |
+| `/api/logs` / `/api/logs/clear` | `GET` / `POST` | 读取抓包历史（支持 `?since=<seq>` 增量拉取） / 双端同步清空日志 |
 | `/api/command` / `/api/target` / `/api/config` | `POST` | 执行控制指令（禁止 `ap off`）、更新目标索引、保存 Flash 配置 |
 
 </details>
@@ -322,6 +365,7 @@ set ble_name <name>         set ap_ssid <ssid>          set ap_pass <pass>      
 
 ## 版本记录
 
+- **v2.1**：将单文件固件重构为 9 模块多文件架构，消除扫描临界区动态 `String` 堆分配并改为栈缓冲流式 HTTP JSON 输出；独立维护 `tools/webui/index.html` 并引入 Gzip 预压缩（Flash 缩减约 `28KB`）、`/api/status` ETag `304` 协商与 `/api/logs?since=` 增量日志拉取；打通全端固件版本号上报（`v2.1.0`）；Android 端完成 `BleTransport` 依赖注入解耦、`@Immutable` / `LazyRow` 渲染优化并将单元测试扩充至 43 项；新增 Firmware 编译 CI。
 - **v2.0**：修复固件 802.11 帧构造边界、混杂模式与扫描并发问题，WebUI 改用直连 lwIP BSD Socket 解决抓包恢复时80端口绑定失败，加入 BLE 抓包分级限流与 `PersistConfig` CRC32 校验；Android 端新增前台保活、断线重连状态机、权限与定位门禁、75ms 日志合批渲染及32个单元测试，CI 接入单测门禁和自动发版。
 - **v1.6**：完善 2.4G/5G 全信道跳频与 `ap off` 隐身模式，Android 客户端拆分为四标签页，支持自定义 AP 与 BLE 名称持久化。
 - **v1.5**：完成双频扫描/发包/抓包基础固件、内置 WebUI 与初版 BLE Android 客户端。

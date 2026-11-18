@@ -1,5 +1,7 @@
 package io.github.xiangwen.wifideck.data
 
+import androidx.compose.runtime.Immutable
+
 /** 固件 BLE JSON 上行消息类型（对应字段 "t"） */
 enum class BleMessageType(val wireType: String) {
     SCAN_BEGIN("scan_begin"),
@@ -13,8 +15,10 @@ enum class BleMessageType(val wireType: String) {
     LOG("log");
 
     companion object {
-        fun fromWireType(type: String): BleMessageType? =
-            entries.firstOrNull { it.wireType == type }
+        private val BY_WIRE_TYPE: Map<String, BleMessageType> =
+            entries.associateBy { it.wireType }
+
+        fun fromWireType(type: String): BleMessageType? = BY_WIRE_TYPE[type]
     }
 }
 
@@ -29,12 +33,15 @@ enum class SniffMode(val code: Int, val commandArg: String, val label: String) {
     STOP(6, "stop", "混杂模式");
 
     companion object {
-        fun fromCode(code: Int): SniffMode =
-            entries.firstOrNull { it.code == code } ?: STOP
+        private val BY_CODE: Map<Int, SniffMode> =
+            entries.associateBy { it.code }
+
+        fun fromCode(code: Int): SniffMode = BY_CODE[code] ?: STOP
     }
 }
 
 /** 单个 Wi-Fi 热点（对应固件 JSON Lines 里的 "ap" 消息） */
+@Immutable
 data class ApItem(
     val index: Int,
     val ssid: String,
@@ -47,6 +54,7 @@ data class ApItem(
 }
 
 /** 设备状态（对应固件 "st" 状态心跳） */
+@Immutable
 data class DeviceStatus(
     val attackEnabled: Boolean = false,
     val disassocEnabled: Boolean = false,
@@ -76,6 +84,7 @@ data class DeviceStatus(
 }
 
 /** 设备配置（对应固件 "cfg" 与 "id" 消息） */
+@Immutable
 data class DeviceConfig(
     val cycleDelayMs: Long = 0,
     val scanTimeMs: Long = 0,
@@ -86,7 +95,8 @@ data class DeviceConfig(
     val apEnabled: Boolean = true,
     val apSsid: String = "WiFi-Deck",
     val apPass: String = "12345678",
-    val bleName: String = "WiFi-Deck"
+    val bleName: String = "WiFi-Deck",
+    val firmwareVersion: String = ""
 )
 
 /** 配置握手双帧同步状态（需同时收到完整 "cfg" 与 "id" 才视为已同步） */
@@ -126,6 +136,7 @@ enum class SniffLogCategory(val tagLabel: String, val isHighlight: Boolean) {
 }
 
 /** 抓包终端日志条目：id 全局单调递增供 LazyColumn 稳定 key，seq 与预解析展示字段消除滑窗重绘 */
+@Immutable
 data class SniffLogEntry(
     val id: Long,
     val seq: Long,
@@ -155,6 +166,7 @@ data class SniffLogEntry(
 }
 
 /** 扫描页列表与频段计数派生状态（在 ViewModel 内合批计算，减少 Compose 重组与过滤排序开销） */
+@Immutable
 data class ScanListState(
     val totalCount: Int = 0,
     val count24G: Int = 0,

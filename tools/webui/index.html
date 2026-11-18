@@ -1,0 +1,707 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="theme-color" content="#0d1117">
+<title>WiFi-Deck</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0d1117;color:#f0f6fc;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;padding-bottom:60px}
+.header{background:#161b22;padding:10px 14px;position:sticky;top:0;z-index:100;border-bottom:1px solid #2b323c}
+.header-top{display:flex;justify-content:space-between;align-items:center}
+.header h1{font-size:17px;font-weight:700;display:flex;align-items:center;gap:6px}
+.badge{font-size:10px;padding:2px 6px;border-radius:4px;background:#102828;color:#39c5bb;border:1px solid rgba(57,197,187,.4)}
+.status-dot{width:10px;height:10px;border-radius:50%;background:#3fb950;transition:.3s}
+.status-dot.active{background:#8957e5;box-shadow:0 0 8px #8957e5}
+.status-dot.attacking{background:#e94560;box-shadow:0 0 8px #e94560;animation:pulse 1s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.telemetry{display:flex;justify-content:space-between;margin-top:8px;padding-top:6px;border-top:1px solid #21262d;font-family:monospace;font-size:11px;color:#8b949e}
+.telemetry b{color:#f0f6fc}
+.tabs{display:flex;background:#161b22;border-bottom:1px solid #2b323c;position:sticky;top:59px;z-index:99}
+.tab{flex:1;padding:11px 0;text-align:center;font-size:12px;font-weight:600;color:#8b949e;cursor:pointer;border-bottom:2px solid transparent;transition:.2s}
+.tab.active{color:#e94560;border-color:#e94560;background:#1a1f29}
+.page{display:none;padding:12px}
+.page.active{display:block}
+.row{display:flex;gap:8px;align-items:center;margin:6px 0}
+.chips{display:flex;gap:6px;overflow-x:auto;padding:4px 0;scrollbar-width:none}
+.chip{white-space:nowrap;padding:5px 10px;border-radius:6px;font-size:11px;font-weight:600;background:#161b22;color:#8b949e;border:1px solid #2b323c;cursor:pointer}
+.chip.active{background:#2d161e;color:#e94560;border-color:#e94560}
+.search-box{flex:1;padding:8px 10px;background:#161b22;border:1px solid #2b323c;border-radius:8px;color:#f0f6fc;font-size:12px}
+.btn{display:inline-block;width:100%;padding:11px;margin:4px 0;border:1px solid transparent;border-radius:8px;font-size:13px;font-weight:600;text-align:center;cursor:pointer;transition:.15s}
+.btn:active{transform:scale(.98)}
+.btn-primary{background:#e94560;color:#fff}
+.btn-success{background:#2ea043;color:#fff}
+.btn-warning{background:#d29922;color:#000}
+.btn-info{background:#2f81f7;color:#fff}
+.btn-dark{background:#161b22;color:#f0f6fc;border-color:#2b323c}
+.btn.running,.btn-dark.running{background:#12261a;color:#3fb950;border-color:#3fb950}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:6px 0}
+.net-item{background:#161b22;border-radius:9px;padding:10px 12px;margin:6px 0;display:flex;align-items:center;cursor:pointer;border:1px solid #2b323c;transition:.15s}
+.net-item.selected{border-color:#e94560;background:#2d161e}
+.net-info{flex:1;min-width:0}
+.net-ssid{font-size:13px;font-weight:600;margin-bottom:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.net-meta{font-size:11px;color:#8b949e;font-family:monospace}
+.net-band{font-size:10px;padding:1px 5px;border-radius:4px;margin-left:5px;font-weight:700}
+.net-band.band5{background:#231934;color:#8957e5;border:1px solid rgba(137,87,229,.5)}
+.net-band.band24{background:#14233a;color:#2f81f7;border:1px solid rgba(47,129,247,.5)}
+.net-check{width:22px;height:22px;border:1.5px solid #6e7681;border-radius:6px;display:flex;align-items:center;justify-content:center;margin-left:10px}
+.net-item.selected .net-check{background:#e94560;border-color:#e94560}
+.net-item.selected .net-check::after{content:'✓';color:#fff;font-size:13px}
+.bar{width:100%;height:5px;background:#21262d;border-radius:3px;overflow:hidden;margin-top:5px}
+.bar-fill{height:100%;border-radius:3px}
+.bar-fill.good{background:#3fb950}
+.bar-fill.mid{background:#d29922}
+.bar-fill.bad{background:#e94560}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:6px 0}
+.stat-card{background:#161b22;border:1px solid #2b323c;border-radius:8px;padding:8px;text-align:center}
+.stat-val{font-size:17px;font-weight:700;color:#e94560;font-family:monospace}
+.stat-label{font-size:10px;color:#8b949e;margin-top:2px}
+.term{background:#090c10;border:1px solid #2b323c;border-radius:8px;padding:8px;height:260px;overflow-y:auto;font-family:monospace;font-size:11px;line-height:1.45;color:#c9d1d9}
+.log-line{padding:2px 4px;border-bottom:1px solid #161b22;word-break:break-all}
+.log-eapol{color:#d29922;background:rgba(210,153,34,.12)}
+.log-deauth{color:#e94560;background:rgba(233,69,96,.12)}
+.config-row{display:flex;justify-content:space-between;align-items:center;padding:9px 12px;background:#161b22;border:1px solid #2b323c;border-radius:8px;margin:5px 0}
+.config-label{font-size:12px;color:#c9d1d9}
+.config-input{width:130px;padding:6px 8px;background:#0d1117;border:1px solid #2b323c;border-radius:6px;color:#fff;font-size:12px;text-align:right;font-family:monospace}
+.loading{display:none;text-align:center;padding:16px;color:#8b949e;font-size:12px}
+.loading.show{display:block}
+.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#1f2631;color:#f0f6fc;padding:8px 16px;border-radius:20px;font-size:12px;z-index:200;opacity:0;transition:.25s;pointer-events:none;border:1px solid #e94560}
+.toast.show{opacity:1}
+.modal-mask{display:none;position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:300;align-items:center;justify-content:center;padding:16px}
+.modal-mask.show{display:flex}
+.modal-card{background:#161b22;border:1px solid #2b323c;border-radius:12px;max-width:360px;width:100%;padding:16px}
+.modal-title{font-size:15px;font-weight:700;margin-bottom:8px;color:#f0f6fc}
+.modal-body{font-size:12px;line-height:1.55;color:#c9d1d9;margin-bottom:14px}
+.banner{display:none;background:#1d192b;border:1px solid #8957e5;border-radius:8px;padding:8px 10px;margin:6px 0;font-size:12px;color:#e6edf3}
+.banner.show{display:block}
+.footer{text-align:center;padding:12px 8px;font-size:11px;color:#6e7681}
+</style>
+</head>
+<body>
+<div class="header">
+  <div class="header-top">
+    <h1>⚡ <span id="hdrName">WiFi-Deck</span> <span class="badge">2.4G / 5G</span></h1>
+    <div class="status-dot" id="statusDot"></div>
+  </div>
+  <div class="telemetry">
+    <span>CH: <b id="topCh">--</b></span>
+    <span>APs: <b id="topAps">0</b></span>
+    <span>目标: <b id="topTargets">0</b></span>
+    <span>TX OK: <b id="topTxOk" style="color:#3fb950">0</b></span>
+    <span>FAIL: <b id="topTxFail">0</b></span>
+  </div>
+</div>
+<div class="tabs">
+  <div class="tab active" onclick="showPage('scan')">📡 扫描</div>
+  <div class="tab" onclick="showPage('attack')">⚔️ 控制</div>
+  <div class="tab" onclick="showPage('sniff')">📟 抓包</div>
+  <div class="tab" onclick="showPage('config')">⚙️ 设置</div>
+</div>
+
+<div class="page active" id="page-scan">
+  <div class="row">
+    <input class="search-box" id="searchBox" placeholder="搜索 SSID / BSSID..." oninput="renderNetworks()">
+    <button class="btn btn-info" style="width:auto;padding:8px 14px;margin:0" onclick="doScan()">🔄 扫描双频</button>
+  </div>
+  <div class="chips">
+    <div class="chip active" id="flt-all" onclick="setBand('ALL')">全部 (0)</div>
+    <div class="chip" id="flt-24" onclick="setBand('2.4G')">2.4G (0)</div>
+    <div class="chip" id="flt-5" onclick="setBand('5G')">5G (0)</div>
+    <div class="chip active" id="srt-rssi" onclick="setSort('RSSI')">信号↓</div>
+    <div class="chip" id="srt-ch" onclick="setSort('CH')">信道↑</div>
+    <div class="chip" onclick="selectAllVisible()">全选</div>
+    <div class="chip" onclick="clearSelection()">清空</div>
+  </div>
+  <div class="loading" id="scanLoading">正在扫描 2.4GHz & 5GHz 频段...</div>
+  <div id="netList"></div>
+</div>
+
+<div class="page" id="page-attack">
+  <div class="banner" id="timedBanner"></div>
+  <div class="banner" id="atkReconnectBanner"></div>
+  <div class="stats">
+    <div class="stat-card"><div class="stat-val" id="statTargets">0</div><div class="stat-label">已选目标</div></div>
+    <div class="stat-card"><div class="stat-val" id="statTxOk" style="color:#3fb950">0</div><div class="stat-label">TX 成功</div></div>
+    <div class="stat-card"><div class="stat-val" id="statCh">--</div><div class="stat-label">当前信道</div></div>
+  </div>
+  <div class="grid2">
+    <button class="btn btn-primary" id="btnDeauth" onclick="startAttack('start deauther')">▶️ Deauth 压制</button>
+    <button class="btn btn-warning" id="btnDisassoc" onclick="startAttack('disassoc')">▶️ Disassoc 剥离</button>
+    <button class="btn btn-dark" onclick="singleApAttack()">🎯 单目标点射</button>
+    <button class="btn btn-dark" onclick="sendCmd('random_attack')">🎲 随机信道抽样</button>
+  </div>
+  <div class="grid2">
+    <button class="btn btn-dark" id="btnBcn" onclick="sendCmd('beacon_flood')">📶 Beacon 伪热点</button>
+    <button class="btn btn-dark" id="btnPrb" onclick="sendCmd('probe_flood')">📡 Probe 探测泛洪</button>
+    <button class="btn btn-dark" id="btnJam" onclick="sendCmd('signal_jam')">📳 Signal Jam 双频</button>
+    <button class="btn btn-dark" id="btnClone" onclick="startSniffClone()">🎯 Deauth 嗅探克隆</button>
+  </div>
+  <div class="row">
+    <button class="btn btn-dark" onclick="timedAttackPreset(10000)">⏱️ 10s</button>
+    <button class="btn btn-dark" onclick="timedAttackPreset(30000)">⏱️ 30s</button>
+    <button class="btn btn-dark" onclick="timedAttackPreset(60000)">⏱️ 60s</button>
+    <button class="btn btn-dark" onclick="sendCmd('reset_txstats')">🧹 清零TX</button>
+  </div>
+  <button class="btn btn-success" onclick="sendCmd('stop')">⏹️ 紧急停止所有任务 (STOP ALL)</button>
+</div>
+
+<div class="page" id="page-sniff">
+  <div style="font-size:11px;color:#8b949e;margin-bottom:6px">
+    💡 网页端开启抓包时会自动进入混杂模式 15 秒（热点将暂时中断），结束后自动恢复 WiFi 热点并回读捕获报文。
+  </div>
+  <div class="banner" id="sniffReconnectBanner"></div>
+  <div class="grid2">
+    <button class="btn btn-info" onclick="startWebSniff('all')">👁️ 15s 抓包 (ALL)</button>
+    <button class="btn btn-warning" onclick="startWebSniff('eapol')">🔑 15s 抓包 (EAPOL)</button>
+    <button class="btn btn-dark" onclick="startWebSniff('deauth')">🚨 15s 抓包 (Deauth)</button>
+    <button class="btn btn-dark" onclick="startWebSniff('probe')">📡 15s 抓包 (Probe)</button>
+  </div>
+  <div class="row">
+    <button class="btn btn-dark" id="btnHopOn" onclick="sendCmd('hop on')">📺 跳频: 开</button>
+    <button class="btn btn-dark" id="btnHopOff" onclick="sendCmd('hop off')">📺 跳频: 关</button>
+    <button class="btn btn-dark" onclick="copyLogs()">📋 复制日志</button>
+    <button class="btn btn-dark" onclick="clearWebLogs()">🗑️ 清空</button>
+  </div>
+  <div class="term" id="logBox"><div style="color:#6e7681;text-align:center;padding-top:90px">暂无抓包记录，点击上方按钮开始捕获</div></div>
+</div>
+
+<div class="page" id="page-config">
+  <div class="config-row"><span class="config-label">BLE 蓝牙名称 (1~26B)</span><input class="config-input" type="text" maxlength="26" id="cfgBleName" value="WiFi-Deck"></div>
+  <div class="config-row"><span class="config-label">WiFi 热点名称 (1~32B)</span><input class="config-input" type="text" maxlength="32" id="cfgApSsid" value="WiFi-Deck"></div>
+  <div class="config-row"><span class="config-label">WiFi 热点密码 (8~63位)</span><input class="config-input" type="password" maxlength="63" id="cfgApPass" value="" placeholder="留空表示不修改" autocomplete="new-password"></div>
+  <div style="font-size:11px;color:#8b949e;padding:2px 4px 4px">🔒 当前热点密码不以明文回显；留空保存则维持原密码不变。如需永久关闭热点请改用 BLE App 或串口。</div>
+  <div class="config-row"><span class="config-label">攻击间隔 (100~60000ms)</span><input class="config-input" type="number" min="100" max="60000" id="cfgCycleDelay" value="2000"></div>
+  <div class="config-row"><span class="config-label">扫描时间 (500~30000ms)</span><input class="config-input" type="number" min="500" max="30000" id="cfgScanTime" value="5000"></div>
+  <div class="config-row"><span class="config-label">单次突发帧数 (1~100)</span><input class="config-input" type="number" min="1" max="100" id="cfgNumFrames" value="3"></div>
+  <div class="config-row"><span class="config-label">起始信道 (1 或 36~165)</span><input class="config-input" type="number" min="1" max="165" id="cfgStartChannel" value="1"></div>
+  <div class="config-row"><span class="config-label">循环间重扫</span><select class="config-input" id="cfgScanCycles"><option value="off">关</option><option value="on">开</option></select></div>
+  <div class="config-row"><span class="config-label">板载 LED 指示灯</span><select class="config-input" id="cfgLed"><option value="on">开</option><option value="off">关</option></select></div>
+  <button class="btn btn-primary" onclick="saveConfig()">💾 保存配置 (写入 Flash 掉电记忆)</button>
+  <button class="btn btn-dark" onclick="resetDefaultConfig()">🔄 恢复出厂默认配置</button>
+  <div class="stat-card" style="margin-top:8px"><div class="stat-val" id="cfgUptime">--</div><div class="stat-label">系统运行时间</div></div>
+  <div class="footer">WiFi-Deck <span id="fwVer"></span>| Dual-Band 802.11 Protocol Analyzer<br>⚠️ 仅用于无线网络安全教学与合法授权测试</div>
+</div>
+<div class="modal-mask" id="confirmMask">
+  <div class="modal-card">
+    <div class="modal-title" id="confirmTitle">操作确认</div>
+    <div class="modal-body" id="confirmBody"></div>
+    <div class="grid2">
+      <button class="btn btn-dark" onclick="closeConfirm(false)">取消</button>
+      <button class="btn btn-primary" onclick="closeConfirm(true)">继续执行</button>
+    </div>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+<script>
+const API='/api';
+let selectedIndices=new Set(),scanCache=null,bandFilter='ALL',sortMode='RSSI',cachedLogs=[],lastLogSeq=-1;
+let lastStatusEtag='',baseUptimeMs=0,baseSyncAtMs=0;
+let curAtkState={deauth:false,disassoc:false,clone:false,hopping:false,targetMode:false,bleConnected:false};
+let selectionDirty=false,lastServerScanCount=-1,lastServerTargetCount=-1;
+let statsInFlight=false,logsInFlight=false,reconnectingAP=false,reconnectTimer=null,reconnectSeq=0,confirmResolver=null;
+function showPage(p){
+  document.querySelectorAll('.tab').forEach((t,i)=>t.classList.toggle('active',['scan','attack','sniff','config'][i]===p));
+  document.querySelectorAll('.page').forEach(pg=>pg.classList.remove('active'));
+  document.getElementById('page-'+p).classList.add('active');
+  if(p==='attack')updateAttackStats();
+  if(p==='sniff')fetchLogs();
+  if(p==='config')initStatus(false);
+}
+function toast(msg){let t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2400);}
+function showConfirm(title,body){
+  document.getElementById('confirmTitle').textContent=title;
+  document.getElementById('confirmBody').textContent=body;
+  document.getElementById('confirmMask').classList.add('show');
+  return new Promise(res=>{confirmResolver=res;});
+}
+function closeConfirm(ok){
+  document.getElementById('confirmMask').classList.remove('show');
+  if(confirmResolver){let r=confirmResolver;confirmResolver=null;r(!!ok);}
+}
+async function fetchAPI(url,opts={},timeoutMs=3500){
+  let ctrl=typeof AbortController!=='undefined'?new AbortController():null;
+  let timer=ctrl?setTimeout(()=>ctrl.abort(),timeoutMs):null;
+  try{
+    let reqOpts=ctrl?Object.assign({},opts,{signal:ctrl.signal}):opts;
+    let r=await fetch(url,reqOpts);
+    let etag=r.headers?r.headers.get('ETag'):null;
+    if(r.status===304)return{ok:true,notModified:true,status:304,data:null,etag,aborted:false};
+    let data=null;
+    try{data=await r.json();}catch(e){data=null;}
+    return{ok:r.ok,notModified:false,status:r.status,data,etag,aborted:false};
+  }catch(e){
+    return{ok:false,notModified:false,status:0,data:null,etag:null,aborted:(e&&e.name==='AbortError')};
+  }finally{
+    if(timer)clearTimeout(timer);
+  }
+}
+async function fetchJSON(url,opts={},timeoutMs=3500){
+  let res=await fetchAPI(url,opts,timeoutMs);
+  return res.ok?res.data:null;
+}
+async function syncScanFromServer(){
+  let res=await fetchAPI(API+'/scan',{},4000);
+  if(res.ok&&res.data){
+    scanCache=res.data;
+    lastServerScanCount=res.data.count||0;
+    if(!selectionDirty){
+      selectedIndices.clear();
+      let srvTargets=0;
+      (res.data.networks||[]).forEach(n=>{if(n.selected){selectedIndices.add(n.index);srvTargets++;}});
+      lastServerTargetCount=srvTargets;
+    }
+    renderNetworks();
+  }
+}
+async function doScan(){
+  if(reconnectingAP){toast('热点恢复中，请稍候...');return;}
+  let rawScan=Number(document.getElementById('cfgScanTime').value);
+  let scanMs=(Number.isFinite(rawScan)&&rawScan>=500)?rawScan:5000;
+  let scanSec=Number((scanMs/1000).toFixed(1));
+  let scanLoadEl=document.getElementById('scanLoading');
+  scanLoadEl.textContent=`正在扫描 2.4GHz & 5GHz 频段... (约 ${scanSec} 秒)`;
+  scanLoadEl.classList.add('show');
+  document.getElementById('netList').innerHTML='';
+  selectedIndices.clear();
+  selectionDirty=false;
+  let timeoutMs=Math.max(10000,scanMs+5000);
+  let res=await fetchAPI(API+'/scan',{method:'POST'},timeoutMs);
+  if(!res.ok){
+    toast('扫描失败: '+((res.data&&res.data.message)||('HTTP '+res.status)));
+    scanLoadEl.classList.remove('show');
+    return;
+  }
+  await syncScanFromServer();
+  if(scanCache)toast('扫描完成: '+scanCache.count+' 个网络');
+  scanLoadEl.classList.remove('show');
+  updateAttackStats();
+}
+function setBand(b){
+  bandFilter=b;
+  document.getElementById('flt-all').classList.toggle('active',b==='ALL');
+  document.getElementById('flt-24').classList.toggle('active',b==='2.4G');
+  document.getElementById('flt-5').classList.toggle('active',b==='5G');
+  renderNetworks();
+}
+function setSort(s){
+  sortMode=s;
+  document.getElementById('srt-rssi').classList.toggle('active',s==='RSSI');
+  document.getElementById('srt-ch').classList.toggle('active',s==='CH');
+  renderNetworks();
+}
+function getFilteredNetworks(){
+  if(!scanCache||!scanCache.networks)return[];
+  let q=(document.getElementById('searchBox').value||'').trim().toLowerCase();
+  return scanCache.networks.filter(n=>{
+    let bOk=bandFilter==='ALL'||(bandFilter==='5G'?n.channel>=36:n.channel<36);
+    let qOk=!q||(n.ssid||'').toLowerCase().includes(q)||(n.bssid||'').toLowerCase().includes(q);
+    return bOk&&qOk;
+  }).sort((a,b)=>sortMode==='RSSI'?(b.rssi-a.rssi):(a.channel-b.channel));
+}
+function updateTargetDisplays(){
+  let cnt=selectionDirty?selectedIndices.size:(lastServerTargetCount>=0?lastServerTargetCount:selectedIndices.size);
+  document.getElementById('topTargets').textContent=cnt;
+  document.getElementById('statTargets').textContent=cnt;
+}
+function renderNetworks(){
+  if(!scanCache){
+    syncScanFromServer().then(()=>updateAttackStats());
+    return;
+  }
+  let nets=scanCache.networks||[];
+  let c24=nets.filter(n=>n.channel<36).length,c5=nets.filter(n=>n.channel>=36).length;
+  document.getElementById('flt-all').textContent=`全部 (${nets.length})`;
+  document.getElementById('flt-24').textContent=`2.4G (${c24})`;
+  document.getElementById('flt-5').textContent=`5G (${c5})`;
+  document.getElementById('topAps').textContent=nets.length;
+  updateTargetDisplays();
+  let list=getFilteredNetworks(),html='';
+  list.forEach(n=>{
+    let pct=Math.max(8,Math.min(100,Math.round((n.rssi+100)*1.5)));
+    let cls=n.rssi>=-60?'good':(n.rssi>=-75?'mid':'bad');
+    let bandCls=n.channel>=36?'band5':'band24';
+    let bandTxt=n.channel>=36?'5G':'2.4G';
+    let sel=selectedIndices.has(n.index)?'selected':'';
+    html+=`<div class="net-item ${sel}" onclick="toggleNet(${n.index})"><div class="net-info"><div class="net-ssid">${escHtml(n.ssid||'(隐藏 SSID)')}<span class="net-band ${bandCls}">${bandTxt}</span></div><div class="net-meta">#${n.index} · CH ${n.channel} · ${n.bssid} · ${n.rssi} dBm</div><div class="bar"><div class="bar-fill ${cls}" style="width:${pct}%"></div></div></div><div class="net-check"></div></div>`;
+  });
+  if(!html)html='<p style="text-align:center;color:#6e7681;padding:28px">暂无匹配热点，请点击右上角扫描</p>';
+  document.getElementById('netList').innerHTML=html;
+}
+function toggleNet(idx){if(selectedIndices.has(idx))selectedIndices.delete(idx);else selectedIndices.add(idx);selectionDirty=true;renderNetworks();}
+function selectAllVisible(){getFilteredNetworks().forEach(n=>selectedIndices.add(n.index));selectionDirty=true;renderNetworks();toast('已勾选 '+selectedIndices.size+' 个目标');}
+function clearSelection(){selectedIndices.clear();selectionDirty=true;renderNetworks();}
+function getAtomicTargetSpec(){
+  if(scanCache&&scanCache.networks&&scanCache.networks.length>0&&selectedIndices.size===scanCache.networks.length){
+    return 'all';
+  }
+  return Array.from(selectedIndices).sort((a,b)=>a-b).join(',');
+}
+async function setTargets(){
+  let indices=Array.from(selectedIndices).sort((a,b)=>a-b).join(',');
+  let res=await fetchAPI(API+'/target?indices='+encodeURIComponent(indices),{method:'POST'},3500);
+  if(res.ok&&res.data&&res.data.status==='ok'){
+    selectionDirty=false;
+    lastServerTargetCount=res.data.targets||0;
+    updateTargetDisplays();
+    return true;
+  }
+  toast('目标同步失败: '+((res.data&&res.data.message)||('HTTP '+res.status)));
+  return false;
+}
+async function startAttack(cmd){
+  if(cmd==='start deauther'&&curAtkState.deauth){await sendCmd('stop');return;}
+  if(cmd==='disassoc'&&curAtkState.disassoc){await sendCmd('disassoc');return;}
+  if(selectedIndices.size===0){toast('请先在扫描页勾选至少一个目标');return;}
+  if(!(await setTargets()))return;
+  let spec=getAtomicTargetSpec();
+  await sendCmd(cmd+' '+spec);
+}
+async function singleApAttack(){
+  if(selectedIndices.size===0){toast('请先在扫描页选择一个目标');return;}
+  let firstIdx=Array.from(selectedIndices).sort((a,b)=>a-b)[0];
+  await sendCmd('single_ap '+firstIdx);
+}
+async function timedAttackPreset(ms){
+  if(selectedIndices.size===0){toast('请先在扫描页勾选至少一个目标');return;}
+  if(!(await setTargets()))return;
+  let spec=getAtomicTargetSpec();
+  await sendCmd('attack_time '+ms+' '+spec);
+}
+function escHtml(s){return String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
+async function sendCmd(cmd){
+  let res=await fetchAPI(API+'/command',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'cmd='+encodeURIComponent(cmd)},4000);
+  if(res.ok&&res.data&&res.data.status==='ok'){
+    toast('已执行: '+cmd);
+    setTimeout(updateAttackStats,300);
+    return true;
+  }
+  toast('命令失败: '+((res.data&&res.data.message)||('HTTP '+res.status)));
+  return false;
+}
+function setReconnectBanners(msg){
+  ['sniffReconnectBanner','atkReconnectBanner'].forEach(id=>{
+    let el=document.getElementById(id);
+    if(!el)return;
+    if(msg){el.textContent=msg;el.classList.add('show');}
+    else{el.classList.remove('show');el.textContent='';}
+  });
+}
+function startReconnectCountdown(seconds,onRecovered){
+  if(reconnectTimer){clearInterval(reconnectTimer);reconnectTimer=null;}
+  let mySeq=++reconnectSeq;
+  reconnectingAP=true;
+  let rem=seconds;
+  setReconnectBanners(`⏳ 热点已暂停用于混杂模式，约 ${rem} 秒后自动恢复并回读数据...`);
+  reconnectTimer=setInterval(async()=>{
+    if(mySeq!==reconnectSeq){clearInterval(reconnectTimer);reconnectTimer=null;return;}
+    if(rem>0){
+      rem--;
+      setReconnectBanners(rem>0?`⏳ 热点已暂停用于混杂模式，约 ${rem} 秒后自动恢复...`:'🔄 正在重连热点并回读数据...');
+      return;
+    }
+    clearInterval(reconnectTimer);reconnectTimer=null;
+    for(let attempt=0;attempt<12;attempt++){
+      if(mySeq!==reconnectSeq)return;
+      let st=await fetchAPI(API+'/status',{},2000);
+      if(mySeq!==reconnectSeq)return;
+      if(st.ok&&st.data&&!st.data.sniffing){
+        reconnectingAP=false;
+        setReconnectBanners('');
+        toast('热点已重连');
+        if(onRecovered)await onRecovered();
+        return;
+      }
+      setReconnectBanners(`🔄 等待手机重新连回热点并恢复通信 (${attempt+1}/12)...`);
+      await new Promise(r=>setTimeout(r,1500));
+    }
+    if(mySeq!==reconnectSeq)return;
+    reconnectingAP=false;
+    setReconnectBanners('⚠️ 自动重连超时，请确认手机已重新连上设备热点后刷新页面。');
+  },1000);
+}
+async function startBleWaitRecovery(onRecovered){
+  if(reconnectTimer){clearInterval(reconnectTimer);reconnectTimer=null;}
+  let mySeq=++reconnectSeq;
+  reconnectingAP=true;
+  setReconnectBanners('⏳ 当前已连蓝牙 App，热点已暂停，请在 App 内停止后自动恢复...');
+  await new Promise(r=>setTimeout(r,1500));
+  while(reconnectingAP&&mySeq===reconnectSeq){
+    let st=await fetchAPI(API+'/status',{},1800);
+    if(mySeq!==reconnectSeq)return;
+    if(st.ok&&st.data&&!st.data.sniffing&&!st.data.deauth_sniff){
+      reconnectingAP=false;
+      setReconnectBanners('');
+      toast('热点已重连');
+      if(onRecovered)await onRecovered();
+      return;
+    }
+    await new Promise(r=>setTimeout(r,2000));
+  }
+}
+async function startWebSniff(mode){
+  if(reconnectingAP){toast('热点恢复中，请稍候...');return;}
+  let confirmed=await showConfirm('抓包模式提示','启用 15 秒抓包会将设备切换至混杂监听模式，期间设备热点及本网页会暂时断开，结束后自动恢复热点并回读捕获报文。是否继续？');
+  if(!confirmed)return;
+  let cmd='sniff_time 15000 '+mode;
+  let res=await fetchAPI(API+'/command',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'cmd='+encodeURIComponent(cmd)},3500);
+  if(!res.ok){
+    toast('启动抓包失败: '+((res.data&&res.data.message)||('HTTP '+res.status)));
+    return;
+  }
+  toast('已开启 15s 抓包，热点将在抓包结束后自动恢复');
+  startReconnectCountdown(15,async()=>{await fetchLogs();await updateAttackStats();});
+}
+async function startSniffClone(){
+  if(curAtkState.clone){await sendCmd('stop');return;}
+  if(reconnectingAP){toast('热点恢复中，请稍候...');return;}
+  let st=await fetchJSON(API+'/status',{},1500);
+  let bleConn=st?!!st.ble_connected:!!curAtkState.bleConnected;
+  if(st)curAtkState.bleConnected=bleConn;
+  let confirmMsg=bleConn
+    ?'当前已连蓝牙 App，启用后热点将暂停并持续监听，请在 App 内停止后自动恢复。是否继续？'
+    :'启用 Deauth 嗅探克隆将暂停设备热点并进入混杂监听。未连接蓝牙控制端时约 15 秒后自动恢复热点；如已连接蓝牙 App 可在 App 内随时停止。是否继续？';
+  let confirmed=await showConfirm('嗅探克隆提示',confirmMsg);
+  if(!confirmed)return;
+  let stAfter=await fetchJSON(API+'/status',{},1000);
+  if(stAfter){bleConn=!!stAfter.ble_connected;curAtkState.bleConnected=bleConn;}
+  let res=await fetchAPI(API+'/command',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'cmd=deauth_sniff'},3500);
+  if(!res.ok){
+    toast('启动失败: '+((res.data&&res.data.message)||('HTTP '+res.status)));
+    return;
+  }
+  if(bleConn){
+    toast('当前已连蓝牙 App，热点已暂停，请在 App 内停止后自动恢复');
+    startBleWaitRecovery(async()=>{await updateAttackStats();});
+  }else{
+    toast('Deauth 嗅探克隆已启动，热点将在恢复后重连');
+    startReconnectCountdown(15,async()=>{await updateAttackStats();});
+  }
+}
+function renderLogBox(){
+  let box=document.getElementById('logBox');
+  if(cachedLogs.length===0){box.innerHTML='<div style="color:#6e7681;text-align:center;padding-top:90px">暂无抓包记录，点击上方按钮开始捕获</div>';return;}
+  box.innerHTML=cachedLogs.map((l,i)=>{
+    let cls=l.includes('EAPOL')?'log-eapol':(l.includes('Deauth')||l.includes('Disassoc')?'log-deauth':'');
+    return `<div class="log-line ${cls}">${String(i+1).padStart(2,'0')} ${escHtml(l)}</div>`;
+  }).join('');
+  box.scrollTop=box.scrollHeight;
+}
+async function fetchLogs(){
+  if(logsInFlight||reconnectingAP)return;
+  logsInFlight=true;
+  try{
+    let url=lastLogSeq>=0?(API+'/logs?since='+lastLogSeq):(API+'/logs');
+    let d=await fetchJSON(url,{},3500);
+    if(!d||!Array.isArray(d.logs))return;
+    let changed=false;
+    if(d.reset||lastLogSeq<0){
+      cachedLogs=d.logs.slice(-32);
+      changed=true;
+    }else if(d.logs.length>0){
+      cachedLogs=cachedLogs.concat(d.logs).slice(-32);
+      changed=true;
+    }
+    if(typeof d.seq==='number')lastLogSeq=d.seq;
+    if(changed)renderLogBox();
+  }finally{
+    logsInFlight=false;
+  }
+}
+async function clearWebLogs(){
+  let res=await fetchAPI(API+'/logs/clear',{method:'POST'},3500);
+  if(res.ok){
+    cachedLogs=[];
+    lastLogSeq=0;
+    renderLogBox();
+    toast('已清空抓包日志');
+  }else{
+    toast('清空失败: '+((res.data&&res.data.message)||('HTTP '+res.status)));
+  }
+}
+function utf8ByteLen(s){return typeof TextEncoder!=='undefined'?new TextEncoder().encode(s).length:unescape(encodeURIComponent(s)).length;}
+function copyTextFallback(text,okMsg){
+  let ta=document.createElement('textarea');
+  ta.value=text;ta.setAttribute('readonly','');
+  ta.style.cssText='position:fixed;left:-9999px;top:0;opacity:0';
+  document.body.appendChild(ta);ta.select();ta.setSelectionRange(0,text.length);
+  let ok=false;
+  try{ok=document.execCommand('copy');}catch(e){ok=false;}
+  document.body.removeChild(ta);
+  toast(ok?okMsg:'当前浏览器不支持自动复制，请长按日志手动复制');
+}
+function copyLogs(){
+  if(!cachedLogs.length){toast('暂无日志可复制');return;}
+  let text=cachedLogs.join('\n'),okMsg='已复制 '+cachedLogs.length+' 条记录';
+  if(navigator.clipboard&&window.isSecureContext){
+    navigator.clipboard.writeText(text).then(()=>toast(okMsg)).catch(()=>copyTextFallback(text,okMsg));
+  }else{
+    copyTextFallback(text,okMsg);
+  }
+}
+function renderUptimeMs(ms){
+  let s=Math.floor(ms/1000),m=Math.floor(s/60),h=Math.floor(m/60);
+  document.getElementById('cfgUptime').textContent=h+'h '+(m%60)+'m '+(s%60)+'s';
+}
+async function updateAttackStats(){
+  updateTargetDisplays();
+  if(statsInFlight||reconnectingAP)return;
+  statsInFlight=true;
+  try{
+    let opts=lastStatusEtag?{headers:{'If-None-Match':lastStatusEtag}}:{};
+    let res=await fetchAPI(API+'/status',opts,2500);
+    if(res.notModified){
+      if(baseSyncAtMs>0)renderUptimeMs(baseUptimeMs+(Date.now()-baseSyncAtMs));
+      return;
+    }
+    if(res.etag)lastStatusEtag=res.etag;
+    let d=res.ok?res.data:null;
+    if(d){
+      let srvScan=Number(d.scan_count||0);
+      let srvTarget=Number(d.target_count||0);
+      let needScanSync=!selectionDirty&&(srvScan!==lastServerScanCount||srvTarget!==lastServerTargetCount);
+      lastServerScanCount=srvScan;
+      lastServerTargetCount=srvTarget;
+      updateTargetDisplays();
+
+      document.getElementById('topCh').textContent=d.current_channel||'--';
+      document.getElementById('statCh').textContent=d.current_channel||'--';
+      document.getElementById('topAps').textContent=srvScan;
+      document.getElementById('topTxOk').textContent=d.tx_ok||0;
+      document.getElementById('statTxOk').textContent=d.tx_ok||0;
+      document.getElementById('topTxFail').textContent=d.tx_fail||0;
+      curAtkState.deauth=!!d.attack_enabled;
+      curAtkState.disassoc=!!d.disassoc_enabled;
+      curAtkState.clone=!!d.deauth_sniff;
+      curAtkState.hopping=!!d.hopping;
+      curAtkState.targetMode=!!d.target_mode;
+      curAtkState.bleConnected=!!d.ble_connected;
+      document.getElementById('btnDeauth').classList.toggle('running',curAtkState.deauth);
+      document.getElementById('btnDisassoc').classList.toggle('running',curAtkState.disassoc);
+      document.getElementById('btnBcn').classList.toggle('running',!!d.beacon_flood);
+      document.getElementById('btnPrb').classList.toggle('running',!!d.probe_flood);
+      document.getElementById('btnJam').classList.toggle('running',!!d.signal_jam);
+      document.getElementById('btnClone').classList.toggle('running',curAtkState.clone);
+      let bHopOn=document.getElementById('btnHopOn'),bHopOff=document.getElementById('btnHopOff');
+      if(bHopOn&&bHopOff){bHopOn.classList.toggle('running',curAtkState.hopping);bHopOff.classList.toggle('running',!curAtkState.hopping);}
+      let tb=document.getElementById('timedBanner');
+      if(tb){
+        if(d.timed_attack&&d.timed_remaining>0){
+          tb.textContent=`⏱️ 定时压制进行中，剩余 ${Math.ceil(d.timed_remaining/1000)} 秒`;
+          tb.classList.add('show');
+        }else{
+          tb.classList.remove('show');
+        }
+      }
+      let dot=document.getElementById('statusDot');
+      dot.className='status-dot';
+      if(d.attack_enabled||d.disassoc_enabled||d.beacon_flood||d.probe_flood||d.signal_jam||d.deauth_sniff)dot.classList.add('attacking');
+      else if(d.sniffing)dot.classList.add('active');
+      baseUptimeMs=Number(d.uptime||0);
+      baseSyncAtMs=Date.now();
+      renderUptimeMs(baseUptimeMs);
+      let nextSsid=d.ssid||'',nextBle=d.ble_name||'';
+      if((nextSsid&&nextSsid!==syncedSsid)||(nextBle&&nextBle!==syncedBle)){
+        syncedSsid=nextSsid;syncedBle=nextBle;
+        applyHeaderIdentity(nextSsid,nextBle);
+        initStatus(false);
+      }else if(nextSsid||nextBle){
+        applyHeaderIdentity(nextSsid,nextBle);
+      }
+      if(needScanSync)syncScanFromServer();
+    }
+  }finally{
+    statsInFlight=false;
+  }
+}
+let loadedBleName='WiFi-Deck',loadedApSsid='WiFi-Deck';
+let syncedSsid='',syncedBle='',dirtyFields=new Set();
+function setCfgField(id,val){if(!dirtyFields.has(id))document.getElementById(id).value=val;}
+function applyHeaderIdentity(ssid,ble){
+  let title=ssid||ble||'WiFi-Deck';
+  document.getElementById('hdrName').textContent=title;
+  document.title=title+' · 控制台';
+}
+async function saveConfig(){
+  let bleName=document.getElementById('cfgBleName').value.trim();
+  let ssid=document.getElementById('cfgApSsid').value.trim();
+  let pass=document.getElementById('cfgApPass').value.trim();
+  let cycleDelay=Number(document.getElementById('cfgCycleDelay').value);
+  let scanTime=Number(document.getElementById('cfgScanTime').value);
+  let numFrames=Number(document.getElementById('cfgNumFrames').value);
+  let startCh=Number(document.getElementById('cfgStartChannel').value);
+  let sendBle=dirtyFields.has('cfgBleName')||bleName!==loadedBleName;
+  let sendSsid=dirtyFields.has('cfgApSsid')||ssid!==loadedApSsid;
+  let sendPass=pass.length>0;
+  let bleLen=utf8ByteLen(bleName),ssidLen=utf8ByteLen(ssid),passLen=utf8ByteLen(pass);
+  if(sendBle&&(bleLen<1||bleLen>26)){toast('BLE 名称需为 1~26 字节');return;}
+  if(sendSsid&&(ssidLen<1||ssidLen>32)){toast('WiFi 热点名称需为 1~32 字节');return;}
+  if(sendPass&&(passLen<8||passLen>63)){toast('WiFi 密码需为 8~63 字符/字节');return;}
+  if(!Number.isInteger(cycleDelay)||cycleDelay<100||cycleDelay>60000){toast('攻击间隔需在 100~60000 ms');return;}
+  if(!Number.isInteger(scanTime)||scanTime<500||scanTime>30000){toast('扫描时间需在 500~30000 ms');return;}
+  if(!Number.isInteger(numFrames)||numFrames<1||numFrames>100){toast('单次突发帧数需在 1~100');return;}
+  if(!Number.isInteger(startCh)||!(startCh===1||(startCh>=36&&startCh<=165))){toast('起始信道需为 1 或 36~165');return;}
+  let credsChanged=(sendSsid&&ssid!==loadedApSsid)||sendPass;
+  let parts=[];
+  if(sendBle)parts.push('ble_name='+encodeURIComponent(bleName));
+  if(sendSsid)parts.push('ap_ssid='+encodeURIComponent(ssid));
+  if(sendPass)parts.push('ap_pass='+encodeURIComponent(pass));
+  parts.push('cycle_delay='+cycleDelay,'scan_time='+scanTime,'num_frames='+numFrames,'start_channel='+startCh,'scan_cycles='+document.getElementById('cfgScanCycles').value,'led='+document.getElementById('cfgLed').value);
+  let body=parts.join('&');
+  let res=await fetchAPI(API+'/config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body},4000);
+  let data=res.data;
+  if(res.ok&&data&&data.status==='ok'){
+    dirtyFields.clear();
+    if(sendBle){loadedBleName=bleName;syncedBle=bleName;}
+    if(sendSsid){loadedApSsid=ssid;syncedSsid=ssid;}
+    if(sendPass)document.getElementById('cfgApPass').value='';
+    applyHeaderIdentity(loadedApSsid,loadedBleName);
+    toast((data.ap_restarted||credsChanged)?'配置已保存，热点正按新名称/密码重启，请重新连接 WiFi':'配置已保存至 Flash');
+  }else if(data&&data.message){
+    toast('保存失败: '+data.message);
+  }else if(credsChanged){
+    dirtyFields.clear();
+    if(sendSsid){loadedApSsid=ssid;syncedSsid=ssid;}
+    if(sendPass)document.getElementById('cfgApPass').value='';
+    applyHeaderIdentity(loadedApSsid,loadedBleName);
+    toast('热点凭据已更新并重启，请重新连接新 WiFi');
+  }else{
+    toast('配置保存请求失败，请检查热点连接');
+  }
+}
+async function resetDefaultConfig(){
+  dirtyFields.clear();
+  document.getElementById('cfgApPass').value='';
+  await sendCmd('reset_config');
+  [500,1500,3500].forEach(ms=>setTimeout(()=>initStatus(true),ms));
+}
+async function initStatus(force=false){
+  let data=await fetchJSON(API+'/info',{},3500);
+  if(data){
+    if(force){dirtyFields.clear();document.getElementById('cfgApPass').value='';}
+    if(data.ble_name){loadedBleName=data.ble_name;syncedBle=data.ble_name;setCfgField('cfgBleName',data.ble_name);}
+    if(data.ssid){loadedApSsid=data.ssid;syncedSsid=data.ssid;setCfgField('cfgApSsid',data.ssid);}
+    applyHeaderIdentity(data.ssid,data.ble_name);
+    setCfgField('cfgCycleDelay',data.cycle_delay);
+    setCfgField('cfgScanTime',data.scan_time);
+    setCfgField('cfgNumFrames',data.num_frames);
+    setCfgField('cfgStartChannel',data.start_channel);
+    setCfgField('cfgScanCycles',data.scan_between_cycles?'on':'off');
+    setCfgField('cfgLed',data.led?'on':'off');
+    if(data.version)document.getElementById('fwVer').textContent='v'+data.version+' ';
+  }
+}
+window.onload=()=>{
+  document.querySelectorAll('#page-config input, #page-config select').forEach(el=>
+    el.addEventListener(el.tagName==='SELECT'?'change':'input',()=>dirtyFields.add(el.id))
+  );
+  renderNetworks();initStatus(true);updateAttackStats();
+  setInterval(()=>{
+    if(reconnectingAP)return;
+    updateAttackStats();
+    if(document.getElementById('page-sniff').classList.contains('active'))fetchLogs();
+  },2500);
+};
+</script>
+</body>
+</html>

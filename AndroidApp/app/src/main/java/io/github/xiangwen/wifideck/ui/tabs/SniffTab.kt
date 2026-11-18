@@ -38,6 +38,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
@@ -67,12 +68,62 @@ import kotlinx.coroutines.flow.map
 
 private const val AUTO_SCROLL_MIN_INTERVAL_MS = 80L
 
+private val QUICK_SNIFF_CHANNELS = listOf(1, 6, 11, 13, 36, 44, 149, 157, 165)
+
+@Immutable
 private data class SniffControlState(
     val sniffing: Boolean = false,
     val sniffMode: Int = SniffMode.STOP.code,
     val hopping: Boolean = false,
     val channel: Int = 0
 )
+
+@Immutable
+private data class LogCategoryStyle(
+    val tagColor: Color,
+    val tagBg: Color,
+    val textColor: Color,
+    val rowBg: Color
+)
+
+private val STYLE_EAPOL = LogCategoryStyle(
+    tagColor = DeckColors.Amber,
+    tagBg = DeckColors.AmberDim,
+    textColor = DeckColors.Amber,
+    rowBg = DeckColors.AmberDim.copy(alpha = 0.35f)
+)
+private val STYLE_DEAUTH = LogCategoryStyle(
+    tagColor = DeckColors.Crimson,
+    tagBg = DeckColors.CrimsonDim,
+    textColor = DeckColors.TextPrimary,
+    rowBg = DeckColors.CrimsonDim.copy(alpha = 0.35f)
+)
+private val STYLE_BEACON = LogCategoryStyle(
+    tagColor = DeckColors.Blue,
+    tagBg = DeckColors.BlueDim,
+    textColor = DeckColors.TextPrimary,
+    rowBg = Color.Transparent
+)
+private val STYLE_PROBE = LogCategoryStyle(
+    tagColor = DeckColors.Purple,
+    tagBg = DeckColors.PurpleDim,
+    textColor = DeckColors.TextPrimary,
+    rowBg = Color.Transparent
+)
+private val STYLE_FRAME = LogCategoryStyle(
+    tagColor = DeckColors.Cyan,
+    tagBg = DeckColors.CyanDim,
+    textColor = DeckColors.TextPrimary,
+    rowBg = Color.Transparent
+)
+
+private fun SniffLogCategory.style(): LogCategoryStyle = when (this) {
+    SniffLogCategory.EAPOL -> STYLE_EAPOL
+    SniffLogCategory.DEAUTH -> STYLE_DEAUTH
+    SniffLogCategory.BEACON -> STYLE_BEACON
+    SniffLogCategory.PROBE -> STYLE_PROBE
+    SniffLogCategory.FRAME -> STYLE_FRAME
+}
 
 @Composable
 fun SniffTab(viewModel: MainViewModel) {
@@ -156,7 +207,7 @@ private fun SniffControlCard(viewModel: MainViewModel) {
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
-                    listOf(1, 6, 11, 13, 36, 44, 149, 157, 165).forEach { ch ->
+                    QUICK_SNIFF_CHANNELS.forEach { ch ->
                         val isCurrent = !control.hopping && control.channel == ch
                         Box(
                             modifier = Modifier
@@ -442,48 +493,12 @@ private fun TerminalToolButton(label: String, active: Boolean, onClick: () -> Un
 
 @Composable
 private fun PacketLogRow(entry: SniffLogEntry) {
-    val tagColor: Color
-    val tagBg: Color
-    val textColor: Color
-    when (entry.category) {
-        SniffLogCategory.EAPOL -> {
-            tagColor = DeckColors.Amber
-            tagBg = DeckColors.AmberDim
-            textColor = DeckColors.Amber
-        }
-        SniffLogCategory.DEAUTH -> {
-            tagColor = DeckColors.Crimson
-            tagBg = DeckColors.CrimsonDim
-            textColor = DeckColors.TextPrimary
-        }
-        SniffLogCategory.BEACON -> {
-            tagColor = DeckColors.Blue
-            tagBg = DeckColors.BlueDim
-            textColor = DeckColors.TextPrimary
-        }
-        SniffLogCategory.PROBE -> {
-            tagColor = DeckColors.Purple
-            tagBg = DeckColors.PurpleDim
-            textColor = DeckColors.TextPrimary
-        }
-        SniffLogCategory.FRAME -> {
-            tagColor = DeckColors.Cyan
-            tagBg = DeckColors.CyanDim
-            textColor = DeckColors.TextPrimary
-        }
-    }
+    val style = entry.category.style()
 
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .background(
-                if (entry.category.isHighlight) {
-                    tagBg.copy(alpha = 0.35f)
-                } else {
-                    Color.Transparent
-                },
-                RoundedCornerShape(4.dp)
-            )
+            .background(style.rowBg, RoundedCornerShape(4.dp))
             .padding(horizontal = 4.dp, vertical = 3.dp),
         verticalAlignment = Alignment.Top
     ) {
@@ -499,18 +514,18 @@ private fun PacketLogRow(entry: SniffLogEntry) {
         )
         Text(
             text = entry.category.tagLabel,
-            color = tagColor,
+            color = style.tagColor,
             fontSize = 9.sp,
             fontFamily = FontFamily.Monospace,
             fontWeight = FontWeight.Bold,
             modifier = Modifier
-                .background(tagBg, RoundedCornerShape(3.dp))
+                .background(style.tagBg, RoundedCornerShape(3.dp))
                 .padding(horizontal = 4.dp, vertical = 1.dp)
         )
         Spacer(modifier = Modifier.width(6.dp))
         Text(
             text = entry.displayText,
-            color = textColor,
+            color = style.textColor,
             fontSize = 11.sp,
             fontFamily = FontFamily.Monospace,
             lineHeight = 15.sp

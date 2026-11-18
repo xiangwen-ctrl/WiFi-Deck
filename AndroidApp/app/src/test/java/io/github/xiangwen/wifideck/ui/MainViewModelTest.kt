@@ -1,8 +1,13 @@
 package io.github.xiangwen.wifideck.ui
 
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.ViewModelStore
+import io.github.xiangwen.wifideck.data.BleGatePrompt
 import io.github.xiangwen.wifideck.data.BleManager
 import io.github.xiangwen.wifideck.data.BleTransport
+import io.github.xiangwen.wifideck.data.ReconnectPhase
+import io.github.xiangwen.wifideck.data.ReconnectUiState
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -27,6 +32,9 @@ private class FakeBleTransport : BleTransport {
     private val _connectionState = MutableStateFlow(BleManager.ConnectionState.DISCONNECTED)
     override val connectionState: StateFlow<BleManager.ConnectionState> = _connectionState
 
+    private val _reconnectState = MutableStateFlow(ReconnectUiState())
+    override val reconnectState: StateFlow<ReconnectUiState> = _reconnectState
+
     private val _mtu = MutableStateFlow(247)
     override val mtu: StateFlow<Int> = _mtu
 
@@ -37,13 +45,24 @@ private class FakeBleTransport : BleTransport {
     val sentTargetedCommands = mutableListOf<Pair<String, List<Int>>>()
     var emergencyStopCount = 0
     var disconnectCalls = 0
+    var retryReconnectCalls = 0
+    var retryReconnectResult = false
 
     fun setState(state: BleManager.ConnectionState) {
         _connectionState.value = state
     }
 
+    fun setReconnectUiState(state: ReconnectUiState) {
+        _reconnectState.value = state
+    }
+
     fun emitLine(json: String) {
         onLine?.invoke(json)
+    }
+
+    override fun retryReconnect(): Boolean {
+        retryReconnectCalls++
+        return retryReconnectResult
     }
 
     override fun sendCommand(cmd: String): Boolean {
@@ -450,5 +469,273 @@ class MainViewModelTest {
         assertEquals(0, fakeBle.disconnectCalls)
         assertNull(viewModel.toast.value)
         assertTrue(viewModel.configSynced.value)
+    }
+
+    private class DummyOtherViewModel : ViewModel()
+
+    @Test
+    fun factory_injectsCustomBleTransportAndPropagatesReconnectState() = runTest(testDispatcher) {
+        val customTransport = FakeBleTransport()
+        val factory: ViewModelProvider.Factory = MainViewModel.Factory(customTransport)
+        val localStore = ViewModelStore()
+        try {
+            val vm = ViewModelProvider(localStore, factory)[MainViewModel::class.java]
+            val reconnecting = ReconnectUiState(phase = ReconnectPhase.RECONNECTING_SCAN, attempt = 2, maxAttempts = 5)
+            customTransport.setReconnectUiState(reconnecting)
+            runCurrent()
+            assertEquals(reconnecting, vm.reconnectState.value)
+
+            var threw = false
+            try {
+                factory.create(DummyOtherViewModel::class.java)
+            } catch (_: IllegalArgumentException) {
+                threw = true
+            }
+            assertTrue(threw)
+        } finally {
+            localStore.clear()
+        }
+    }
+
+    @Test
+    fun retryOrConnectBle_prefersTransportRetryReconnectBeforeGateCheck() = runTest(testDispatcher) {
+        val gateActions = mutableListOf<BleGateAction>()
+        val collectJob = launch {
+            viewModel.gateActions.collect { gateActions.add(it) }
+        }
+        try {
+            viewModel.showBleGatePrompt(BleGatePrompt.BluetoothDisabled)
+            fakeBle.retryReconnectResult = true
+            viewModel.retryOrConnectBle()
+            runCurrent()
+
+            assertEquals(1, fakeBle.retryReconnectCalls)
+            assertNull(viewModel.bleGatePrompt.value)
+            assertTrue(gateActions.isEmpty())
+
+            fakeBle.retryReconnectResult = false
+            viewModel.retryOrConnectBle()
+            runCurrent()
+
+            assertEquals(2, fakeBle.retryReconnectCalls)
+            assertEquals(listOf(BleGateAction.CheckAndConnect(autoTriggered = false)), gateActions)
+        } finally {
+            collectJob.cancel()
+        }
+    }
+
+    @Test
+    fun statusMessage_parsesAllFieldsAndUpdatesDerivedFlows() = runTest(testDispatcher) {
+        fakeBle.setState(BleManager.ConnectionState.CONNECTED)
+        runCurrent()
+
+        fakeBle.emitLine(
+            """{"t":"st","atk":1,"dis":0,"bcn":1,"prb":0,"jam":0,"snf":0,"snfOn":1,"sMode":4,"hop":1,"ch":149,"ok":128,"fail":3,"rem":12}"""
+        )
+        runCurrent()
+
+        val st = viewModel.status.value
+        assertTrue(st.attackEnabled)
+        assertFalse(st.disassocEnabled)
+        assertTrue(st.beaconFlood)
+        assertTrue(st.sniffing)
+        assertEquals(4, st.sniffMode)
+        assertTrue(st.hopping)
+        assertEquals(149, st.channel)
+        assertEquals(128L, st.txOk)
+        assertEquals(3L, st.txFail)
+        assertEquals(12, st.timedRemainingSec)
+        assertTrue(viewModel.isAttacking.value)
+        assertTrue(viewModel.isSniffing.value)
+    }
+
+    @Test
+    fun scanListState_filtersByBandAndSanitizedQueryAndSortsCorrectly() = runTest(testDispatcher) {
+        fakeBle.setState(BleManager.ConnectionState.CONNECTED)
+        runCurrent()
+        fakeBle.emitLine("""{"t":"scan_begin"}""")
+        fakeBle.emitLine("""{"t":"ap","i":0,"s":"Home24","b":"AA:BB:CC:00:00:01","c":11,"r":-70}""")
+        fakeBle.emitLine("""{"t":"ap","i":1,"s":"Office5G","b":"AA:BB:CC:00:00:02","c":36,"r":-55}""")
+        fakeBle.emitLine("""{"t":"ap","i":2,"s":"Cafe24","b":"AA:BB:CC:00:00:03","c":1,"r":-45}""")
+        fakeBle.emitLine("""{"t":"scan_end","n":3}""")
+        runCurrent()
+
+        assertEquals(3, viewModel.scanListState.value.totalCount)
+        assertEquals(2, viewModel.scanListState.value.count24G)
+        assertEquals(1, viewModel.scanListState.value.count5G)
+        // Default sort RSSI descending: Cafe24(-45), Office5G(-55), Home24(-70)
+        assertEquals(listOf(2, 1, 0), viewModel.scanListState.value.filteredAps.map { it.index })
+
+        viewModel.setSortMode(SortMode.CHANNEL)
+        runCurrent()
+        assertEquals(listOf(2, 0, 1), viewModel.scanListState.value.filteredAps.map { it.index })
+
+        viewModel.setBandFilter(BandFilter.G5)
+        runCurrent()
+        assertEquals(listOf(1), viewModel.scanListState.value.filteredAps.map { it.index })
+
+        viewModel.selectAll()
+        assertEquals(setOf(1), viewModel.selected.value)
+
+        viewModel.setBandFilter(BandFilter.ALL)
+        viewModel.setSearchQuery("cafe\r\n")
+        runCurrent()
+        assertEquals("cafe", viewModel.searchQuery.value)
+        assertEquals(listOf(2), viewModel.scanListState.value.filteredAps.map { it.index })
+    }
+
+    @Test
+    fun logRingBuffer_capsAt500EntriesAndErrorLogAbortsPendingConfigSave() = runTest(testDispatcher) {
+        fakeBle.setState(BleManager.ConnectionState.CONNECTED)
+        runCurrent()
+
+        for (i in 1..505) {
+            fakeBle.emitLine("""{"t":"log","m":"[MGMT] Beacon #$i"}""")
+            if (i % 64 == 0) runCurrent()
+        }
+        runCurrent()
+        advanceTimeBy(100L)
+        runCurrent()
+
+        assertEquals(500, viewModel.logs.value.size)
+        assertEquals("Beacon #6", viewModel.logs.value.first().displayText)
+        assertEquals("Beacon #505", viewModel.logs.value.last().displayText)
+
+        // Start an identity save, then simulate firmware [ERROR] log aborting savingConfig
+        viewModel.sendSetBleName("DeckPro")
+        assertTrue(viewModel.savingConfig.value)
+
+        fakeBle.emitLine("""{"t":"log","m":"[ERROR] Invalid setting"}""")
+        runCurrent()
+        assertFalse(viewModel.savingConfig.value)
+        assertEquals("[ERROR] Invalid setting", viewModel.toast.value)
+    }
+
+    @Test
+    fun identityConfigSave_validatesUtf8BoundsProbesInfoAt1500msAndTimesOutAt3300ms() = runTest(testDispatcher) {
+        fakeBle.setState(BleManager.ConnectionState.CONNECTED)
+        runCurrent()
+
+        // 9 Chinese chars = 27 UTF-8 bytes (> 26B limit) -> rejected locally
+        viewModel.sendSetBleName("一二三四五六七八九")
+        assertEquals("BLE 蓝牙名称长度需为 1~26 字节", viewModel.toast.value)
+        assertTrue(fakeBle.sentCommands.isEmpty())
+
+        // Short WPA2 password (< 8B) -> rejected locally
+        viewModel.sendSetApPass("1234567")
+        assertEquals("WPA2 热点密码长度需为 8~63 字符/字节", viewModel.toast.value)
+        assertTrue(fakeBle.sentCommands.isEmpty())
+
+        // Valid SSID update triggers auto "info" probe at 1500ms and times out cleanly at 3300ms if unconfirmed
+        viewModel.clearToast()
+        viewModel.sendSetApSsid("LabDeck")
+        assertTrue(viewModel.savingConfig.value)
+        assertEquals(listOf("set ap_ssid LabDeck"), fakeBle.sentCommands)
+
+        advanceTimeBy(1_500L)
+        runCurrent()
+        assertTrue(fakeBle.sentCommands.contains("info"))
+        assertTrue(viewModel.savingConfig.value)
+
+        advanceTimeBy(1_800L)
+        runCurrent()
+        assertFalse(viewModel.savingConfig.value)
+        assertEquals("热点名称保存超时，请刷新核对", viewModel.toast.value)
+    }
+
+    @Test
+    fun debouncedSettings_gateOnConfigSyncAndEnforcePerKey350msDebounce() = runTest(testDispatcher) {
+        fakeBle.setState(BleManager.ConnectionState.CONNECTED)
+        runCurrent()
+
+        // Blocked before cfg + id sync completes
+        viewModel.sendLedToggle(false)
+        assertEquals("正在同步设备配置，请稍候", viewModel.toast.value)
+        assertTrue(fakeBle.sentCommands.isEmpty())
+
+        fakeBle.emitLine("""{"t":"cfg","delay":2000,"scan":5000,"frames":3,"ch":1,"sc":0,"led":1,"ap":1}""")
+        fakeBle.emitLine("""{"t":"id","ssid":"WiFi-Deck","pass":"12345678","ble":"WiFi-Deck"}""")
+        runCurrent()
+        assertTrue(viewModel.canWriteSettings.value)
+
+        viewModel.sendLedToggle(false)
+        // Immediate duplicate key within 350ms is debounced; different key goes through
+        viewModel.sendLedToggle(true)
+        viewModel.sendSetFrames(5)
+        assertEquals(listOf("set led off", "set num_frames 5"), fakeBle.sentCommands)
+    }
+
+    @Test
+    fun confirmBleGatePrompt_dispatchesExpectedActionsAndSetChannelGuardsActiveSoftAp() = runTest(testDispatcher) {
+        val gateActions = mutableListOf<BleGateAction>()
+        val collectJob = launch {
+            viewModel.gateActions.collect { gateActions.add(it) }
+        }
+        try {
+            viewModel.showBleGatePrompt(BleGatePrompt.PermissionRationale(isAndroid12Plus = true))
+            viewModel.confirmBleGatePrompt()
+            viewModel.showBleGatePrompt(BleGatePrompt.PermissionPermanentlyDenied(isAndroid12Plus = true))
+            viewModel.confirmBleGatePrompt()
+            viewModel.showBleGatePrompt(BleGatePrompt.BluetoothDisabled)
+            viewModel.confirmBleGatePrompt()
+            viewModel.showBleGatePrompt(BleGatePrompt.LocationDisabled)
+            viewModel.confirmBleGatePrompt()
+            runCurrent()
+
+            assertEquals(
+                listOf(
+                    BleGateAction.LaunchPermissionRequest,
+                    BleGateAction.LaunchAppSettings,
+                    BleGateAction.LaunchEnableBluetooth,
+                    BleGateAction.LaunchLocationSettings
+                ),
+                gateActions
+            )
+
+            // SoftAP active + not sniffing blocks channel lock; sniffing=true allows channel lock
+            fakeBle.setState(BleManager.ConnectionState.CONNECTED)
+            fakeBle.emitLine("""{"t":"cfg","delay":2000,"scan":5000,"frames":3,"ch":1,"sc":0,"led":1,"ap":1}""")
+            fakeBle.emitLine("""{"t":"st","atk":0,"dis":0,"bcn":0,"prb":0,"jam":0,"snf":0,"snfOn":0,"sMode":6,"hop":0,"ch":1,"ok":0,"fail":0,"rem":0}""")
+            runCurrent()
+
+            viewModel.sendSetChannel(36)
+            assertEquals("热点开启中不可直接锁频，请先开启抓包或关闭热点", viewModel.toast.value)
+            assertFalse(fakeBle.sentCommands.contains("set ch 36"))
+
+            fakeBle.emitLine("""{"t":"st","atk":0,"dis":0,"bcn":0,"prb":0,"jam":0,"snf":0,"snfOn":1,"sMode":0,"hop":0,"ch":1,"ok":0,"fail":0,"rem":0}""")
+            runCurrent()
+            viewModel.sendSetChannel(36)
+            assertTrue(fakeBle.sentCommands.contains("set ch 36"))
+            assertEquals("已锁定信道 CH 36", viewModel.toast.value)
+        } finally {
+            collectJob.cancel()
+        }
+    }
+
+    @Test
+    fun configMessage_parsesFirmwareVersionAndResetsOnDisconnect() = runTest(testDispatcher) {
+        fakeBle.setState(BleManager.ConnectionState.CONNECTED)
+        runCurrent()
+
+        assertEquals("", viewModel.config.value.firmwareVersion)
+
+        fakeBle.emitLine(
+            """{"t":"cfg","delay":2000,"scan":5000,"frames":3,"ch":1,"sc":0,"led":1,"ap":1,"ver":"2.1.0"}"""
+        )
+        runCurrent()
+        assertEquals("2.1.0", viewModel.config.value.firmwareVersion)
+
+        // Legacy cfg frame without "ver" preserves already known firmwareVersion during active session
+        fakeBle.emitLine(
+            """{"t":"cfg","delay":1000,"scan":5000,"frames":5,"ch":1,"sc":0,"led":1,"ap":1}"""
+        )
+        runCurrent()
+        assertEquals("2.1.0", viewModel.config.value.firmwareVersion)
+        assertEquals(5, viewModel.config.value.numSendFrames)
+
+        // Disconnect resets remote DeviceConfig snapshot cleanly
+        fakeBle.setState(BleManager.ConnectionState.DISCONNECTED)
+        runCurrent()
+        assertEquals("", viewModel.config.value.firmwareVersion)
     }
 }

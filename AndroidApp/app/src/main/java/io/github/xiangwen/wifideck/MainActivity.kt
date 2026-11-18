@@ -41,7 +41,9 @@ class MainActivity : ComponentActivity() {
         private const val KEY_NOTIFICATION_PERM_REQUESTED = "notification_perm_requested"
     }
 
-    private val viewModel: MainViewModel by viewModels()
+    private val viewModel: MainViewModel by viewModels {
+        MainViewModel.Factory(BleManager)
+    }
 
     private val gatePrefs by lazy {
         getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)

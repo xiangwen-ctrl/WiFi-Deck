@@ -3,9 +3,10 @@ package io.github.xiangwen.wifideck.data
 import kotlinx.coroutines.flow.StateFlow
 import java.io.ByteArrayOutputStream
 
-/** BLE 传输层抽象：生产环境由 [BleManager] 单例实现，JVM 单元测试可注入轻量替身 */
+/** BLE 传输层抽象：生产环境由 [BleManager] 实现，通过 [io.github.xiangwen.wifideck.ui.MainViewModel.Factory] 注入，JVM 单测可注入替身 */
 interface BleTransport {
     val connectionState: StateFlow<BleManager.ConnectionState>
+    val reconnectState: StateFlow<ReconnectUiState>
     val mtu: StateFlow<Int>
     var onLine: ((String) -> Unit)?
     var onScanError: ((String) -> Unit)?
@@ -13,6 +14,7 @@ interface BleTransport {
     fun sendCommand(cmd: String): Boolean
     fun sendEmergencyStop(): Boolean
     fun sendTargetedCommand(baseCmd: String, indices: Collection<Int>): Boolean
+    fun retryReconnect(): Boolean = false
     fun disconnect(userInitiated: Boolean = true)
     fun onBluetoothAdapterOff(): Boolean
     fun onBluetoothAdapterOn()

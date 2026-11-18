@@ -61,6 +61,11 @@ import io.github.xiangwen.wifideck.ui.theme.DeckColors
 
 private const val SETTINGS_SUBMIT_DEBOUNCE_MS = 350L
 
+private val NUM_FRAMES_OPTIONS = listOf(1 to "1", 3 to "3", 5 to "5", 10 to "10", 20 to "20")
+private val CYCLE_DELAY_OPTIONS = listOf(500 to "0.5s", 1000 to "1.0s", 2000 to "2.0s", 5000 to "5.0s")
+private val SCAN_TIME_OPTIONS = listOf(3000 to "3.0s", 5000 to "5.0s", 8000 to "8.0s", 10000 to "10s")
+private val START_CHANNEL_OPTIONS = listOf(1 to "2.4G + 5G 全频段", 36 to "仅 5GHz 频段")
+
 private fun utf8ByteLength(s: String): Int = s.toByteArray(Charsets.UTF_8).size
 
 private fun sanitizeSingleLineInput(raw: String): String =
@@ -141,9 +146,10 @@ fun SettingsTab(viewModel: MainViewModel) {
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         // 1. BLE 链路管理卡片
+        val fwSuffix = if (config.firmwareVersion.isNotBlank()) " · FW v${config.firmwareVersion}" else ""
         SectionHeader(
             title = "蓝牙 GATT 链路",
-            subtitle = if (isConnected) "Nordic UART · MTU $mtu" else "Nordic UART · 等待连接"
+            subtitle = if (isConnected) "Nordic UART · MTU $mtu$fwSuffix" else "Nordic UART · 等待连接"
         )
         Card(
             modifier = Modifier.fillMaxWidth(),
@@ -426,7 +432,7 @@ fun SettingsTab(viewModel: MainViewModel) {
                 SegmentedParamSelector(
                     label = "单次突发帧数 (num_frames)",
                     currentValue = "${config.numSendFrames} 帧",
-                    options = listOf(1 to "1", 3 to "3", 5 to "5", 10 to "10", 20 to "20"),
+                    options = NUM_FRAMES_OPTIONS,
                     selectedKey = config.numSendFrames,
                     enabled = canWriteSettings,
                     onPick = { viewModel.sendSetFrames(it) }
@@ -435,7 +441,7 @@ fun SettingsTab(viewModel: MainViewModel) {
                 SegmentedParamSelector(
                     label = "攻击循环间隔 (cycle_delay)",
                     currentValue = "${config.cycleDelayMs} ms",
-                    options = listOf(500 to "0.5s", 1000 to "1.0s", 2000 to "2.0s", 5000 to "5.0s"),
+                    options = CYCLE_DELAY_OPTIONS,
                     selectedKey = config.cycleDelayMs.toInt(),
                     enabled = canWriteSettings,
                     onPick = { viewModel.sendSetCycleDelay(it.toLong()) }
@@ -444,7 +450,7 @@ fun SettingsTab(viewModel: MainViewModel) {
                 SegmentedParamSelector(
                     label = "双频扫描时长 (scan_time)",
                     currentValue = "${config.scanTimeMs} ms",
-                    options = listOf(3000 to "3.0s", 5000 to "5.0s", 8000 to "8.0s", 10000 to "10s"),
+                    options = SCAN_TIME_OPTIONS,
                     selectedKey = config.scanTimeMs.toInt(),
                     enabled = canWriteSettings,
                     onPick = { viewModel.sendSetScanTime(it.toLong()) }
@@ -453,7 +459,7 @@ fun SettingsTab(viewModel: MainViewModel) {
                 SegmentedParamSelector(
                     label = "扫描起始频段 (start_channel)",
                     currentValue = if (config.startChannel >= 36) "仅 5GHz (CH 36+)" else "2.4G + 5G 双频 (CH 1+)",
-                    options = listOf(1 to "2.4G + 5G 全频段", 36 to "仅 5GHz 频段"),
+                    options = START_CHANNEL_OPTIONS,
                     selectedKey = config.startChannel,
                     enabled = canWriteSettings,
                     onPick = { viewModel.sendSetStartChannel(it) }

@@ -4,7 +4,6 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -17,6 +16,8 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -57,6 +58,13 @@ import io.github.xiangwen.wifideck.ui.MainViewModel
 import io.github.xiangwen.wifideck.ui.components.SectionHeader
 import io.github.xiangwen.wifideck.ui.components.TacticalActionCard
 import io.github.xiangwen.wifideck.ui.theme.DeckColors
+
+private val TIMED_ATTACK_PRESETS = listOf(
+    10_000L to "10s",
+    30_000L to "30s",
+    60_000L to "60s",
+    120_000L to "120s"
+)
 
 @Composable
 fun ControlTab(
@@ -223,12 +231,7 @@ private fun TacticalControlsSection(viewModel: MainViewModel) {
                 .padding(10.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            listOf(
-                10_000L to "10s",
-                30_000L to "30s",
-                60_000L to "60s",
-                120_000L to "120s"
-            ).forEach { (ms, label) ->
+            TIMED_ATTACK_PRESETS.forEach { (ms, label) ->
                 Box(
                     modifier = Modifier
                         .weight(1f)
@@ -339,13 +342,15 @@ private fun TargetAndStatsCard(
 
             if (selectedAps.isNotEmpty()) {
                 Spacer(modifier = Modifier.height(10.dp))
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .horizontalScroll(rememberScrollState()),
+                LazyRow(
+                    modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    selectedAps.forEach { ap ->
+                    items(
+                        items = selectedAps,
+                        key = { it.index },
+                        contentType = { "selected_ap_chip" }
+                    ) { ap ->
                         Row(
                             modifier = Modifier
                                 .background(DeckColors.BgTerminal, RoundedCornerShape(6.dp))

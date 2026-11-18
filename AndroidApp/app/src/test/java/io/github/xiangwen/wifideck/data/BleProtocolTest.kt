@@ -173,4 +173,31 @@ class BleProtocolTest {
         assertTrue(BleCommandCodec.prepareTargetedCommand("start deauther", listOf(1, 3, 5), mtu = 23) is BleCommandCodec.PreparedCommand.Ready)
         assertTrue(BleCommandCodec.prepareTargetedCommand("start deauther", listOf(1, 3, 10), mtu = 23) is BleCommandCodec.PreparedCommand.Rejected)
     }
+
+    @Test
+    fun framer_handlesEmptyChunkWhitespaceOnlyAndSingleByteEmojiSlices() {
+        val framer = BleLineFramer()
+        assertEquals(emptyList<String>(), framer.feed(ByteArray(0)))
+        assertEquals(emptyList<String>(), framer.feed("   \r\n\t\r\n".toByteArray(Charsets.UTF_8)))
+
+        val expected = "{\"t\":\"log\",\"m\":\"⚡📡🔑测试\"}"
+        val wire = (expected + "\r\n").toByteArray(Charsets.UTF_8)
+        val out = mutableListOf<String>()
+        for (b in wire) {
+            out.addAll(framer.feed(byteArrayOf(b)))
+        }
+        assertEquals(listOf(expected), out)
+    }
+
+    @Test
+    fun commandCodec_prepareTargetedCommand_enforcesEmptyPrefixAnd219ByteHardCap() {
+        assertEquals(
+            BleCommandCodec.PreparedCommand.Empty,
+            BleCommandCodec.prepareTargetedCommand("  \r\n ", listOf(0, 1), mtu = 247)
+        )
+        val hugeIndices = (0..90).toList()
+        val rejected = BleCommandCodec.prepareTargetedCommand("start deauther", hugeIndices, mtu = 512)
+        assertTrue(rejected is BleCommandCodec.PreparedCommand.Rejected)
+        assertTrue((rejected as BleCommandCodec.PreparedCommand.Rejected).reason.contains("219B"))
+    }
 }

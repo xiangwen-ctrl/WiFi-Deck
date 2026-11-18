@@ -71,7 +71,7 @@ object BleManager : BleTransport {
 
     private val reconnectTracker = BleReconnectTracker()
     private val _reconnectState = MutableStateFlow(ReconnectUiState())
-    val reconnectState: StateFlow<ReconnectUiState> = _reconnectState
+    override val reconnectState: StateFlow<ReconnectUiState> = _reconnectState
 
     private val _mtu = MutableStateFlow(23)
     override val mtu: StateFlow<Int> = _mtu
@@ -168,7 +168,7 @@ object BleManager : BleTransport {
     }
 
     /** 手动重试重连：清除 EXHAUSTED 状态，有缓存设备时发起直连，否则回退扫描；蓝牙关闭或缺权限时返回 false */
-    fun retryReconnect(): Boolean {
+    override fun retryReconnect(): Boolean {
         val adapter = bluetoothAdapter ?: return false
         if (!adapter.isEnabled || !hasBlePermissions(requireScan = true)) {
             return false
