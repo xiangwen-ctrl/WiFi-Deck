@@ -5,6 +5,8 @@ Usage:
     python tools/pack_webui.py
 """
 import gzip
+import re
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -16,7 +18,25 @@ def main() -> None:
     raw_text = SRC_HTML.read_text(encoding="utf-8")
     # Normalize CRLF -> LF for deterministic cross-platform builds
     raw_bytes = raw_text.replace("\r\n", "\n").rstrip("\n").encode("utf-8")
-    gz_bytes = gzip.compress(raw_bytes, compresslevel=9, mtime=0)
+
+    if "--check" in sys.argv[1:]:
+        hdr_text = OUT_HDR.read_text(encoding="utf-8")
+        m = re.search(r"INDEX_HTML_GZ_LEN\s*=\s*(\d+)U", hdr_text)
+        if not m:
+            raise SystemExit("ERROR: Missing INDEX_HTML_GZ_LEN in webui_gz.h")
+        declared_len = int(m.group(1))
+        hdr_bytes = bytes(int(h, 16) for h in re.findall(r"0x([0-9A-Fa-f]{2})", hdr_text))
+        if len(hdr_bytes) != declared_len:
+            raise SystemExit(f"ERROR: Length mismatch ({len(hdr_bytes)} != {declared_len})")
+        if gzip.decompress(hdr_bytes) != raw_bytes:
+            raise SystemExit("ERROR: webui_gz.h is out of sync with tools/webui/index.html! Run: python tools/pack_webui.py")
+        print(f"Verified {OUT_HDR.name}: {declared_len}B decompresses cleanly to {len(raw_bytes)}B")
+        return
+
+    gz_ba = bytearray(gzip.compress(raw_bytes, compresslevel=9, mtime=0))
+    # Normalize RFC 1952 OS header byte (index 9) to 0xFF across Windows/Linux/macOS
+    gz_ba[9] = 0xFF
+    gz_bytes = bytes(gz_ba)
 
     # Strict round-trip verification
     assert gzip.decompress(gz_bytes) == raw_bytes, "Gzip round-trip mismatch!"

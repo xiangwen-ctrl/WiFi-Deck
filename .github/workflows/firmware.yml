@@ -17,9 +17,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Verify gzipped WebUI header is up to date
-        run: |
-          python3 tools/pack_webui.py
-          git diff --exit-code webui_gz.h
+        run: python3 tools/pack_webui.py --check
 
       - name: Install arduino-cli
         uses: arduino/setup-arduino-cli@v2
