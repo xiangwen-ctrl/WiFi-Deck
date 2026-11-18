@@ -2,6 +2,7 @@
 
 [![Firmware CI](https://github.com/xiangwen-ctrl/WiFi-Deck/actions/workflows/firmware.yml/badge.svg)](https://github.com/xiangwen-ctrl/WiFi-Deck/actions/workflows/firmware.yml)
 [![Android CI](https://github.com/xiangwen-ctrl/WiFi-Deck/actions/workflows/android.yml/badge.svg)](https://github.com/xiangwen-ctrl/WiFi-Deck/actions/workflows/android.yml)
+[![Release](https://img.shields.io/github/v/release/xiangwen-ctrl/WiFi-Deck)](https://github.com/xiangwen-ctrl/WiFi-Deck/releases/latest)
 ![Platform](https://img.shields.io/badge/Platform-BW16--Kit%20(RTL8720DN)-blue)
 ![Band](https://img.shields.io/badge/Wi--Fi-2.4GHz%20%26%205GHz-crimson)
 ![Control](https://img.shields.io/badge/Control-UART%20%7C%20WebUI%20%7C%20BLE%205.0-success)
@@ -209,29 +210,29 @@ sequenceDiagram
 - **开发板**：**Ai-Thinker BW16-Kit**（RTL8720DN），请用支持数据传输的 USB 线接电脑或独立供电口。
 - **固件环境**：Arduino IDE 2.x 或 `arduino-cli`，安装 **Realtek Ameba Boards (AmebaD)** **`3.1.7`**，开发板管理器地址：
   ```text
-  https://github.com/ambiot/ambd_arduino/raw/main/Arduino_package/package_realtek_amebad_index.json
+  https://github.com/ambiot/ambd_arduino/raw/master/Arduino_package/package_realtek_amebad_index.json
   ```
 - **Android 环境**：手机需 **Android 8.0+**（`minSdk 26`，`targetSdk 36`）；从源码编译需 **JDK 17+** 与 **Android SDK 36**（Build Tools `35.0.0`）。
 
 ### 烧录固件
 
 **方式一：Windows 一键烧录（无需安装 Arduino IDE）**  
-前往 [GitHub Releases](https://github.com/xiangwen-ctrl/WiFi-Deck/releases/latest) 下载 **`WiFi-Deck-v2.0-FlashTool.zip`** 并完整解压；按住板载 **`BURN`** 键不放 → 短按一下 **`RST`** 键 → 松开 **`BURN`** 键进入下载模式，双击 **`一键烧录固件.bat`**，按提示输入串口号回车即可完成烧录。
+前往 [GitHub Releases](https://github.com/xiangwen-ctrl/WiFi-Deck/releases/latest) 下载 **`WiFi-Deck-v2.1.0-FlashTool.zip`** 并完整解压，双击 **`一键烧录固件.bat`**：脚本会自动识别 USB 串口，带自动下载电路的 BW16-Kit 直接回车即可免按键自动烧录；旧版开发板或外接串口模块可选模式 `[2]`，按提示**按住板载 `BURN` 键不放 → 短按一下 `RST` 键 → 松开 `BURN` 键**完成烧录。
 
 **方式二：Arduino IDE / 命令行源码烧录**
 1. Arduino IDE 打开根目录 `WiFi-Deck.ino`，开发板选 **`Ai-Thinker BW16 (RTL8720DN)`**。
-2. **进入下载模式**：按住板载 **`BURN`** 键不放 → 短按一下 **`RST`** 键 → 松开 **`BURN`** 键。
+2. **进入下载模式**：支持自动下载的 BW16-Kit 可开启 `Auto Flash Mode: Enable` 直接上传；或手动**按住板载 `BURN` 键不放 → 短按一下 `RST` 键 → 松开 `BURN` 键**。
 3. 选好串口点上传即可（串口监视器波特率 **`115200`**）。
 
 命令行编译与烧录（`arduino-cli`）：
 ```bash
 arduino-cli compile --clean --fqbn realtek:AmebaD:Ai-Thinker_BW16 --warnings all .
-arduino-cli upload -p COM6 --fqbn realtek:AmebaD:Ai-Thinker_BW16 .
+arduino-cli upload -p COM6 --fqbn realtek:AmebaD:Ai-Thinker_BW16:AutoUploadMode=Enable .
 ```
 
 ### 连接与使用
 
-- **Android 客户端（推荐）**：前往 [GitHub Releases](https://github.com/xiangwen-ctrl/WiFi-Deck/releases/latest) 或 [Gitee Releases](https://gitee.com/xiangwen-ctrl/WiFi-Deck/releases) 下载 **`WiFi-Deck-v2.0.apk`** 安装，按提示授予蓝牙/附近设备权限（Android 8–11 需同时开启定位）后在 App 内点顶部连接按钮即可（不用在系统蓝牙里配对，手机可继续上网，也不影响蓝牙耳机）。
+- **Android 客户端（推荐）**：前往 [GitHub Releases](https://github.com/xiangwen-ctrl/WiFi-Deck/releases/latest) 或 [Gitee Releases](https://gitee.com/xiangwen-ctrl/WiFi-Deck/releases) 下载 **`WiFi-Deck-v2.1.0.apk`** 安装，按提示授予蓝牙/附近设备权限（Android 8–11 需同时开启定位）后在 App 内点顶部连接按钮即可（不用在系统蓝牙里配对，手机可继续上网，也不影响蓝牙耳机）。
 - **板载 WebUI**：手机或电脑连上热点（默认名称 **`WiFi-Deck`**，密码 **`12345678`**），浏览器打开 **`http://192.168.1.1`**。
 - **UART 串口**：波特率 `115200`，发 `help` 可看完整命令列表。
 - **本地编译 App 与跑单元测试**：
@@ -365,7 +366,7 @@ set ble_name <name>         set ap_ssid <ssid>          set ap_pass <pass>      
 
 ## 版本记录
 
-- **v2.1**：将单文件固件重构为 9 模块多文件架构，消除扫描临界区动态 `String` 堆分配并改为栈缓冲流式 HTTP JSON 输出；独立维护 `tools/webui/index.html` 并引入 Gzip 预压缩（Flash 缩减约 `28KB`）、`/api/status` ETag `304` 协商与 `/api/logs?since=` 增量日志拉取；打通全端固件版本号上报（`v2.1.0`）；Android 端完成 `BleTransport` 依赖注入解耦、`@Immutable` / `LazyRow` 渲染优化并将单元测试扩充至 43 项；新增 Firmware 编译 CI。
+- **v2.1.0**：将单文件固件重构为 9 模块多文件架构，消除扫描临界区动态 `String` 堆分配并改为栈缓冲流式 HTTP JSON 输出；独立维护 `tools/webui/index.html` 并引入 Gzip 预压缩（Flash 缩减约 `28KB`）、`/api/status` ETag `304` 协商与 `/api/logs?since=` 增量日志拉取；打通全端固件与客户端版本号（`v2.1.0`）；Android 端完成 `BleTransport` 依赖注入解耦、`@Immutable` / `LazyRow` 渲染优化并将单元测试扩充至 43 项；新增 Firmware 编译 CI。
 - **v2.0**：修复固件 802.11 帧构造边界、混杂模式与扫描并发问题，WebUI 改用直连 lwIP BSD Socket 解决抓包恢复时80端口绑定失败，加入 BLE 抓包分级限流与 `PersistConfig` CRC32 校验；Android 端新增前台保活、断线重连状态机、权限与定位门禁、75ms 日志合批渲染及32个单元测试，CI 接入单测门禁和自动发版。
 - **v1.6**：完善 2.4G/5G 全信道跳频与 `ap off` 隐身模式，Android 客户端拆分为四标签页，支持自定义 AP 与 BLE 名称持久化。
 - **v1.5**：完成双频扫描/发包/抓包基础固件、内置 WebUI 与初版 BLE Android 客户端。

@@ -24,16 +24,33 @@ jobs:
       - name: Install arduino-cli
         uses: arduino/setup-arduino-cli@v2
 
-      - name: Install Realtek AmebaD core
+      - name: Cache Realtek AmebaD SDK & toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.arduino15/staging
+            ~/.arduino15/packages
+          key: arduino-amebad-3.1.7-${{ runner.os }}
+
+      - name: Install Realtek AmebaD core (3.1.7)
         run: |
           arduino-cli config init --overwrite
           arduino-cli config add board_manager.additional_urls https://github.com/ambiot/ambd_arduino/raw/master/Arduino_package/package_realtek_amebad_index.json
           arduino-cli core update-index
-          arduino-cli core install realtek:AmebaD
+          arduino-cli core install realtek:AmebaD@3.1.7
 
       - name: Compile WiFi-Deck firmware (BW16 / RTL8720DN)
         run: |
           arduino-cli compile --clean \
             --fqbn realtek:AmebaD:Ai-Thinker_BW16 \
             --warnings all \
-            .
+            --build-path /tmp/bw16-build \
+            . | tee compile.log
+          test -f /tmp/bw16-build/km0_km4_image2.bin
+          grep -E "Sketch uses|Maximum is" compile.log >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Upload compiled firmware binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: WiFi-Deck-bw16-firmware
+          path: /tmp/bw16-build/km0_km4_image2.bin
