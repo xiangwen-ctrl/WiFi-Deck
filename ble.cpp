@@ -3,6 +3,7 @@
 #include "utils.h"
 #include "sniff.h"
 #include "wifi_scan.h"
+#include "wifi_attack.h"
 #include "command.h"
 
 #include <strings.h>
@@ -128,7 +129,9 @@ static bool hasBleTxCreditHeadroom(uint8_t connId, uint16_t minCredits, uint16_t
     if (maxSeenCredits > 0) {
       if (maxSeenCredits <= 2 && effectiveMin > 1) {
         effectiveMin = 1;
-      } else if (maxSeenCredits >= 3 && effectiveMin >= maxSeenCredits) {
+      } else if (maxSeenCredits == 3 && effectiveMin > 2) {
+        effectiveMin = 2;
+      } else if (maxSeenCredits >= 4 && effectiveMin >= maxSeenCredits) {
         effectiveMin = (uint16_t)(maxSeenCredits - 1);
       }
     }
@@ -232,9 +235,9 @@ bool bleSendSniffLog(const char *msg, bool highPriority) {
   char line[280];
   int n = snprintf(line, sizeof(line), "{\"t\":\"log\",\"m\":\"%s\"}", esc);
   if (n <= 0 || (size_t)n >= sizeof(line)) return false;
-  // Routine logs require >=3 free credits (auto-capped on smaller pools) to leave headroom for heartbeat/control;
-  // high-priority security alerts (EAPOL/Deauth/Disassoc/Pwnagotchi) require >=1 credit.
-  uint16_t minCredits = highPriority ? 1 : 3;
+  // Routine logs require >=4 free credits (auto-scaled on smaller pools) to leave ample headroom for heartbeat/control;
+  // high-priority security alerts (EAPOL/Deauth/Disassoc/Pwnagotchi) require >=2 credits so LL supervision never starves.
+  uint16_t minCredits = highPriority ? 2 : 4;
   return bleSendLineCstr(line, (size_t)n, false, highPriority, minCredits);
 }
 
@@ -412,6 +415,9 @@ static T_APP_RESULT appGapCallback(uint8_t cb_type, void *p_cb_data) {
             bleGapDiag.updLatency = cl;
             bleGapDiag.updTimeout = ct;
             bleGapDiag.evParamUpdated = true;
+            if ((ci < 24 || ct < 400) && bleGapDiag.negotiateAttempts < 3) {
+              bleGapDiag.negotiatePending = true;
+            }
             rtw_exit_critical(NULL, NULL);
           } else if (status == GAP_CONN_PARAM_UPDATE_STATUS_FAIL) {
             rtw_enter_critical(NULL, NULL);
@@ -463,8 +469,9 @@ static T_APP_RESULT appGapCallback(uint8_t cb_type, void *p_cb_data) {
         uint16_t cmax = cb_data.p_le_conn_update_ind->conn_interval_max;
         uint16_t clat = cb_data.p_le_conn_update_ind->conn_latency;
         uint16_t ctout = cb_data.p_le_conn_update_ind->supervision_timeout;
-        // 1C: 拦截过紧的连接参数请求（interval < 30ms、supv_tout < 2000ms 或 latency > 10）
-        bool reject = (cmin < 24 || ctout < 200 || clat > 10);
+        // 1C: 拦截过紧的连接参数请求（interval < 30ms、supv_tout < 4000ms 或 latency > 10）
+        // 双频扫描/跳频期间 5GHz 批次最长驻留 ~700-960ms，必须保证 supervision_timeout >= 4000ms
+        bool reject = (cmin < 24 || ctout < 400 || clat > 10);
         result = reject ? APP_RESULT_REJECT : APP_RESULT_ACCEPT;
         rtw_enter_critical(NULL, NULL);
         bleGapDiag.indMin = cmin;
@@ -529,6 +536,7 @@ void processBleDiagAndNegotiation() {
              (unsigned)snap.initTxPhy,
              (unsigned)snap.initRxPhy);
     Serial.println(buf);
+    enforceBleCoexPta(!softApActive);
   }
   if (snap.evDisconnected) {
     cancelBleScanPush();
@@ -538,6 +546,7 @@ void processBleDiagAndNegotiation() {
     snprintf(buf, sizeof(buf), "[BLE] Disconnected conn=%u disc_cause=0x%04X",
              (unsigned)snap.discConnId, (unsigned)snap.discCause);
     Serial.println(buf);
+    enforceBleCoexPta(!softApActive);
   }
   if (snap.evMtuUpdated) {
     char buf[64];
@@ -569,6 +578,7 @@ void processBleDiagAndNegotiation() {
              (unsigned)snap.updLatency,
              (unsigned)(snap.updTimeout * 10U));
     Serial.println(buf);
+    enforceBleCoexPta(!softApActive);
   }
   if (snap.evParamUpdateFailed) {
     char buf[64];
@@ -583,25 +593,31 @@ void processBleDiagAndNegotiation() {
     Serial.println(buf);
   }
 
-  // 1C: 连接建立 1.5s 后（避开 Android 初始快速服务发现窗口）协商稳健容错连接参数
-  if (snap.negotiatePending && BLE.connected(snap.connId) && (nowMs - snap.connectedAtMs >= 1500)) {
+  // 1C: CCCD 订阅完成 (>=750ms) 或建链 1.5s 后协商双频抗扰连接参数：
+  // interval 30-50ms (24..40*1.25ms) 确保每次 75-85ms 2.4GHz 喘息窗口内必含 >=1-2 个 BLE 锚点，
+  // slave_latency=4 降低静置功耗，supervision_timeout=6000ms (600*10ms) 提供充裕跨频容错余量。
+  uint8_t curStateCid = 0;
+  bool notifyReady = false;
+  getBleStateSafe(curStateCid, notifyReady);
+  bool readyForParamReq = (nowMs - snap.connectedAtMs >= 1500UL) ||
+                          (notifyReady && curStateCid == snap.connId && (nowMs - snap.connectedAtMs >= 750UL));
+  if (snap.negotiatePending && BLE.connected(snap.connId) && readyForParamReq) {
     uint16_t curInt = 0, curLat = 0, curTout = 0;
     le_get_conn_param(GAP_PARAM_CONN_INTERVAL, &curInt, snap.connId);
     le_get_conn_param(GAP_PARAM_CONN_LATENCY, &curLat, snap.connId);
     le_get_conn_param(GAP_PARAM_CONN_TIMEOUT, &curTout, snap.connId);
-    if (curInt >= 36 && curInt <= 72 && curLat >= 4 && curLat <= 6 && curTout >= 500) {
+    if (curInt >= 24 && curInt <= 72 && curLat <= 6 && curTout >= 450) {
       rtw_enter_critical(NULL, NULL);
       bleGapDiag.negotiatePending = false;
       rtw_exit_critical(NULL, NULL);
-    } else if (snap.negotiateAttempts < 2 &&
-               (snap.lastNegotiateMs == 0 || (nowMs - snap.lastNegotiateMs >= 3000))) {
-      // 目标: interval 45-90ms (36..72*1.25ms), latency 4, supv_tout 6000ms (600*10ms)
-      uint16_t targetTout = (snap.negotiateAttempts == 0) ? 600 : 500;
-      T_GAP_CAUSE cause = le_update_conn_param(snap.connId, 36, 72, 4, targetTout, 70, 142);
+    } else if (snap.negotiateAttempts < 3 &&
+               (snap.lastNegotiateMs == 0 || (nowMs - snap.lastNegotiateMs >= 2000UL))) {
+      uint16_t targetTout = (snap.negotiateAttempts < 2) ? 600 : 500;
+      T_GAP_CAUSE cause = le_update_conn_param(snap.connId, 24, 40, 4, targetTout, 46, 78);
       rtw_enter_critical(NULL, NULL);
       bleGapDiag.negotiateAttempts++;
       bleGapDiag.lastNegotiateMs = nowMs;
-      if (bleGapDiag.negotiateAttempts >= 2) {
+      if (bleGapDiag.negotiateAttempts >= 3) {
         bleGapDiag.negotiatePending = false;
       }
       rtw_exit_critical(NULL, NULL);
@@ -773,6 +789,7 @@ void setupBLE() {
   le_register_app_cb(appGapCallback);
 
   bleStarted = true;
+  restoreBleCoex(true);
   Serial.print("[INFO] BLE UART service started (");
   Serial.print(ble_name);
   Serial.println(")");
@@ -888,9 +905,9 @@ void blePushStatus(bool critical) {
   chSnap = currentChannel;
   rtw_exit_critical(NULL, NULL);
 
-  char line[224];
+  char line[240];
   int n = snprintf(line, sizeof(line),
-                   "{\"t\":\"st\",\"atk\":%d,\"dis\":%d,\"bcn\":%d,\"prb\":%d,\"jam\":%d,\"snf\":%d,\"snfOn\":%d,\"sMode\":%d,\"hop\":%d,\"ch\":%d,\"ok\":%lu,\"fail\":%lu,\"rem\":%lu}",
+                   "{\"t\":\"st\",\"atk\":%d,\"dis\":%d,\"bcn\":%d,\"prb\":%d,\"jam\":%d,\"snf\":%d,\"snfOn\":%d,\"sMode\":%d,\"hop\":%d,\"ch\":%d,\"ok\":%lu,\"fail\":%lu,\"rem\":%lu,\"ap\":%d}",
                    attack_enabled ? 1 : 0,
                    disassoc_enabled ? 1 : 0,
                    beacon_flood_enabled ? 1 : 0,
@@ -903,7 +920,8 @@ void blePushStatus(bool critical) {
                    chSnap,
                    (unsigned long)tx_success_count,
                    (unsigned long)tx_fail_count,
-                   remSec);
+                   remSec,
+                   apEnabled ? 1 : 0);
   if (n > 0 && (size_t)n < sizeof(line)) {
     bleSendLineCstr(line, (size_t)n, critical, !critical);
   }

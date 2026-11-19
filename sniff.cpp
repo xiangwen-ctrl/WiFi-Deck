@@ -21,13 +21,31 @@ volatile bool isSniffing = false;
 
 volatile bool isHopping = false;
 unsigned long lastHopTime = 0;
-const unsigned long HOP_INTERVAL = 500;
+const unsigned long HOP_INTERVAL = 350;
 const int CHANNELS_2GHZ[13] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13};
 const int CHANNELS_5GHZ[25] = {36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165};
+// 2:1 interleaved dual-band schedule (all 13 2.4GHz + all 25 5GHz channels, <=2 consecutive 5GHz hops = <=700ms)
+// Guarantees RTL8720DN shared RF PLL returns to 2.4GHz every <=700ms so BLE never hits Supervision Timeout (0x0108).
+const int INTERLEAVED_DUAL_BAND_CHANNELS[38] = {
+  1,  36, 40,
+  2,  44, 48,
+  3,  52, 56,
+  4,  60, 64,
+  5,  100, 104,
+  6,  108, 112,
+  7,  116, 120,
+  8,  124, 128,
+  9,  132, 136,
+  10, 140, 144,
+  11, 149, 153,
+  12, 157, 161,
+  13, 165
+};
 int currentChannelIndex = 0;
 bool hopUse5GHz = false;
 bool hopResetPending = true;
 volatile int currentChannel = WIFI_CHANNEL;
+volatile bool promiscPauseForBleCoex = false;
 
 char sniffLogRing[LOG_RING_SIZE][LOG_STR_LEN];
 volatile uint8_t logHead = 0;
@@ -47,6 +65,7 @@ volatile unsigned long lastMgmtBeaconLogMs = 0;
 volatile unsigned long lastMgmtProbeLogMs = 0;
 volatile unsigned long lastCtrlLogMs = 0;
 volatile unsigned long lastDataLogMs = 0;
+static volatile unsigned long lastMgmtDeauthLogMs = 0;
 
 volatile bool deauth_sniff_enabled = false;
 bool deauth_sniff_prev_hop = false;
@@ -82,6 +101,7 @@ void resetPromiscLogThrottle() {
   lastMgmtProbeLogMs = 0;
   lastCtrlLogMs = 0;
   lastDataLogMs = 0;
+  lastMgmtDeauthLogMs = 0;
   rtw_exit_critical(NULL, NULL);
 }
 
@@ -106,16 +126,18 @@ void promisc_callback(unsigned char *buf, unsigned int len, void * /*userdata*/)
 
   SniffMode modeSnapshot;
   bool sniffingSnapshot;
+  bool pausedForBleSnapshot;
   bool deauthSniffSnapshot;
   int channelSnapshot;
   rtw_enter_critical(NULL, NULL);
   modeSnapshot = currentMode;
   sniffingSnapshot = isSniffing;
+  pausedForBleSnapshot = promiscPauseForBleCoex;
   deauthSniffSnapshot = deauth_sniff_enabled;
   channelSnapshot = currentChannel;
   rtw_exit_critical(NULL, NULL);
 
-  if (!sniffingSnapshot || modeSnapshot == SNIFF_STOP) return;
+  if (pausedForBleSnapshot || !sniffingSnapshot || modeSnapshot == SNIFF_STOP) return;
 
   if (!buf || len < sizeof(wifi_ieee80211_mac_hdr)) {
     return;
@@ -178,6 +200,23 @@ void promisc_callback(unsigned char *buf, unsigned int len, void * /*userdata*/)
       }
     }
     else if (fsubtype == 12) {
+      // Capture deauth source MAC and channel for deauth-sniff-and-clone mode (never throttled)
+      if (deauthSniffSnapshot && !is_broadcast_mac(hdr->addr1)) {
+        rtw_enter_critical(NULL, NULL);
+        memcpy(sniffed_deauth_src, hdr->addr2, 6);
+        sniffed_deauth_ch = channelSnapshot;
+        has_sniffed_deauth = true;
+        rtw_exit_critical(NULL, NULL);
+      }
+      unsigned long now = millis();
+      rtw_enter_critical(NULL, NULL);
+      if (lastMgmtDeauthLogMs != 0 && (now - lastMgmtDeauthLogMs < 50)) {
+        rtw_exit_critical(NULL, NULL);
+        return;
+      }
+      lastMgmtDeauthLogMs = now;
+      rtw_exit_critical(NULL, NULL);
+
       char mac2[18], mac1[18];
       formatMac(hdr->addr2, mac2, sizeof(mac2));
       formatMac(hdr->addr1, mac1, sizeof(mac1));
@@ -187,14 +226,6 @@ void promisc_callback(unsigned char *buf, unsigned int len, void * /*userdata*/)
                  mac2, mac1, (unsigned)reasonCode);
       } else {
         snprintf(logBuf, sizeof(logBuf), "[MGMT] Deauth detected Sender MAC: %s Receiver MAC: %s", mac2, mac1);
-      }
-      // Capture deauth source MAC and channel for deauth-sniff-and-clone mode
-      if (deauthSniffSnapshot && !is_broadcast_mac(hdr->addr1)) {
-        rtw_enter_critical(NULL, NULL);
-        memcpy(sniffed_deauth_src, hdr->addr2, 6);
-        sniffed_deauth_ch = channelSnapshot;
-        has_sniffed_deauth = true;
-        rtw_exit_critical(NULL, NULL);
       }
     }
     else if (fsubtype == 4 || fsubtype == 5) {
@@ -227,6 +258,15 @@ void promisc_callback(unsigned char *buf, unsigned int len, void * /*userdata*/)
       }
     }
     else if (fsubtype == 10) {
+      unsigned long now = millis();
+      rtw_enter_critical(NULL, NULL);
+      if (lastMgmtDeauthLogMs != 0 && (now - lastMgmtDeauthLogMs < 50)) {
+        rtw_exit_critical(NULL, NULL);
+        return;
+      }
+      lastMgmtDeauthLogMs = now;
+      rtw_exit_critical(NULL, NULL);
+
       char mac2[18], mac1[18];
       formatMac(hdr->addr2, mac2, sizeof(mac2));
       formatMac(hdr->addr1, mac1, sizeof(mac1));
@@ -352,8 +392,10 @@ bool setChannel(int newChannel) {
     Serial.println("[WARN] SoftAP active on CH 1; skipping channel lock.");
     return false;
   }
+  int prevCh = getCurrentChannelSafe();
   if (wifi_set_channel(newChannel) == RTW_SUCCESS) {
     setCurrentChannelSafe(newChannel);
+    refreshBleCoexOnBandSwitch(prevCh, newChannel);
     return true;
   }
   Serial.print("[WARN] wifi_set_channel(");
@@ -380,31 +422,13 @@ void hopChannel() {
   unsigned long now = millis();
   if (!hopResetPending && (now - lastHopTime < HOP_INTERVAL)) return;
 
-  const int num2G = sizeof(CHANNELS_2GHZ) / sizeof(CHANNELS_2GHZ[0]);
-  const int num5G = sizeof(CHANNELS_5GHZ) / sizeof(CHANNELS_5GHZ[0]);
-  int nextChannel = WIFI_CHANNEL;
-
-  if (!hopUse5GHz) {
-    if (currentChannelIndex < 0 || currentChannelIndex >= num2G) {
-      currentChannelIndex = 0;
-    }
-    nextChannel = CHANNELS_2GHZ[currentChannelIndex];
-    currentChannelIndex++;
-    if (currentChannelIndex >= num2G) {
-      currentChannelIndex = 0;
-      hopUse5GHz = true;
-    }
-  } else {
-    if (currentChannelIndex < 0 || currentChannelIndex >= num5G) {
-      currentChannelIndex = 0;
-    }
-    nextChannel = CHANNELS_5GHZ[currentChannelIndex];
-    currentChannelIndex++;
-    if (currentChannelIndex >= num5G) {
-      currentChannelIndex = 0;
-      hopUse5GHz = false;
-    }
+  const int totalInterleaved = (int)(sizeof(INTERLEAVED_DUAL_BAND_CHANNELS) / sizeof(INTERLEAVED_DUAL_BAND_CHANNELS[0]));
+  if (currentChannelIndex < 0 || currentChannelIndex >= totalInterleaved) {
+    currentChannelIndex = 0;
   }
+  int nextChannel = INTERLEAVED_DUAL_BAND_CHANNELS[currentChannelIndex];
+  currentChannelIndex = (currentChannelIndex + 1) % totalInterleaved;
+  hopUse5GHz = (nextChannel >= 36);
 
   hopResetPending = false;
   lastHopTime = now;
@@ -426,44 +450,32 @@ void startSniffing() {
 
   if (!alreadySniffing) {
     Serial.println("[INFO] Enabling promiscuous mode...");
-    // Shut down HTTP listening socket cleanly before wifi_enter_promisc_mode() calls wifi_off()
-    prepareRadioForSniff(false);
+    // Preserve an explicit channel lock (e.g. 'ap off' -> 'set ch 36' -> 'start sniff') across enterStaMode()
+    int preservedCh = (!apEnabled && !softApActive) ? getCurrentChannelSafe() : WIFI_CHANNEL;
+
+    // Switch cleanly to RTW_MODE_STA (reusing active STA or hot-switching via wifi_set_mode with zero wifi_off())
+    // instead of wifi_enter_promisc_mode()/RTW_MODE_PROMISC which sets broken coex wifi_state=8 in lib_wlan.a.
     resetPromiscLogThrottle();
-    WlanRuntimeMode prevMode = wlanRuntimeMode;
     feedWatchdog();
-    int preWextMode = -1;
-    if (wlanRuntimeMode == WLAN_MODE_UNINIT || wext_get_mode(WLAN0_NAME, &preWextMode) != RTW_SUCCESS) {
-      if (wifi_on(RTW_MODE_PROMISC) != RTW_SUCCESS) {
-        wlanRuntimeMode = WLAN_MODE_UNINIT;
-        timedSniffEnabled = false;
-        rtw_enter_critical(NULL, NULL);
-        isSniffing = false;
-        currentMode = SNIFF_STOP;
-        rtw_exit_critical(NULL, NULL);
-        Serial.println("[ERROR] startSniffing: wifi_on(RTW_MODE_PROMISC) failed.");
-        restoreRadioAfterSniff();
-        return;
-      }
-      delay(20);
-      feedWatchdog();
-    } else {
-      wifi_enter_promisc_mode();
-      feedWatchdog();
+    if (!enterStaMode("startSniffing")) {
+      timedSniffEnabled = false;
+      rtw_enter_critical(NULL, NULL);
+      isSniffing = false;
+      currentMode = SNIFF_STOP;
+      promiscPauseForBleCoex = false;
+      rtw_exit_critical(NULL, NULL);
+      Serial.println("[ERROR] startSniffing: enterStaMode failed.");
+      restoreRadioAfterSniff();
+      return;
     }
-    int wextMode = -1;
-    wext_get_mode(WLAN0_NAME, &wextMode);
-    bool stayedSta = (prevMode == WLAN_MODE_STA && wextMode == RTW_MODE_INFRA);
-    wlanRuntimeMode = stayedSta ? WLAN_MODE_STA : WLAN_MODE_PROMISC;
-    WiFi.disablePowerSave();
-    restoreBleCoex(!stayedSta);
-    int targetCh = getCurrentChannelSafe();
-    setChannel(targetCh);
+    setChannel(preservedCh);
 
     // 先设置状态标志再启用回调，避免首波回调丢失或读到 SNIFF_STOP
     rtw_enter_critical(NULL, NULL);
     if (currentMode == SNIFF_STOP) {
       currentMode = SNIFF_ALL;
     }
+    promiscPauseForBleCoex = false;
     isSniffing = true;
     rtw_exit_critical(NULL, NULL);
 
@@ -471,12 +483,15 @@ void startSniffing() {
       rtw_enter_critical(NULL, NULL);
       isSniffing = false;
       currentMode = SNIFF_STOP;
+      promiscPauseForBleCoex = false;
       rtw_exit_critical(NULL, NULL);
       timedSniffEnabled = false;
       Serial.println("[ERROR] Failed to enable promiscuous callback.");
       restoreRadioAfterSniff();
       return;
     }
+    // Re-assert BLE-priority PTA table (0x55555555) & 0x778=0x01 after RCR.AAP=1 promisc activation
+    enforceBleCoexPta(true);
     Serial.println("[INFO] Sniffer initialized and running.");
   }
 }
@@ -508,6 +523,7 @@ bool haltPromiscSniff() {
   rtw_enter_critical(NULL, NULL);
   active = (isSniffing || deauth_sniff_enabled);
   isSniffing = false;
+  promiscPauseForBleCoex = false;
   currentMode = SNIFF_STOP;
   rtw_exit_critical(NULL, NULL);
   if (!active) return false;
@@ -547,20 +563,6 @@ void clearDeauthSniffState() {
 }
 
 // =========================
-// prepareRadioForSniff
-// =========================
-void prepareRadioForSniff(bool turnOffAp) {
-  stopWebServer();
-  softApActive = false;
-  if (turnOffAp) {
-    wifi_off();
-    feedWatchdog();
-    delay(40);
-    wlanRuntimeMode = WLAN_MODE_UNINIT;
-  }
-}
-
-// =========================
 // startMonitorSniff
 // =========================
 void startMonitorSniff(SniffMode mode, bool timed, unsigned long dur) {
@@ -593,21 +595,33 @@ void clearSniffLogRingSafe() {
 // pushSniffLog
 // =========================
 void pushSniffLog(const char *msg) {
-  char safeMsg[LOG_STR_LEN];
-  utf8SafeCopy(safeMsg, sizeof(safeMsg), msg);
-  size_t copyBytes = strlen(safeMsg) + 1;
-  if (copyBytes > LOG_STR_LEN) copyBytes = LOG_STR_LEN;
+  if (!msg) return;
+  // Zero-stack UTF-8 boundary truncation to minimize Wi-Fi RX callback stack footprint
+  const size_t maxLen = LOG_STR_LEN - 1;
+  size_t len = 0;
+  while (len < maxLen && msg[len] != '\0') {
+    len++;
+  }
+  if (len > 0 && msg[len] != '\0' && (((uint8_t)msg[len] & 0xC0U) == 0x80U)) {
+    size_t back = len;
+    while (back > 0 && (((uint8_t)msg[back - 1] & 0xC0U) == 0x80U)) {
+      back--;
+    }
+    len = (back > 0 && (((uint8_t)msg[back - 1] & 0x80U) != 0U)) ? (back - 1) : back;
+  }
 
   rtw_enter_critical(NULL, NULL);
   uint8_t next = (logHead + 1) % LOG_RING_SIZE;
   if (next != logTail) {
-    memcpy(sniffLogRing[logHead], safeMsg, copyBytes);
+    if (len > 0) memcpy(sniffLogRing[logHead], msg, len);
+    sniffLogRing[logHead][len] = '\0';
     logHead = next;
   } else {
     droppedLogCount++;
   }
   // Also record into WebUI circular history so /api/logs can inspect captured frames incrementally
-  memcpy(webLogHistory[webLogHead], safeMsg, copyBytes);
+  if (len > 0) memcpy(webLogHistory[webLogHead], msg, len);
+  webLogHistory[webLogHead][len] = '\0';
   webLogHead = (webLogHead + 1) % WEB_LOG_HISTORY_SIZE;
   if (webLogCount < WEB_LOG_HISTORY_SIZE) {
     webLogCount++;

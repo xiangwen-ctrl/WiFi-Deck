@@ -13,7 +13,7 @@
 //==========================
 // Firmware Version & Defaults
 //==========================
-#define FIRMWARE_VERSION  "2.1.0"
+#define FIRMWARE_VERSION  "2.2.0"
 #define DEFAULT_WIFI_SSID "WiFi-Deck"
 #define DEFAULT_WIFI_PASS "12345678"
 #define DEFAULT_BLE_NAME  "WiFi-Deck"

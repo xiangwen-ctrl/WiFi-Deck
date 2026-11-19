@@ -23,7 +23,21 @@
 
 extern "C" {
 #include "bt_intf.h"
+extern uint8_t *pcoex;
+void dhcps_deinit(void);
+void hal_coex_init(void *padapter);
+void rtw_coex_run_enable(void *padapter, uint8_t enable);
+void rtw_coex_run(void *padapter);
+void rtl8721d_set_coex_table(void *padapter, uint32_t val0x6c0, uint32_t val0x6c4, uint32_t val0x6c8, uint32_t val0x6cc);
+void rtl8721d_set_pstdma_cmd(void *padapter, uint8_t b1, uint8_t b2, uint8_t b3, uint8_t b4, uint8_t b5);
+uint8_t rtw_read8(void *padapter, uint32_t addr);
+int rtw_write8(void *padapter, uint32_t addr, uint8_t val);
+uint32_t rtw_read32(void *padapter, uint32_t addr);
+int rtw_write32(void *padapter, uint32_t addr, uint32_t val);
 }
+
+static unsigned long continuous5GHzSinceMs = 0;
+static unsigned long lastBleWindowStatusMs = 0;
 
 //==========================================================
 // Reason Code Definitions
@@ -329,7 +343,27 @@ bool stepSlicedTxCycle(SlicedTxCycle &st, bool sendDeauth, bool sendDisassoc, un
     }
 
     const WiFiScanResult &tgt = st.targets[st.targetIdx];
+    if ((int)tgt.channel >= 36 &&
+        isBleConnectedSafe() &&
+        continuous5GHzSinceMs != 0 &&
+        (millis() - continuous5GHzSinceMs >= 650UL)) {
+      // Bound continuous 5GHz residency across multi-target 5GHz lists (st.frameIdx == 0)
+      // and high-frame-count bursts (st.frameIdx > 0) so the shared RTL8720DN LO (RF_0x18)
+      // returns to 2.4GHz CH 1 for BLE LL supervision anchors.
+      serviceBleBreathingWindow(85UL, true);
+      if (abortNow()) {
+        st.reset();
+        restoreDefaultChannelIfNeeded(false);
+        if (USE_LED) digitalWrite(LED_B, LOW);
+        return false;
+      }
+      if (st.frameIdx > 0 && wifi_set_channel(tgt.channel) == RTW_SUCCESS) {
+        setCurrentChannelSafe((int)tgt.channel);
+        refreshBleCoexOnBandSwitch(WIFI_CHANNEL, (int)tgt.channel);
+      }
+    }
     if (st.frameIdx == 0) {
+      int prevCh = getCurrentChannelSafe();
       if (wifi_set_channel(tgt.channel) != RTW_SUCCESS) {
         Serial.print("[WARN] wifi_set_channel(");
         Serial.print(tgt.channel);
@@ -338,6 +372,7 @@ bool stepSlicedTxCycle(SlicedTxCycle &st, bool sendDeauth, bool sendDisassoc, un
         continue;
       }
       setCurrentChannelSafe((int)tgt.channel);
+      refreshBleCoexOnBandSwitch(prevCh, (int)tgt.channel);
     }
 
     if (st.frameIdx >= num_send_frames) {
@@ -412,25 +447,353 @@ void targetAttack() {
 // Forward declaration for BLE started flag (defined in BLE module / main .ino)
 extern volatile bool bleStarted;
 
+static void *getActiveWlanAdapter() {
+  const uint8_t *wlanInfoBytes = reinterpret_cast<const uint8_t *>(&rltk_wlan_info);
+  if (wlanInfoBytes[16] == 0) {
+    return nullptr;
+  }
+  uint8_t *wlanDev = rltk_wlan_info;
+  if (wlanDev == nullptr) {
+    return nullptr;
+  }
+  void **privSlot = reinterpret_cast<void **>(wlanDev + 0x10);
+  void *privPtr = *privSlot;
+  if (privPtr == nullptr) {
+    return nullptr;
+  }
+  return *reinterpret_cast<void **>(privPtr);
+}
+
+struct CoexMutexGuard {
+  _mutex *mtx = nullptr;
+  bool locked = false;
+
+  bool tryLock(uint32_t timeoutMs = 50U) {
+    if (pcoex == nullptr || pcoex[0] == 0U) return false;
+    _mutex *slot = reinterpret_cast<_mutex *>(pcoex + 8);
+    if (*slot == NULL) return false;
+    if (rtw_mutex_get_timeout(slot, timeoutMs) >= 0) {
+      mtx = slot;
+      locked = true;
+      return true;
+    }
+    return false;
+  }
+
+  void unlock() {
+    if (locked && mtx != nullptr) {
+      rtw_mutex_put(mtx);
+      locked = false;
+      mtx = nullptr;
+    }
+  }
+
+  ~CoexMutexGuard() { unlock(); }
+};
+
+void enforceBleCoexPta(bool forceBlePriorityTable) {
+  if (!bleStarted) return;
+  if (!wifi_is_up(RTW_STA_INTERFACE) && !wifi_is_up(RTW_AP_INTERFACE)) {
+    return;
+  }
+  void *padapter = getActiveWlanAdapter();
+  if (padapter == nullptr) return;
+
+  // Serialize with lib_wlan's rtw_coex_run() (0x0e0241c4) via [pcoex + 8] mutex to avoid racing
+  // cmd_thread / rtw_coex_mailbox_thread / survey_timer_hdl on pcoex, pbtcoex[0], 0x778, 0x6c0..6c8.
+  CoexMutexGuard coexGuard;
+  if (pcoex != nullptr && pcoex[0] != 0U) {
+    if (!coexGuard.tryLock(50U)) {
+      return;
+    }
+  }
+
+  // 1) Synchronize lib_wlan pcoex state:
+  //    - Keep prev_wifi_state (pcoex[2]) aligned with current mode (6=SoftAP, 1=STA) so
+  //      report_surveydone_event -> rtw_coex_wifi_info_update(padapter, 3) always restores it.
+  //    - Sanitize bt_state (pcoex[3]) to 2 when BLE is connected or 1 when advertising, clearing
+  //      any stuck bit 3 (0x08 from mailbox 0x45 -> Case 8) or stale 1/4 that breaks coex_case 0x0202
+  //      in rtl8721d_btcoex_wifi_tdma_scan_start / rtl8721d_btcoex_wifi_tdma_scan_set_slot.
+  bool bleConn = isBleConnectedSafe();
+  uint8_t desiredBtState = bleConn ? 2U : 1U;
+  uint8_t baseWifiState = softApActive ? 6U : 1U;
+  bool inActiveSurvey = false;
+  if (pcoex != nullptr) {
+    pcoex[2] = baseWifiState;
+    if (pcoex[1] == 2U) {
+      inActiveSurvey = true;
+    } else if (pcoex[1] != baseWifiState) {
+      pcoex[1] = baseWifiState;
+    }
+    if (pcoex[3] != desiredBtState) {
+      pcoex[3] = desiredBtState;
+    }
+    *reinterpret_cast<uint16_t *>(pcoex + 4) =
+        static_cast<uint16_t>((static_cast<uint16_t>(pcoex[1]) << 8) | pcoex[3]);
+    if (!inActiveSurvey && pcoex[12] != 0U) {
+      pcoex[12] = 0U;
+    }
+  }
+
+  // 2) Ensure hardware PTA pad/mux & arbitration are enabled (0x70[31:24]=0xCA, 0x74 BIT16 = BIT_BT_PTA_EN)
+  //    and clear any software-forced Wi-Fi-only GNT_BT override in 0x764[10:9].
+  uint32_t reg70 = rtw_read32(padapter, 0x0070U);
+  if ((reg70 & 0xFF000000U) != 0xCA000000U) {
+    rtw_write32(padapter, 0x0070U, 0xCA000082U);
+  }
+  uint32_t reg74 = rtw_read32(padapter, 0x0074U);
+  if ((reg74 & 0x00010000U) == 0U) {
+    rtw_write32(padapter, 0x0074U, reg74 | 0x00010000U);
+  }
+  uint32_t reg764 = rtw_read32(padapter, 0x0764U);
+  if ((reg764 & 0x00000600U) != 0U) {
+    rtw_write32(padapter, 0x0764U, reg764 & ~0x00000600U);
+  }
+
+  // 3) Sanitize MAC 0x778 low nibble back to 0x01 (normal PTA table select) whenever not inside
+  //    an active TDMA scan step (where rtl8721d_btcoex_wifi_tdma_scan_set_slot toggles 0x09/0x01)
+  //    and not running SoftAP PS-TDMA Case 4 (where KM0 MCU toggles 0x778 dynamically).
+  bool tdmaScanStepActive = (inActiveSurvey && pcoex != nullptr && pcoex[12] != 0U);
+  if (!tdmaScanStepActive && (forceBlePriorityTable || !softApActive)) {
+    uint8_t reg778 = rtw_read8(padapter, 0x0778U);
+    if ((reg778 & 0x0FU) != 0x01U) {
+      rtw_write8(padapter, 0x0778U, static_cast<uint8_t>((reg778 & 0xF0U) | 0x01U));
+    }
+  }
+
+  // 4) Enforce Coex Table (0x6c0/0x6c4/0x6c8) & KM0 WLAN MCU PS-TDMA (H2C 0x60):
+  //    - In unassociated STA / promiscuous sniff / breathing windows (forceBlePriorityTable || !softApActive),
+  //      match Realtek Case 2 (0x0102) & Case 5 (0x0202):
+  //      0x6c0=0x55555555, 0x6c4=0x55555555, 0x6c8=0x0000FFFF (break table protecting BLE),
+  //      and explicitly disable H2C 0x60 PS-TDMA (0,0,0,0,0) if pbtcoex->cur_pstdma_case was on
+  //      Case 4 (0x61) or Case 8 (0x51).
+  //    - In normal SoftAP mode with BLE connected (0x0602 -> Case 4), invalidate any non-Case-4
+  //      cur_pstdma_case cache, release [pcoex+8] mutex, and re-run rtw_coex_run(padapter).
+  uint32_t *pbtcoex = *reinterpret_cast<uint32_t **>(reinterpret_cast<uint8_t *>(padapter) + 0x207cU);
+  bool needSoftApCoexRun = false;
+  if (forceBlePriorityTable || !softApActive) {
+    if (rtw_read32(padapter, 0x06c0U) != 0x55555555U ||
+        rtw_read32(padapter, 0x06c4U) != 0x55555555U ||
+        rtw_read32(padapter, 0x06c8U) != 0x0000FFFFU) {
+      rtl8721d_set_coex_table(padapter, 0x55555555U, 0x55555555U, 0x0000FFFFU, 0U);
+    }
+    if (pbtcoex != nullptr && pbtcoex[0] != 2U && pbtcoex[0] != 5U) {
+      rtl8721d_set_pstdma_cmd(padapter, 0U, 0U, 0U, 0U, 0U);
+      pbtcoex[0] = inActiveSurvey ? 5U : 2U;
+    }
+  } else if (!inActiveSurvey && bleConn) {
+    if (pbtcoex != nullptr && pbtcoex[0] != 4U) {
+      pbtcoex[0] = 0xFFFFFFFFU;
+      needSoftApCoexRun = true;
+    }
+  }
+  coexGuard.unlock();
+  if (needSoftApCoexRun) {
+    rtw_coex_run(padapter);
+  }
+}
+
 void restoreBleCoex(bool resetCoex) {
   if (!bleStarted) return;
   wifi_btcoex_set_bt_on();
-  // rtw_coex_bt_enable(0/1) 直接操作 pcoex，仅在 WLAN 接口已就绪时调用
-  if (wifi_is_up(RTW_STA_INTERFACE) || wifi_is_up(RTW_AP_INTERFACE)) {
-    if (resetCoex) {
-      rltk_coex_bt_enable(0);
-    }
-    rltk_coex_bt_enable(1);
+  if (!wifi_is_up(RTW_STA_INTERFACE) && !wifi_is_up(RTW_AP_INTERFACE)) {
+    return;
   }
+  void *padapter = getActiveWlanAdapter();
+  if (padapter == nullptr) return;
+
+  // AmebaD 3.1.7 lib_wlan.a fix:
+  // 1) Never call rltk_coex_bt_enable(0/1) here: bt_enable(0) frees pcoex (wiping wifi_state)
+  //    and bt_enable(1) overwrites bt_state=2 (BLE connected) back to 1 and duplicates coex_mailbox.
+  // 2) For hot wifi_set_mode() transitions (!resetCoex && pcoex->run_en == 1), synchronize pcoex
+  //    under [pcoex+8] mutex without tearing down coex_run_enable or re-running hal_coex_init.
+  // 3) For cold wifi_on() fallback (resetCoex == true), re-initialize hal_coex_init & rtw_coex_run_enable
+  //    after netif is UP so btc_pta_init_8721d() succeeds, then apply rtw_coex_run() + enforceBleCoexPta().
+  feedWatchdog();
+  uint8_t baseWifiState = softApActive ? 6U : 1U;
+  uint8_t desiredBtState = isBleConnectedSafe() ? 2U : 1U;
+  bool coexAlreadyRunning = (!resetCoex && pcoex != nullptr && pcoex[0] != 0U);
+  if (coexAlreadyRunning) {
+    CoexMutexGuard coexGuard;
+    coexGuard.tryLock(50U);
+    pcoex[1] = baseWifiState;
+    pcoex[2] = baseWifiState;
+    pcoex[3] = desiredBtState;
+    pcoex[12] = 0U;
+    uint32_t *pbtcoex = *reinterpret_cast<uint32_t **>(reinterpret_cast<uint8_t *>(padapter) + 0x207cU);
+    if (pbtcoex != nullptr) {
+      pbtcoex[0] = 0xFFFFFFFFU;
+    }
+    coexGuard.unlock();
+  } else {
+    hal_coex_init(padapter);
+    if (pcoex != nullptr) {
+      pcoex[1] = baseWifiState;
+      pcoex[2] = baseWifiState;
+      pcoex[3] = desiredBtState;
+      pcoex[12] = 0U;
+    }
+    if (resetCoex) {
+      rtw_coex_run_enable(padapter, 0);
+    }
+    rtw_coex_run_enable(padapter, 1);
+    uint32_t *pbtcoex = *reinterpret_cast<uint32_t **>(reinterpret_cast<uint8_t *>(padapter) + 0x207cU);
+    if (pbtcoex != nullptr) {
+      pbtcoex[0] = 0xFFFFFFFFU;
+    }
+  }
+  rtw_coex_run(padapter);
+  enforceBleCoexPta(!softApActive);
+  feedWatchdog();
+}
+
+void refreshBleCoexOnBandSwitch(int prevCh, int newCh) {
+  if (newCh >= 36) {
+    if (prevCh < 36 || continuous5GHzSinceMs == 0) {
+      continuous5GHzSinceMs = millis();
+      if (continuous5GHzSinceMs == 0) continuous5GHzSinceMs = 1;
+    }
+  } else {
+    continuous5GHzSinceMs = 0;
+  }
+
+  if (!bleStarted) return;
+  if (!wifi_is_up(RTW_STA_INTERFACE) && !wifi_is_up(RTW_AP_INTERFACE)) return;
+  void *padapter = getActiveWlanAdapter();
+  if (padapter != nullptr && ((prevCh >= 36) != (newCh >= 36))) {
+    rtw_coex_run(padapter);
+  }
+  if (newCh < 36) {
+    enforceBleCoexPta(!softApActive);
+  }
+}
+
+void serviceBleBreathingWindow(unsigned long windowMs, bool parkOn2G) {
+  feedWatchdog();
+  pollSerialInput();
+  if (!bleStarted && !softApActive) {
+    return;
+  }
+
+  int prevCh = getCurrentChannelSafe();
+  if (parkOn2G) {
+    // Always re-assert WIFI_CHANNEL (CH 1) in hardware when parkOn2G is requested:
+    // lib_wlan's site_survey switches RF channels directly without updating currentChannel,
+    // so checking prevCh != WIFI_CHANNEL alone could skip retuning RF_0x18 back to 2.4GHz.
+    if (wifi_set_channel(WIFI_CHANNEL) == RTW_SUCCESS) {
+      setCurrentChannelSafe(WIFI_CHANNEL);
+      continuous5GHzSinceMs = 0;
+    }
+  } else if (prevCh < 36) {
+    continuous5GHzSinceMs = 0;
+  }
+
+  enforceBleCoexPta(true);
+
+  unsigned long startMs = millis();
+  while (true) {
+    feedWatchdog();
+    pollSerialInput();
+    processBleDiagAndNegotiation();
+
+    unsigned long nowMs = millis();
+    if (nowMs - lastBleWindowStatusMs >= 1000UL) {
+      lastBleWindowStatusMs = nowMs;
+      blePushStatus(false);
+    }
+
+    if (emergencyStopRequested || priorityStopPending || hasQueuedStopInCmdRing()) {
+      break;
+    }
+    unsigned long elapsed = nowMs - startMs;
+    if (elapsed >= windowMs) {
+      break;
+    }
+    unsigned long stepMs = windowMs - elapsed;
+    if (stepMs > 10UL) stepMs = 10UL;
+    delay(stepMs);
+  }
+
+  if (softApActive) {
+    void *padapter = getActiveWlanAdapter();
+    if (padapter != nullptr) {
+      rtw_coex_run(padapter);
+    }
+    enforceBleCoexPta(false);
+  } else {
+    enforceBleCoexPta(true);
+  }
+}
+
+void maintainBle5GHzKeepalive() {
+  static unsigned long last2GCoexGuardMs = 0;
+  unsigned long nowMs = millis();
+  int curCh = getCurrentChannelSafe();
+  if (curCh < 36) {
+    continuous5GHzSinceMs = 0;
+    // Periodically self-heal 2.4GHz PTA registers (0x6c0/0x6c4=0x55555555, 0x778=0x01)
+    // in case asynchronous rtw_coex_mailbox_thread or delayed survey events ran rtw_coex_run().
+    if (bleStarted && (nowMs - last2GCoexGuardMs >= 500UL)) {
+      last2GCoexGuardMs = nowMs;
+      enforceBleCoexPta(!softApActive);
+    }
+    return;
+  }
+  if (!bleStarted) {
+    continuous5GHzSinceMs = (nowMs != 0) ? nowMs : 1UL;
+    return;
+  }
+  if (continuous5GHzSinceMs == 0) {
+    continuous5GHzSinceMs = (nowMs != 0) ? nowMs : 1UL;
+    return;
+  }
+  bool bleConn = isBleConnectedSafe();
+  unsigned long max5GResidencyMs = bleConn ? 800UL : 1200UL;
+  if (nowMs - continuous5GHzSinceMs < max5GResidencyMs) {
+    return;
+  }
+
+  // RTL8720DN shares a single RF PLL (RF_0x18) between 5GHz Wi-Fi and 2.4GHz BLE.
+  // When locked onto CH 36-165 (e.g. single-channel 5GHz sniff, 5GHz flood, or idle CH lock
+  // under 'ap off'), periodically park on 2.4GHz CH 1 for 75-85ms (~2 BLE connection/advertising
+  // intervals) while muting promiscuous RX so 2.4GHz frames never contaminate 5GHz capture logs.
+  rtw_enter_critical(NULL, NULL);
+  promiscPauseForBleCoex = true;
+  rtw_exit_critical(NULL, NULL);
+
+  bool parked = (wifi_set_channel(WIFI_CHANNEL) == RTW_SUCCESS);
+  if (parked) {
+    serviceBleBreathingWindow(bleConn ? 75UL : 85UL, false);
+    if (!emergencyStopRequested && !priorityStopPending &&
+        wifi_set_channel(curCh) == RTW_SUCCESS) {
+      unsigned long resumedAt = millis();
+      continuous5GHzSinceMs = (resumedAt != 0) ? resumedAt : 1UL;
+    } else {
+      setCurrentChannelSafe(WIFI_CHANNEL);
+      continuous5GHzSinceMs = 0;
+    }
+  }
+
+  rtw_enter_critical(NULL, NULL);
+  promiscPauseForBleCoex = false;
+  rtw_exit_critical(NULL, NULL);
 }
 
 //==========================================================
 // Radio Management — Channel Restore
 //==========================================================
 void restoreDefaultChannelIfNeeded(bool force) {
-  if (force || apEnabled || softApActive) {
+  bool sniffingNow = false;
+  rtw_enter_critical(NULL, NULL);
+  sniffingNow = isSniffing;
+  rtw_exit_critical(NULL, NULL);
+
+  int prevCh = getCurrentChannelSafe();
+  bool strandedOn5GWithBle = (!sniffingNow && prevCh >= 36 && isBleConnectedSafe());
+  if (force || apEnabled || softApActive || strandedOn5GWithBle) {
     if (wifi_set_channel(WIFI_CHANNEL) == RTW_SUCCESS) {
       setCurrentChannelSafe(WIFI_CHANNEL);
+      refreshBleCoexOnBandSwitch(prevCh, WIFI_CHANNEL);
     }
   }
 }
@@ -464,24 +827,39 @@ bool startSoftAP() {
     if (attempt > 0) {
       Serial.println("[WARN] startSoftAP: retrying AP + WebServer recovery...");
     }
-    // 修复 WiFiDrv 静态 init_wlan/wifi_mode 失同步（2-OptA）：
-    // 首次启动由 WiFi.apbegin()->wifiDriverInit() 完成 LwIP_Init；后续重启 WiFiDrv::wifi_mode 仍为
-    // RTW_MODE_AP，会跳过 wifi_on(RTW_MODE_AP)，因此必须显式重置为 RTW_MODE_AP。
+    bool didColdWifiReset = false;
+    // 优先使用 SDK 原生 wifi_set_mode(RTW_MODE_AP) 热切模式，避免 wifi_off()/wifi_on()
+    // 触发 rtl8721d_hal_deinit/hal_init + ex_hal8721d_wifi_only_hw_config 破坏运行中的 BLE RF/PTA。
     if (wlanLwipInitialized) {
-      wifi_off();
-      feedWatchdog();
-      delay(40);
-      if (wifi_on(RTW_MODE_AP) != RTW_SUCCESS) {
-        wlanRuntimeMode = WLAN_MODE_UNINIT;
-        Serial.println("[ERROR] startSoftAP: wifi_on(RTW_MODE_AP) failed");
-        continue;
+      bool hotSwitchOk = false;
+      if (attempt == 0 && (wifi_is_up(RTW_STA_INTERFACE) || wifi_is_up(RTW_AP_INTERFACE))) {
+        dhcps_deinit();
+        feedWatchdog();
+        if (wifi_set_mode(RTW_MODE_AP) == RTW_SUCCESS) {
+          hotSwitchOk = true;
+          feedWatchdog();
+        } else {
+          Serial.println("[WARN] startSoftAP: wifi_set_mode(RTW_MODE_AP) failed; falling back to cold restart.");
+        }
       }
-      delay(20);
-      feedWatchdog();
+      if (!hotSwitchOk) {
+        wifi_off();
+        feedWatchdog();
+        delay(40);
+        if (wifi_on(RTW_MODE_AP) != RTW_SUCCESS) {
+          wlanRuntimeMode = WLAN_MODE_UNINIT;
+          Serial.println("[ERROR] startSoftAP: wifi_on(RTW_MODE_AP) failed");
+          continue;
+        }
+        delay(20);
+        feedWatchdog();
+        didColdWifiReset = true;
+      }
     } else if (wlanRuntimeMode != WLAN_MODE_UNINIT) {
       wifi_off();
       feedWatchdog();
       delay(40);
+      didColdWifiReset = true;
     }
 
     int apRes = WiFi.apbegin(ap_ssid, ap_pass, ch, 0);
@@ -503,7 +881,8 @@ bool startSoftAP() {
     WiFi.disablePowerSave();
     softApActive = true;
     setCurrentChannelSafe(WIFI_CHANNEL);
-    restoreBleCoex(true);
+    continuous5GHzSinceMs = 0;
+    restoreBleCoex(didColdWifiReset);
 
     if (startWebServer(3)) {
       return true;
@@ -521,6 +900,7 @@ bool startSoftAP() {
     WiFi.disablePowerSave();
     softApActive = true;
     setCurrentChannelSafe(WIFI_CHANNEL);
+    continuous5GHzSinceMs = 0;
     restoreBleCoex(true);
     return webServerRunning();
   }
@@ -544,34 +924,66 @@ bool enterStaMode(const char *context) {
                    !wifi_is_up(RTW_AP_INTERFACE) &&
                    wext_get_mode(WLAN0_NAME, &wextMode) == RTW_SUCCESS &&
                    wextMode == RTW_MODE_INFRA);
+  bool didColdWifiReset = false;
+  bool didHotSwitch = false;
   if (!alreadySta) {
-    wifi_off();
-    feedWatchdog();
-    delay(40);
-    if (wifi_on(RTW_MODE_STA) != RTW_SUCCESS) {
-      wlanRuntimeMode = WLAN_MODE_UNINIT;
-      Serial.print("[ERROR] wifi_on(RTW_MODE_STA) failed");
-      if (context && context[0] != '\0') {
-        Serial.print(" (");
-        Serial.print(context);
-        Serial.print(")");
+    // 优先通过 wifi_set_mode(RTW_MODE_STA) 热切模式：绝不触发 wifi_off()/wifi_on()
+    // 中的 rtl8721d_hal_deinit/hal_init + ex_hal8721d_wifi_only_hw_config，保持 BLE RF 与 PTA 连续不断链。
+    if (wifi_is_up(RTW_AP_INTERFACE) || wifi_is_up(RTW_STA_INTERFACE)) {
+      dhcps_deinit();
+      feedWatchdog();
+      int swRet = wifi_set_mode(RTW_MODE_STA);
+      feedWatchdog();
+      int chkMode = -1;
+      if (swRet == RTW_SUCCESS &&
+          wifi_is_up(RTW_STA_INTERFACE) &&
+          !wifi_is_up(RTW_AP_INTERFACE) &&
+          wext_get_mode(WLAN0_NAME, &chkMode) == RTW_SUCCESS &&
+          chkMode == RTW_MODE_INFRA) {
+        didHotSwitch = true;
+        wlanRuntimeMode = WLAN_MODE_STA;
+      } else {
+        Serial.print("[WARN] wifi_set_mode(RTW_MODE_STA) failed ret=");
+        Serial.println(swRet);
       }
-      Serial.println(".");
-      restoreBleCoex(false);
-      return false;
     }
-    delay(20);
-    feedWatchdog();
-    wlanRuntimeMode = WLAN_MODE_STA;
+    if (!didHotSwitch) {
+      wifi_off();
+      feedWatchdog();
+      delay(40);
+      if (wifi_on(RTW_MODE_STA) != RTW_SUCCESS) {
+        wlanRuntimeMode = WLAN_MODE_UNINIT;
+        Serial.print("[ERROR] wifi_on(RTW_MODE_STA) failed");
+        if (context && context[0] != '\0') {
+          Serial.print(" (");
+          Serial.print(context);
+          Serial.print(")");
+        }
+        Serial.println(".");
+        restoreBleCoex(false);
+        return false;
+      }
+      delay(20);
+      feedWatchdog();
+      wlanRuntimeMode = WLAN_MODE_STA;
+      didColdWifiReset = true;
+    }
   }
-  WiFi.disablePowerSave();
-  restoreBleCoex(!alreadySta);
-  if (wifi_set_channel(WIFI_CHANNEL) == RTW_SUCCESS) {
-    setCurrentChannelSafe(WIFI_CHANNEL);
+  if (!alreadySta) {
+    WiFi.disablePowerSave();
+    restoreBleCoex(didColdWifiReset);
   } else {
-    Serial.print("[WARN] wifi_set_channel(");
-    Serial.print(WIFI_CHANNEL);
-    Serial.println(") failed after STA switch.");
+    enforceBleCoexPta(true);
+  }
+  if (!alreadySta || getCurrentChannelSafe() != WIFI_CHANNEL) {
+    if (wifi_set_channel(WIFI_CHANNEL) == RTW_SUCCESS) {
+      setCurrentChannelSafe(WIFI_CHANNEL);
+      continuous5GHzSinceMs = 0;
+    } else {
+      Serial.print("[WARN] wifi_set_channel(");
+      Serial.print(WIFI_CHANNEL);
+      Serial.println(") failed after STA switch.");
+    }
   }
   return true;
 }

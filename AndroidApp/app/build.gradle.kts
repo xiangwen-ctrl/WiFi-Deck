@@ -12,8 +12,8 @@ android {
         applicationId = "io.github.xiangwen.wifideck"
         minSdk = 26
         targetSdk = 36
-        versionCode = 21
-        versionName = "2.1.0"
+        versionCode = 220
+        versionName = "2.2.0"
     }
 
     buildTypes {

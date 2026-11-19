@@ -91,7 +91,11 @@ bool stepSlicedTxCycle(SlicedTxCycle &st, bool sendDeauth, bool sendDisassoc, un
 //==========================================================
 // Radio Management
 //==========================================================
+void enforceBleCoexPta(bool forceBlePriorityTable = false);
 void restoreBleCoex(bool resetCoex = true);
+void refreshBleCoexOnBandSwitch(int prevCh, int newCh);
+void serviceBleBreathingWindow(unsigned long windowMs, bool parkOn2G = true);
+void maintainBle5GHzKeepalive();
 void restoreDefaultChannelIfNeeded(bool force = false);
 void restoreRadioAfterSniff();
 bool startSoftAP();

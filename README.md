@@ -163,13 +163,15 @@ flowchart LR
   `wifi_tx_raw_frame` 对驱动内部结构体做逐级判空与帧长（`<= 1500B`）校验，Beacon/Probe 构造器限制 SSID `<= 32B` 与96B 栈缓冲边界；App 与 WebUI 下发攻击时必须带目标索引（如 `start deauther 0,2,5`），未选目标直接拒绝，全量发包需要显式传 `all`。
 - **BLE 上行分级背压限流**  
   抓包高峰期如果无限制地发 Notify 会耗尽协议栈 TX credit，把每秒1次的 `st` 心跳饿死并触发 `0x0108` 超时断连。`bleSendSniffLog` 和主循环对此做了分级流控：`EAPOL`、`Deauth`、`Disassoc` 与 `Pwnagotchi` 帧只要还有 `>= 1` 个 credit（间隔 `>= 15ms`）就优先发送；普通日志则要求至少保留3个 credit 给心跳和命令响应，并根据 ATT MTU 在 `100ms–800ms` 之间动态退避。
+- **WLAN 热模式切换与双频 BLE 共存调度**  
+  针对 RTL8720DN 单射频共用本振（`RF_0x18`）与 Wi-Fi/BLE 共用 PTA 天线仲裁的硬件约束，`enterStaMode()` / `startSoftAP()` 改用 SDK 原生 `wifi_set_mode()` 热切换（配合 `dhcps_deinit()`），避免 `wifi_off()` / `wifi_on()` 反复冷重置射频与 PTA 导致 BLE 断连（`0x0108`）及无法重连；`enforceBleCoexPta()` / `restoreBleCoex()` 通过驱动内部 `[pcoex+8]` 互斥锁（`CoexMutexGuard`）保护，避免与驱动线程并发踩踏共存寄存器。双频扫描按 16 批次 `wifi_set_pscan_chan(PSCAN_ENABLE)` 分段执行（所有 5GHz 批次严格限制为 `≤2` 个信道、批次间回切 2.4GHz `CH 1` 留出 BLE 喘息窗口）；双频跳频采用 `2:1` 5GHz/2.4GHz 交错序列（`INTERLEAVED_DUAL_BAND_CHANNELS`），5GHz 定频抓包/发包期间则由 `maintainBle5GHzKeepalive()` 周期回切保活。
 - **WebUI Gzip 压缩、增量轮询与 Flash 掉电记忆**  
   前端源码独立维护于 `tools/webui/index.html`，通过 `tools/pack_webui.py` 预压缩为 `webui_gz.h`（`Content-Encoding: gzip`，体积缩减约 `70.7%`）；`/api/status` 支持 FNV-1a `ETag` / `304 Not Modified` 协商，`/api/logs?since=<seq>` 仅回传新增报文并在无新帧时跳过 4KB 缓冲分配。纯 WebUI 用户点抓包时，固件先完整发出 HTTP 200 再关闭热点进入15秒定时抓包，结束后自动拉起 SoftAP 并重绑80端口。配置保存使用 `PersistConfig`（含 `CFG_MAGIC` `0x57444B33`、版本号与 `CRC32` 校验），`saveConfigToFlash` 会先用 `memcmp` 比对，参数没变时不重复擦写 Flash。
 
 ### Android 客户端实现细节（`AndroidApp/`）
 
 - **GATT 四阶段串行握手与断线重连状态机**  
-  `BleManager`（实现 `BleTransport` 接口并通过 `MainViewModel.Factory` 注入）把扫描、建链、错峰 `400ms` MTU 协商、服务发现、写 CCCD 开启 Notify 与初始状态同步串成带超时的单线流水线，并通过有界写队列与 `WriteAckTracker`（`60ms` 写确认超时、最小 `25ms` 间隔，`stop` 队首插队）控制下发节奏。意外断线后，`BleReconnectTracker` 会先用缓存设备尝试1次 `4.5s` 快速直连，失败立刻切回 BLE 扫描（按 MAC 锁定原设备，最多退避重试5轮）：
+  `BleManager`（实现 `BleTransport` 接口并通过 `MainViewModel.Factory` 注入）把扫描、建链、错峰 `400ms` MTU 协商、服务发现、写 CCCD 开启 Notify 与初始状态同步串成带超时的单线流水线，并通过有界写队列与 `WriteAckTracker`（`90ms` 写确认超时、最小 `25ms` 间隔，普通指令最多 8 次 / `stop` 队首插队最多 10 次退避重试）控制下发节奏。意外断线后，`BleReconnectTracker` 会先用缓存设备尝试1次 `4.5s` 快速直连，失败立刻切回 BLE 扫描（按 MAC 锁定原设备，最多退避重试5轮）：
 
 ```mermaid
 sequenceDiagram
@@ -192,7 +194,7 @@ sequenceDiagram
     FW-->>BM: onDescriptorWrite(GATT_SUCCESS)
     BM->>VM: connectionState = CONNECTED
     BM->>FW: sendCommand("info") + sendCommand("results")
-    FW-->>VM: Notify {"t":"cfg","ver":"2.1.0",...} + {"t":"id",...} + {"t":"sync_begin"..."sync_end"}
+    FW-->>VM: Notify {"t":"cfg","ver":"2.2.0",...} + {"t":"id",...} + {"t":"sync_begin"..."sync_end"}
     Note over BM,FW: On unexpected disconnect: 1x 4.5s direct connect -> up to 5x scan fallback
 ```
 
@@ -217,7 +219,7 @@ sequenceDiagram
 ### 烧录固件
 
 **方式一：Windows 一键烧录（无需安装 Arduino IDE）**  
-前往 [GitHub Releases](https://github.com/xiangwen-ctrl/WiFi-Deck/releases/latest) 下载 **`WiFi-Deck-v2.1.0-FlashTool.zip`** 并完整解压，双击 **`一键烧录固件.bat`**：脚本会自动识别 USB 串口，带自动下载电路的 BW16-Kit 直接回车即可免按键自动烧录；旧版开发板或外接串口模块可选模式 `[2]`，按提示**按住板载 `BURN` 键不放 → 短按一下 `RST` 键 → 松开 `BURN` 键**完成烧录。
+前往 [GitHub Releases](https://github.com/xiangwen-ctrl/WiFi-Deck/releases/latest) 下载 **`WiFi-Deck-v2.2.0-FlashTool.zip`** 并完整解压，双击 **`一键烧录固件.bat`**：脚本会自动识别 USB 串口，带自动下载电路的 BW16-Kit 直接回车即可免按键自动烧录；旧版开发板或外接串口模块可选模式 `[2]`，按提示**按住板载 `BURN` 键不放 → 短按一下 `RST` 键 → 松开 `BURN` 键**完成烧录。
 
 **方式二：Arduino IDE / 命令行源码烧录**
 1. Arduino IDE 打开根目录 `WiFi-Deck.ino`，开发板选 **`Ai-Thinker BW16 (RTL8720DN)`**。
@@ -232,7 +234,7 @@ arduino-cli upload -p COM6 --fqbn realtek:AmebaD:Ai-Thinker_BW16:AutoUploadMode=
 
 ### 连接与使用
 
-- **Android 客户端（推荐）**：前往 [GitHub Releases](https://github.com/xiangwen-ctrl/WiFi-Deck/releases/latest) 或 [Gitee Releases](https://gitee.com/xiangwen-ctrl/WiFi-Deck/releases) 下载 **`WiFi-Deck-v2.1.0.apk`** 安装，按提示授予蓝牙/附近设备权限（Android 8–11 需同时开启定位）后在 App 内点顶部连接按钮即可（不用在系统蓝牙里配对，手机可继续上网，也不影响蓝牙耳机）。
+- **Android 客户端（推荐）**：前往 [GitHub Releases](https://github.com/xiangwen-ctrl/WiFi-Deck/releases/latest) 或 [Gitee Releases](https://gitee.com/xiangwen-ctrl/WiFi-Deck/releases) 下载 **`WiFi-Deck-v2.2.0.apk`** 安装，按提示授予蓝牙/附近设备权限（Android 8–11 需同时开启定位）后在 App 内点顶部连接按钮即可（不用在系统蓝牙里配对，手机可继续上网，也不影响蓝牙耳机）。
 - **板载 WebUI**：手机或电脑连上热点（默认名称 **`WiFi-Deck`**，密码 **`12345678`**），浏览器打开 **`http://192.168.1.1`**。
 - **UART 串口**：波特率 `115200`，发 `help` 可看完整命令列表。
 - **本地编译 App 与跑单元测试**：
@@ -331,7 +333,7 @@ set ble_name <name>         set ap_ssid <ssid>          set ap_pass <pass>      
 | `scan_begin` / `scan_end` | 主动扫描起止 | `n`：热点数量（失败附 `err: 1`） |
 | `sync_begin` / `sync_end` | `results` 回读或间隙重扫同步 | `n`：热点数量（不触发主动扫描超时） |
 | `ap` | 单条扫描热点 | `i`：索引，`s`：SSID，`b`：BSSID，`c`：信道，`r`：RSSI，`sel`：选中标志 |
-| `st` | 每秒或状态变更心跳 | `atk`/`dis`/`bcn`/`prb`/`jam`/`snf`、`snfOn`、`sMode`、`hop`、`ch`、`ok`/`fail`、`rem` |
+| `st` | 每秒或状态变更心跳 | `atk`/`dis`/`bcn`/`prb`/`jam`/`snf`、`snfOn`、`sMode`、`hop`、`ch`、`ok`/`fail`、`rem`、`ap` |
 | `cfg` / `id` | 运行配置与设备身份同步 | `delay`、`scan`、`frames`、`ch`、`sc`、`led`、`ap`、`ver` / `ssid`、`pass`、`ble` |
 | `log` | 抓包报文与系统提示 | `m`：单行日志文本 |
 
@@ -366,6 +368,10 @@ set ble_name <name>         set ap_ssid <ssid>          set ap_pass <pass>      
 
 ## 版本记录
 
+- **v2.2.0**：根治关闭热点（`ap off`）、双频扫描（`scan`）、混杂抓包（`start sniff`）、双频跳频（`hop on`）、`deauth_sniff` 及 5GHz 发包期间 BLE 超时断连（`0x0108`）与无法重连的底层共存顽疾：
+  - **WLAN 热模式切换与 PTA 互斥保护**：`enterStaMode()` 与 `startSoftAP()` 改用 SDK 原生 `wifi_set_mode()` 热切换（配合 `dhcps_deinit()`），彻底消除 `wifi_off()` / `wifi_on()` 反复冷重置射频/PTA 引发蓝牙失联的问题；新增基于驱动内部 `[pcoex+8]` 互斥锁的 `CoexMutexGuard` 保护 `enforceBleCoexPta()` / `restoreBleCoex()`，同步恢复 `0x778=0x01`、`0x6c0/0x6c4=0x55555555`、`0x6c8=0x0000FFFF` 并清除 KM0 `H2C 0x60` PS-TDMA 残留，混杂抓包运行于 `RTW_MODE_STA`；
+  - **双频分段扫描与 5GHz BLE 保活**：针对 RTL8720DN 单射频共用本振（`RF_0x18`）特性，将双频扫描重构为 16 批次 `wifi_set_pscan_chan(PSCAN_ENABLE)` 分段扫描（所有 5GHz 批次严格限制为 `≤2` 个信道、批次间回切 2.4GHz `CH 1` 留出 `95ms` BLE 喘息窗口）并移除扫描等待循环内的无锁 PTA 写入；双频跳频重构为 `INTERLEAVED_DUAL_BAND_CHANNELS`（`2:1` 5GHz/2.4GHz 交错，单次 5GHz 驻留 `≤700ms`），新增 5GHz 定频抓包/发包期间的 `maintainBle5GHzKeepalive()` 保活窗口；
+  - **BLE 链路协同与 Android 客户端增强**：优化固件 BLE 连接参数协商（`30–50ms` 间隔、`6000ms` 监督超时）并在 1 秒状态心跳 `st` 新增 `ap` 字段防止热点开关回弹；Android 客户端升级至 `v2.2.0`（`versionCode = 220`），增强 GATT 写入繁忙重试与退避容错、补齐重连后配置与扫描结果自愈同步，单元测试扩充至 47 项。
 - **v2.1.0**：将单文件固件重构为 9 模块多文件架构，消除扫描临界区动态 `String` 堆分配并改为栈缓冲流式 HTTP JSON 输出；独立维护 `tools/webui/index.html` 并引入 Gzip 预压缩（Flash 缩减约 `28KB`）、`/api/status` ETag `304` 协商与 `/api/logs?since=` 增量日志拉取；打通全端固件与客户端版本号（`v2.1.0`）；Android 端完成 `BleTransport` 依赖注入解耦、`@Immutable` / `LazyRow` 渲染优化并将单元测试扩充至 43 项；新增 Firmware 编译 CI。
 - **v2.0**：修复固件 802.11 帧构造边界、混杂模式与扫描并发问题，WebUI 改用直连 lwIP BSD Socket 解决抓包恢复时80端口绑定失败，加入 BLE 抓包分级限流与 `PersistConfig` CRC32 校验；Android 端新增前台保活、断线重连状态机、权限与定位门禁、75ms 日志合批渲染及32个单元测试，CI 接入单测门禁和自动发版。
 - **v1.6**：完善 2.4G/5G 全信道跳频与 `ap off` 隐身模式，Android 客户端拆分为四标签页，支持自定义 AP 与 BLE 名称持久化。

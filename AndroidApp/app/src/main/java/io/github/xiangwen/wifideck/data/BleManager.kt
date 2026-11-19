@@ -54,9 +54,9 @@ object BleManager : BleTransport {
 
     private const val MAX_CMD_QUEUE_SIZE = WriteAckTracker.MAX_CMD_QUEUE_SIZE
     private const val GATT_CLOSE_TIMEOUT_MS = 800L
-    private const val MAX_WRITE_RETRIES = 5
-    private const val MAX_URGENT_WRITE_RETRIES = 8
-    private const val WRITE_ACK_TIMEOUT_MS = 60L
+    private const val MAX_WRITE_RETRIES = 8
+    private const val MAX_URGENT_WRITE_RETRIES = 10
+    private const val WRITE_ACK_TIMEOUT_MS = 90L
     private const val MIN_WRITE_INTERVAL_MS = 25L
 
     enum class ConnectionState { DISCONNECTED, SCANNING, CONNECTING, CONNECTED }
@@ -948,8 +948,8 @@ object BleManager : BleTransport {
                         retryCount = 0
                         onScanError?.invoke("BLE 写入繁忙超时，指令未能发出: $cmd")
                     } else {
-                        val baseDelay = if (isUrgent) 15L else 25L
-                        val backoffMs = (baseDelay shl (retryCount - 1)).coerceAtMost(200L)
+                        val baseDelay = if (isUrgent) 15L else 30L
+                        val backoffMs = (baseDelay shl (retryCount - 1)).coerceAtMost(250L)
                         Log.w(TAG, "GATT write busy for '$cmd', retry #$retryCount in ${backoffMs}ms")
                         if (isUrgent) {
                             delay(backoffMs)

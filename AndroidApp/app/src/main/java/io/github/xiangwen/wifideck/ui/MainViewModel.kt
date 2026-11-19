@@ -194,6 +194,7 @@ class MainViewModel(
     private var lastLogFlushMs = monotonicMs() - LOG_BATCH_INTERVAL_MS
 
     private var inSyncMode = false
+    private var syncResultsReceived = false
     private var syncPreservedBssids: Set<String> = emptySet()
     private var configSyncState = ConfigSyncState()
     private var idSsidReceived = false
@@ -285,8 +286,13 @@ class MainViewModel(
                         initialSyncProbeJob?.cancel()
                         initialSyncProbeJob = viewModelScope.launch {
                             delay(1200)
-                            if (!_configSynced.value && connectionState.value == BleManager.ConnectionState.CONNECTED) {
-                                ble.sendCommand("info")
+                            if (connectionState.value == BleManager.ConnectionState.CONNECTED) {
+                                if (!_configSynced.value) {
+                                    ble.sendCommand("info")
+                                }
+                                if (!syncResultsReceived && !_scanning.value) {
+                                    ble.sendCommand("results")
+                                }
                             }
                         }
                     }
@@ -426,6 +432,7 @@ class MainViewModel(
 
     private fun resetSyncProgress() {
         inSyncMode = false
+        syncResultsReceived = false
         syncPreservedBssids = emptySet()
         configSyncState = ConfigSyncState()
         idSsidReceived = false
@@ -504,6 +511,7 @@ class MainViewModel(
             when (BleMessageType.fromWireType(obj.optString("t"))) {
                 BleMessageType.SCAN_BEGIN -> {
                     inSyncMode = false
+                    syncResultsReceived = true
                     syncPreservedBssids = emptySet()
                     apFlushJob?.cancel()
                     apFlushJob = null
@@ -518,6 +526,7 @@ class MainViewModel(
                 BleMessageType.SYNC_BEGIN -> {
                     // 攻击间隙同步 (scan_between_cycles) 与 results 回读均走 sync_begin/sync_end，绝不干扰主动扫描态
                     inSyncMode = true
+                    syncResultsReceived = true
                     val curSelected = _selected.value + pendingSelectedIndices
                     syncPreservedBssids = apBackingMap.values
                         .filter { it.index in curSelected }
@@ -565,6 +574,7 @@ class MainViewModel(
                 BleMessageType.SCAN_END -> {
                     flushApBatchNow()
                     inSyncMode = false
+                    syncResultsReceived = true
                     syncPreservedBssids = emptySet()
                     scanWatchdogJob?.cancel()
                     scanWatchdogJob = null
@@ -578,6 +588,7 @@ class MainViewModel(
                 BleMessageType.SYNC_END -> {
                     flushApBatchNow()
                     inSyncMode = false
+                    syncResultsReceived = true
                     syncPreservedBssids = emptySet()
                 }
                 BleMessageType.STATUS -> {
@@ -596,6 +607,12 @@ class MainViewModel(
                         txFail = obj.optLong("fail"),
                         timedRemainingSec = obj.optInt("rem", 0)
                     )
+                    if (obj.has("ap")) {
+                        val apOn = obj.optInt("ap", 1) != 0
+                        if (_config.value.apEnabled != apOn) {
+                            _config.update { it.copy(apEnabled = apOn) }
+                        }
+                    }
                 }
                 BleMessageType.CONFIG -> {
                     _config.update {
@@ -947,7 +964,9 @@ class MainViewModel(
     }
 
     fun sendApToggle(on: Boolean) {
-        sendDebouncedSettingCommand("ap", if (on) "ap on" else "ap off")
+        if (sendDebouncedSettingCommand("ap", if (on) "ap on" else "ap off")) {
+            _config.update { it.copy(apEnabled = on) }
+        }
     }
 
     fun sendSetFrames(n: Int) {

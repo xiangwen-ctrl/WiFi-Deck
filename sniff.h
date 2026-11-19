@@ -63,10 +63,12 @@ extern unsigned long lastHopTime;
 extern const unsigned long HOP_INTERVAL;
 extern const int CHANNELS_2GHZ[13];
 extern const int CHANNELS_5GHZ[25];
+extern const int INTERLEAVED_DUAL_BAND_CHANNELS[38];
 extern int currentChannelIndex;
 extern bool hopUse5GHz;
 extern bool hopResetPending;
 extern volatile int currentChannel;
+extern volatile bool promiscPauseForBleCoex;
 
 // Cross-thread sniff log ring buffer (WiFi promisc thread -> loop)
 extern char sniffLogRing[LOG_RING_SIZE][LOG_STR_LEN];
@@ -144,7 +146,6 @@ void stopSniffing();
 bool haltPromiscSniff();
 void waitForPromiscCallbacksIdle();
 void clearDeauthSniffState();
-void prepareRadioForSniff(bool turnOffAp);
 void startMonitorSniff(SniffMode mode, bool timed = false, unsigned long dur = 0);
 
 void pushSniffLog(const char *msg);
