@@ -247,7 +247,8 @@ void bleSendLog(const char *msg) {
   if (!isBleReadyToNotifySafe(connId)) return;
   if (!bleSendSniffLog(msg, false)) {
     rtw_enter_critical(NULL, NULL);
-    bleDroppedLogCount++;
+    uint32_t nextDropped = bleDroppedLogCount + 1U;
+    bleDroppedLogCount = nextDropped;
     rtw_exit_critical(NULL, NULL);
   }
 }
@@ -686,21 +687,21 @@ void ensureBleAdvertisingIfDisconnected() {
 void updateBleName(const char *newName) {
   if (!newName || newName[0] == '\0') return;
   char nextName[sizeof(ble_name)];
-  strncpy(nextName, newName, sizeof(nextName) - 1);
-  nextName[sizeof(nextName) - 1] = '\0';
+  boundedStrCopy(nextName, sizeof(nextName), newName);
   if (strcmp(ble_name, nextName) == 0) {
     return;
   }
-  strcpy(ble_name, nextName);
+  boundedStrCopy(ble_name, sizeof(ble_name), nextName);
   if (!bleStarted) return;
 
   bleAdvUpdateInProgress = true;
   BLE.setDeviceName(String(ble_name));
   char gapName[GAP_DEVICE_NAME_LEN] = {0};
-  strncpy(gapName, ble_name, GAP_DEVICE_NAME_LEN - 1);
+  boundedStrCopy(gapName, sizeof(gapName), ble_name);
   le_set_gap_param(GAP_PARAM_DEVICE_NAME, GAP_DEVICE_NAME_LEN, gapName);
   // 同步更新内置 GATT Device Name (0x2A00)，避免手机按 GATT 服务读取仍显示旧名
-  gaps_set_parameter(GAPS_PARAM_DEVICE_NAME, (uint8_t)strlen(ble_name), (void *)ble_name);
+  size_t bleNameLen = boundedStrLen(ble_name, sizeof(ble_name) - 1);
+  gaps_set_parameter(GAPS_PARAM_DEVICE_NAME, (uint8_t)bleNameLen, (void *)ble_name);
 
   // AmebaD GAP (#14): 先标记更新边界并停广播等待进入 IDLE，防止断连回调与参数更新竞态
   T_GAP_DEV_STATE devState = {0, 0, 0, 0, 0};
@@ -820,8 +821,11 @@ void pumpBleScanPush() {
       break;
     }
     if (!bleScanPush.beginSent) {
-      const char *beginMsg = bleScanPush.isSync ? "{\"t\":\"sync_begin\"}" : "{\"t\":\"scan_begin\"}";
-      if (!bleSendLineCstr(beginMsg, strlen(beginMsg), true, false)) {
+      static constexpr char SYNC_BEGIN_MSG[] = "{\"t\":\"sync_begin\"}";
+      static constexpr char SCAN_BEGIN_MSG[] = "{\"t\":\"scan_begin\"}";
+      const char *beginMsg = bleScanPush.isSync ? SYNC_BEGIN_MSG : SCAN_BEGIN_MSG;
+      size_t beginLen = bleScanPush.isSync ? (sizeof(SYNC_BEGIN_MSG) - 1) : (sizeof(SCAN_BEGIN_MSG) - 1);
+      if (!bleSendLineCstr(beginMsg, beginLen, true, false)) {
         break;
       }
       bleScanPush.beginSent = true;
@@ -1035,8 +1039,7 @@ void pollSerialInput() {
         } else {
           uint8_t next = (serialCmdHead + 1) % SERIAL_CMD_QUEUE_SIZE;
           if (next != serialCmdTail) {
-            strncpy(serialCmdQueue[serialCmdHead], line, sizeof(serialCmdQueue[0]) - 1);
-            serialCmdQueue[serialCmdHead][sizeof(serialCmdQueue[0]) - 1] = '\0';
+            boundedStrCopy(serialCmdQueue[serialCmdHead], sizeof(serialCmdQueue[0]), line);
             serialCmdHead = next;
             Serial.print("> ");
             Serial.println(line);

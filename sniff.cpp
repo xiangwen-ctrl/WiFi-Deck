@@ -80,14 +80,16 @@ unsigned long deauth_sniff_interval = 500;
 // =========================
 PromiscFlightGuard::PromiscFlightGuard() {
   rtw_enter_critical(NULL, NULL);
-  promiscCallbackInFlight++;
+  uint32_t nextInFlight = promiscCallbackInFlight + 1U;
+  promiscCallbackInFlight = nextInFlight;
   rtw_exit_critical(NULL, NULL);
 }
 
 PromiscFlightGuard::~PromiscFlightGuard() {
   rtw_enter_critical(NULL, NULL);
-  if (promiscCallbackInFlight > 0) {
-    promiscCallbackInFlight--;
+  uint32_t curInFlight = promiscCallbackInFlight;
+  if (curInFlight > 0U) {
+    promiscCallbackInFlight = curInFlight - 1U;
   }
   rtw_exit_critical(NULL, NULL);
 }
@@ -617,15 +619,18 @@ void pushSniffLog(const char *msg) {
     sniffLogRing[logHead][len] = '\0';
     logHead = next;
   } else {
-    droppedLogCount++;
+    uint32_t nextDropped = droppedLogCount + 1U;
+    droppedLogCount = nextDropped;
   }
   // Also record into WebUI circular history so /api/logs can inspect captured frames incrementally
   if (len > 0) memcpy(webLogHistory[webLogHead], msg, len);
   webLogHistory[webLogHead][len] = '\0';
   webLogHead = (webLogHead + 1) % WEB_LOG_HISTORY_SIZE;
-  if (webLogCount < WEB_LOG_HISTORY_SIZE) {
-    webLogCount++;
+  uint8_t curWebCount = webLogCount;
+  if (curWebCount < WEB_LOG_HISTORY_SIZE) {
+    webLogCount = (uint8_t)(curWebCount + 1U);
   }
-  webLogTotalSeq++;
+  uint32_t nextSeq = webLogTotalSeq + 1U;
+  webLogTotalSeq = nextSeq;
   rtw_exit_critical(NULL, NULL);
 }

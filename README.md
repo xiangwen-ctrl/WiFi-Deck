@@ -2,6 +2,7 @@
 
 [![Firmware CI](https://github.com/xiangwen-ctrl/WiFi-Deck/actions/workflows/firmware.yml/badge.svg)](https://github.com/xiangwen-ctrl/WiFi-Deck/actions/workflows/firmware.yml)
 [![Android CI](https://github.com/xiangwen-ctrl/WiFi-Deck/actions/workflows/android.yml/badge.svg)](https://github.com/xiangwen-ctrl/WiFi-Deck/actions/workflows/android.yml)
+[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=xiangwen-ctrl_WiFi-Deck&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=xiangwen-ctrl_WiFi-Deck)
 [![Release](https://img.shields.io/github/v/release/xiangwen-ctrl/WiFi-Deck)](https://github.com/xiangwen-ctrl/WiFi-Deck/releases/latest)
 ![Platform](https://img.shields.io/badge/Platform-BW16--Kit%20(RTL8720DN)-blue)
 ![Band](https://img.shields.io/badge/Wi--Fi-2.4GHz%20%26%205GHz-crimson)

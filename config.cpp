@@ -4,6 +4,7 @@
  */
 #include "config.h"
 #include "ble.h"
+#include "utils.h"
 
 //==========================
 // Global Configuration Variable Definitions
@@ -77,14 +78,17 @@ void loadConfigFromFlash() {
   cfg.ap_pass[64] = '\0';
   cfg.ble_name[26] = '\0';
 
-  if (strlen(cfg.ap_ssid) >= 1 && strlen(cfg.ap_ssid) <= 32) {
-    strcpy(ap_ssid, cfg.ap_ssid);
+  size_t ssidLen = boundedStrLen(cfg.ap_ssid, sizeof(cfg.ap_ssid));
+  if (ssidLen >= 1 && ssidLen <= 32) {
+    boundedStrCopy(ap_ssid, sizeof(ap_ssid), cfg.ap_ssid);
   }
-  if (strlen(cfg.ap_pass) >= 8 && strlen(cfg.ap_pass) <= 63) {
-    strcpy(ap_pass, cfg.ap_pass);
+  size_t passLen = boundedStrLen(cfg.ap_pass, sizeof(cfg.ap_pass));
+  if (passLen >= 8 && passLen <= 63) {
+    boundedStrCopy(ap_pass, sizeof(ap_pass), cfg.ap_pass);
   }
-  if (strlen(cfg.ble_name) >= 1 && strlen(cfg.ble_name) <= 26) {
-    strcpy(ble_name, cfg.ble_name);
+  size_t bleLen = boundedStrLen(cfg.ble_name, sizeof(cfg.ble_name));
+  if (bleLen >= 1 && bleLen <= 26) {
+    boundedStrCopy(ble_name, sizeof(ble_name), cfg.ble_name);
   }
   if (cfg.cycle_delay >= 100 && cfg.cycle_delay <= 60000) {
     cycle_delay = cfg.cycle_delay;
@@ -113,9 +117,9 @@ void saveConfigToFlash() {
   cfg.magic = CFG_MAGIC;
   cfg.version = CFG_VERSION;
   cfg.size = (uint16_t)sizeof(PersistConfig);
-  strncpy(cfg.ap_ssid, ap_ssid, sizeof(cfg.ap_ssid) - 1);
-  strncpy(cfg.ap_pass, ap_pass, sizeof(cfg.ap_pass) - 1);
-  strncpy(cfg.ble_name, ble_name, sizeof(cfg.ble_name) - 1);
+  boundedStrCopy(cfg.ap_ssid, sizeof(cfg.ap_ssid), ap_ssid);
+  boundedStrCopy(cfg.ap_pass, sizeof(cfg.ap_pass), ap_pass);
+  boundedStrCopy(cfg.ble_name, sizeof(cfg.ble_name), ble_name);
   cfg.cycle_delay = cycle_delay;
   cfg.scan_time = scan_time;
   cfg.num_send_frames = num_send_frames;
@@ -229,16 +233,14 @@ bool applyConfigSetting(const String &key, const String &rawValue, bool &apChang
     return true;
   } else if (key.equalsIgnoreCase("ap_ssid")) {
     if (String(ap_ssid) != rawValue) {
-      strncpy(ap_ssid, rawValue.c_str(), sizeof(ap_ssid) - 1);
-      ap_ssid[sizeof(ap_ssid) - 1] = '\0';
+      boundedStrCopy(ap_ssid, sizeof(ap_ssid), rawValue.c_str());
       apChanged = true;
     }
     Serial.println("[CFG] AP SSID updated to: " + String(ap_ssid));
     return true;
   } else if (key.equalsIgnoreCase("ap_pass")) {
     if (String(ap_pass) != rawValue) {
-      strncpy(ap_pass, rawValue.c_str(), sizeof(ap_pass) - 1);
-      ap_pass[sizeof(ap_pass) - 1] = '\0';
+      boundedStrCopy(ap_pass, sizeof(ap_pass), rawValue.c_str());
       apChanged = true;
     }
     Serial.println("[CFG] AP password updated.");

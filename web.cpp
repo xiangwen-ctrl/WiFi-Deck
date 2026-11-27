@@ -302,8 +302,7 @@ void parseHttpRequestLineCstr(const char *hdrBuf, size_t hdrLen,
                               char *fullPathOut, size_t pathCap) {
   if (methodOut && methodCap > 0) methodOut[0] = '\0';
   if (fullPathOut && pathCap > 0) {
-    strncpy(fullPathOut, "/", pathCap - 1);
-    fullPathOut[pathCap - 1] = '\0';
+    boundedStrCopy(fullPathOut, pathCap, "/");
   }
   if (!hdrBuf || hdrLen == 0) return;
 
@@ -660,8 +659,8 @@ static void computeStatusEtag(char *etagOut, size_t etagCap) {
   fnv1aMixU32(h, tx_success_count);
   fnv1aMixU32(h, tx_fail_count);
   fnv1aMixU32(h, remSec);
-  fnv1aMixBytes(h, ap_ssid, strlen(ap_ssid));
-  fnv1aMixBytes(h, ble_name, strlen(ble_name));
+  fnv1aMixBytes(h, ap_ssid, boundedStrLen(ap_ssid, sizeof(ap_ssid) - 1));
+  fnv1aMixBytes(h, ble_name, boundedStrLen(ble_name, sizeof(ble_name) - 1));
 
   snprintf(etagOut, etagCap, "\"wdk-%08lx\"", (unsigned long)h);
 }
@@ -761,10 +760,7 @@ bool sendLogsJSON(int clientSock, bool hasSince, uint32_t sinceSeq) {
     for (uint8_t i = 0; i < emitCount; i++) {
       uint8_t slot = (startIdx + i) % WEB_LOG_HISTORY_SIZE;
       char *dst = logSnapshot + ((size_t)i * LOG_STR_LEN);
-      size_t cp = strlen(webLogHistory[slot]) + 1;
-      if (cp > LOG_STR_LEN) cp = LOG_STR_LEN;
-      memcpy(dst, webLogHistory[slot], cp);
-      dst[LOG_STR_LEN - 1] = '\0';
+      boundedStrCopy(dst, LOG_STR_LEN, webLogHistory[slot]);
     }
   } else if (logSnapshot == nullptr) {
     emitCount = 0;
@@ -839,10 +835,7 @@ String getLogsJSON() {
     for (uint8_t i = 0; i < count; i++) {
       uint8_t slot = (startIdx + i) % WEB_LOG_HISTORY_SIZE;
       char *dst = logSnapshot + ((size_t)i * LOG_STR_LEN);
-      size_t cp = strlen(webLogHistory[slot]) + 1;
-      if (cp > LOG_STR_LEN) cp = LOG_STR_LEN;
-      memcpy(dst, webLogHistory[slot], cp);
-      dst[LOG_STR_LEN - 1] = '\0';
+      boundedStrCopy(dst, LOG_STR_LEN, webLogHistory[slot]);
     }
   }
   rtw_exit_critical(NULL, NULL);
@@ -1054,8 +1047,7 @@ void handleWebClient() {
     memcpy(pathBuf, fullPathBuf, pLen);
     pathBuf[pLen] = '\0';
   } else {
-    strncpy(pathBuf, fullPathBuf, sizeof(pathBuf) - 1);
-    pathBuf[sizeof(pathBuf) - 1] = '\0';
+    boundedStrCopy(pathBuf, sizeof(pathBuf), fullPathBuf);
   }
 
   Serial.print("[WEB] ");

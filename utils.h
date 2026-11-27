@@ -24,6 +24,31 @@ static inline void formatMac(const uint8_t *mac, char *out, size_t outSize) {
 }
 
 // ── String helpers ──────────────────────────────────────────
+static inline size_t boundedStrLen(const char *s, size_t maxLen) {
+  if (!s) return 0;
+  size_t len = 0;
+  while (len < maxLen && s[len] != '\0') {
+    len++;
+  }
+  return len;
+}
+
+static inline size_t boundedStrCopy(char *dst, size_t dstSize, const char *src) {
+  if (!dst || dstSize == 0) return 0;
+  if (!src) {
+    dst[0] = '\0';
+    return 0;
+  }
+  size_t maxCopy = dstSize - 1;
+  size_t i = 0;
+  while (i < maxCopy && src[i] != '\0') {
+    dst[i] = src[i];
+    i++;
+  }
+  dst[i] = '\0';
+  return i;
+}
+
 bool startsWithIgnoreCase(const String &s, const char *prefix);
 
 // ── UTF-8 helpers ───────────────────────────────────────────

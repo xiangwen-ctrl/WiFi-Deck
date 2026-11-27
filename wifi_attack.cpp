@@ -68,7 +68,7 @@ void wifi_tx_raw_frame(void* frame, size_t length) {
     Serial.println("[TX ERROR] Wi-Fi interface is not up!");
     return;
   }
-  uint8_t *wlan_dev = rltk_wlan_info;
+  uint8_t *wlan_dev = rltk_wlan_info[0].dev;
   if (wlan_dev == NULL) {
     tx_fail_count++;
     Serial.println("[TX ERROR] rltk_wlan_info dev is NULL!");
@@ -448,11 +448,10 @@ void targetAttack() {
 extern volatile bool bleStarted;
 
 static void *getActiveWlanAdapter() {
-  const uint8_t *wlanInfoBytes = reinterpret_cast<const uint8_t *>(&rltk_wlan_info);
-  if (wlanInfoBytes[16] == 0) {
+  if (rltk_wlan_info[0].enable == 0) {
     return nullptr;
   }
-  uint8_t *wlanDev = rltk_wlan_info;
+  uint8_t *wlanDev = rltk_wlan_info[0].dev;
   if (wlanDev == nullptr) {
     return nullptr;
   }

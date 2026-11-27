@@ -19,14 +19,15 @@ body{background:#0d1117;color:#f0f6fc;font-family:-apple-system,BlinkMacSystemFo
 .telemetry{display:flex;justify-content:space-between;margin-top:8px;padding-top:6px;border-top:1px solid #21262d;font-family:monospace;font-size:11px;color:#8b949e}
 .telemetry b{color:#f0f6fc}
 .tabs{display:flex;background:#161b22;border-bottom:1px solid #2b323c;position:sticky;top:59px;z-index:99}
-.tab{flex:1;padding:11px 0;text-align:center;font-size:12px;font-weight:600;color:#8b949e;cursor:pointer;border-bottom:2px solid transparent;transition:.2s}
+.tab{flex:1;padding:11px 0;text-align:center;font-family:inherit;font-size:12px;font-weight:600;line-height:inherit;color:#8b949e;background:transparent;border:0;border-bottom:2px solid transparent;border-radius:0;cursor:pointer;-webkit-appearance:none;appearance:none;transition:.2s}
 .tab.active{color:#e94560;border-color:#e94560;background:#1a1f29}
 .page{display:none;padding:12px}
 .page.active{display:block}
 .row{display:flex;gap:8px;align-items:center;margin:6px 0}
 .chips{display:flex;gap:6px;overflow-x:auto;padding:4px 0;scrollbar-width:none}
-.chip{white-space:nowrap;padding:5px 10px;border-radius:6px;font-size:11px;font-weight:600;background:#161b22;color:#8b949e;border:1px solid #2b323c;cursor:pointer}
+.chip{flex-shrink:0;white-space:nowrap;padding:5px 10px;border-radius:6px;font-family:inherit;font-size:11px;font-weight:600;line-height:inherit;background:#161b22;color:#8b949e;border:1px solid #2b323c;cursor:pointer;-webkit-appearance:none;appearance:none}
 .chip.active{background:#2d161e;color:#e94560;border-color:#e94560}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap;border:0}
 .search-box{flex:1;padding:8px 10px;background:#161b22;border:1px solid #2b323c;border-radius:8px;color:#f0f6fc;font-size:12px}
 .btn{display:inline-block;width:100%;padding:11px;margin:4px 0;border:1px solid transparent;border-radius:8px;font-size:13px;font-weight:600;text-align:center;cursor:pointer;transition:.15s}
 .btn:active{transform:scale(.98)}
@@ -93,25 +94,26 @@ body{background:#0d1117;color:#f0f6fc;font-family:-apple-system,BlinkMacSystemFo
   </div>
 </div>
 <div class="tabs">
-  <div class="tab active" onclick="showPage('scan')">📡 扫描</div>
-  <div class="tab" onclick="showPage('attack')">⚔️ 控制</div>
-  <div class="tab" onclick="showPage('sniff')">📟 抓包</div>
-  <div class="tab" onclick="showPage('config')">⚙️ 设置</div>
+  <button type="button" class="tab active" onclick="showPage('scan')">📡 扫描</button>
+  <button type="button" class="tab" onclick="showPage('attack')">⚔️ 控制</button>
+  <button type="button" class="tab" onclick="showPage('sniff')">📟 抓包</button>
+  <button type="button" class="tab" onclick="showPage('config')">⚙️ 设置</button>
 </div>
 
 <div class="page active" id="page-scan">
   <div class="row">
-    <input class="search-box" id="searchBox" placeholder="搜索 SSID / BSSID..." oninput="renderNetworks()">
+    <label class="sr-only" for="searchBox">搜索 SSID / BSSID</label>
+    <input class="search-box" id="searchBox" aria-label="搜索 SSID / BSSID" placeholder="搜索 SSID / BSSID..." oninput="renderNetworks()">
     <button class="btn btn-info" style="width:auto;padding:8px 14px;margin:0" onclick="doScan()">🔄 扫描双频</button>
   </div>
   <div class="chips">
-    <div class="chip active" id="flt-all" onclick="setBand('ALL')">全部 (0)</div>
-    <div class="chip" id="flt-24" onclick="setBand('2.4G')">2.4G (0)</div>
-    <div class="chip" id="flt-5" onclick="setBand('5G')">5G (0)</div>
-    <div class="chip active" id="srt-rssi" onclick="setSort('RSSI')">信号↓</div>
-    <div class="chip" id="srt-ch" onclick="setSort('CH')">信道↑</div>
-    <div class="chip" onclick="selectAllVisible()">全选</div>
-    <div class="chip" onclick="clearSelection()">清空</div>
+    <button type="button" class="chip active" id="flt-all" onclick="setBand('ALL')">全部 (0)</button>
+    <button type="button" class="chip" id="flt-24" onclick="setBand('2.4G')">2.4G (0)</button>
+    <button type="button" class="chip" id="flt-5" onclick="setBand('5G')">5G (0)</button>
+    <button type="button" class="chip active" id="srt-rssi" onclick="setSort('RSSI')">信号↓</button>
+    <button type="button" class="chip" id="srt-ch" onclick="setSort('CH')">信道↑</button>
+    <button type="button" class="chip" onclick="selectAllVisible()">全选</button>
+    <button type="button" class="chip" onclick="clearSelection()">清空</button>
   </div>
   <div class="loading" id="scanLoading">正在扫描 2.4GHz & 5GHz 频段...</div>
   <div id="netList"></div>
@@ -167,16 +169,16 @@ body{background:#0d1117;color:#f0f6fc;font-family:-apple-system,BlinkMacSystemFo
 </div>
 
 <div class="page" id="page-config">
-  <div class="config-row"><span class="config-label">BLE 蓝牙名称 (1~26B)</span><input class="config-input" type="text" maxlength="26" id="cfgBleName" value="WiFi-Deck"></div>
-  <div class="config-row"><span class="config-label">WiFi 热点名称 (1~32B)</span><input class="config-input" type="text" maxlength="32" id="cfgApSsid" value="WiFi-Deck"></div>
-  <div class="config-row"><span class="config-label">WiFi 热点密码 (8~63位)</span><input class="config-input" type="password" maxlength="63" id="cfgApPass" value="" placeholder="留空表示不修改" autocomplete="new-password"></div>
+  <div class="config-row"><label class="config-label" for="cfgBleName">BLE 蓝牙名称 (1~26B)</label><input class="config-input" type="text" maxlength="26" id="cfgBleName" value="WiFi-Deck"></div>
+  <div class="config-row"><label class="config-label" for="cfgApSsid">WiFi 热点名称 (1~32B)</label><input class="config-input" type="text" maxlength="32" id="cfgApSsid" value="WiFi-Deck"></div>
+  <div class="config-row"><label class="config-label" for="cfgApPass">WiFi 热点密码 (8~63位)</label><input class="config-input" type="password" maxlength="63" id="cfgApPass" value="" placeholder="留空表示不修改" autocomplete="new-password"></div>
   <div style="font-size:11px;color:#8b949e;padding:2px 4px 4px">🔒 当前热点密码不以明文回显；留空保存则维持原密码不变。如需永久关闭热点请改用 BLE App 或串口。</div>
-  <div class="config-row"><span class="config-label">攻击间隔 (100~60000ms)</span><input class="config-input" type="number" min="100" max="60000" id="cfgCycleDelay" value="2000"></div>
-  <div class="config-row"><span class="config-label">扫描时间 (500~30000ms)</span><input class="config-input" type="number" min="500" max="30000" id="cfgScanTime" value="5000"></div>
-  <div class="config-row"><span class="config-label">单次突发帧数 (1~100)</span><input class="config-input" type="number" min="1" max="100" id="cfgNumFrames" value="3"></div>
-  <div class="config-row"><span class="config-label">起始信道 (1 或 36~165)</span><input class="config-input" type="number" min="1" max="165" id="cfgStartChannel" value="1"></div>
-  <div class="config-row"><span class="config-label">循环间重扫</span><select class="config-input" id="cfgScanCycles"><option value="off">关</option><option value="on">开</option></select></div>
-  <div class="config-row"><span class="config-label">板载 LED 指示灯</span><select class="config-input" id="cfgLed"><option value="on">开</option><option value="off">关</option></select></div>
+  <div class="config-row"><label class="config-label" for="cfgCycleDelay">攻击间隔 (100~60000ms)</label><input class="config-input" type="number" min="100" max="60000" id="cfgCycleDelay" value="2000"></div>
+  <div class="config-row"><label class="config-label" for="cfgScanTime">扫描时间 (500~30000ms)</label><input class="config-input" type="number" min="500" max="30000" id="cfgScanTime" value="5000"></div>
+  <div class="config-row"><label class="config-label" for="cfgNumFrames">单次突发帧数 (1~100)</label><input class="config-input" type="number" min="1" max="100" id="cfgNumFrames" value="3"></div>
+  <div class="config-row"><label class="config-label" for="cfgStartChannel">起始信道 (1 或 36~165)</label><input class="config-input" type="number" min="1" max="165" id="cfgStartChannel" value="1"></div>
+  <div class="config-row"><label class="config-label" for="cfgScanCycles">循环间重扫</label><select class="config-input" id="cfgScanCycles"><option value="off">关</option><option value="on">开</option></select></div>
+  <div class="config-row"><label class="config-label" for="cfgLed">板载 LED 指示灯</label><select class="config-input" id="cfgLed"><option value="on">开</option><option value="off">关</option></select></div>
   <button class="btn btn-primary" onclick="saveConfig()">💾 保存配置 (写入 Flash 掉电记忆)</button>
   <button class="btn btn-dark" onclick="resetDefaultConfig()">🔄 恢复出厂默认配置</button>
   <div class="stat-card" style="margin-top:8px"><div class="stat-val" id="cfgUptime">--</div><div class="stat-label">系统运行时间</div></div>

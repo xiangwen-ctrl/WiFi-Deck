@@ -1,14 +1,19 @@
 #include "utils.h"
 #include <ctype.h>
-#include <strings.h>
 
 // ── String helpers ──────────────────────────────────────────
 
 bool startsWithIgnoreCase(const String &s, const char *prefix) {
   if (!prefix) return false;
-  size_t plen = strlen(prefix);
-  if (s.length() < plen) return false;
-  return strncasecmp(s.c_str(), prefix, plen) == 0;
+  const char *str = s.c_str();
+  size_t sLen = s.length();
+  for (size_t i = 0; prefix[i] != '\0'; i++) {
+    if (i >= sLen) return false;
+    if (tolower((unsigned char)str[i]) != tolower((unsigned char)prefix[i])) {
+      return false;
+    }
+  }
+  return true;
 }
 
 // ── MAC helpers ─────────────────────────────────────────────
@@ -126,22 +131,17 @@ size_t jsonEscapeTruncatedToBuf(const char *src, char *out, size_t outSize, size
   if (maxEscapedBytes != (size_t)-1 && maxEscapedBytes < cap) {
     cap = maxEscapedBytes;
   }
-  size_t ellLen = (ellipsis != nullptr) ? strlen(ellipsis) : 0;
+  size_t ellLen = (ellipsis != nullptr) ? boundedStrLen(ellipsis, cap + 1) : 0;
   if (ellLen > cap) ellLen = 0;
 
   const uint8_t *data = (const uint8_t *)src;
-  size_t srcLen = strlen(src);
   size_t i = 0;
   size_t pos = 0;
   size_t lastEllipsisCut = 0;
   bool truncated = false;
 
-  while (i < srcLen) {
+  while (data[i] != 0x00) {
     uint8_t c = data[i];
-    if (c == 0x00) {
-      i++;
-      continue;
-    }
 
     char seqBuf[8];
     size_t seqLen = 0;
@@ -168,7 +168,11 @@ size_t jsonEscapeTruncatedToBuf(const char *src, char *out, size_t outSize, size
       seqBuf[0] = (char)c;
       seqLen = 1;
     } else {
-      size_t utf8Len = validUtf8CharLen(&data[i], srcLen - i);
+      size_t avail = 1;
+      while (avail < 4 && data[i + avail] != 0x00) {
+        avail++;
+      }
+      size_t utf8Len = validUtf8CharLen(&data[i], avail);
       if (utf8Len > 0 && utf8Len <= 4) {
         memcpy(seqBuf, &data[i], utf8Len);
         seqLen = utf8Len;

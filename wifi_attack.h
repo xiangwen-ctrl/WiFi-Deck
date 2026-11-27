@@ -40,7 +40,23 @@ typedef struct {
 //==========================================================
 // Realtek SDK Externs
 //==========================================================
-extern uint8_t* rltk_wlan_info;
+struct RltkWlanInfo {
+  uint8_t *dev;
+  uint8_t reserved[12];
+  uint8_t enable;
+  uint8_t tail[11];
+};
+
+extern "C" RltkWlanInfo rltk_wlan_info[2];
+static_assert(sizeof(void *) != 4 || offsetof(RltkWlanInfo, dev) == 0,
+              "RltkWlanInfo::dev offset must be 0x00 on 32-bit targets");
+static_assert(sizeof(void *) != 4 || offsetof(RltkWlanInfo, enable) == 16,
+              "RltkWlanInfo::enable offset must be 0x10 on 32-bit targets");
+static_assert(sizeof(void *) != 4 || sizeof(RltkWlanInfo) == 28,
+              "RltkWlanInfo size must be 28 bytes on 32-bit targets");
+static_assert(sizeof(void *) != 4 || sizeof(rltk_wlan_info) == 0x38,
+              "rltk_wlan_info[2] size must be 0x38 bytes on 32-bit targets");
+
 extern "C" void* alloc_mgtxmitframe(void* ptr);
 extern "C" void update_mgntframe_attrib(void* ptr, void* frame_control);
 extern "C" int dump_mgntframe(void* ptr, void* frame_control);

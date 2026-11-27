@@ -653,8 +653,8 @@ bool executeCommand(String command, String *errOut, bool fromHttp) {
   }
   else if (command.equalsIgnoreCase("reset_config")) {
     bool apChanged = (strcmp(ap_ssid, DEFAULT_WIFI_SSID) != 0 || strcmp(ap_pass, DEFAULT_WIFI_PASS) != 0);
-    strcpy(ap_ssid, DEFAULT_WIFI_SSID);
-    strcpy(ap_pass, DEFAULT_WIFI_PASS);
+    boundedStrCopy(ap_ssid, sizeof(ap_ssid), DEFAULT_WIFI_SSID);
+    boundedStrCopy(ap_pass, sizeof(ap_pass), DEFAULT_WIFI_PASS);
     updateBleName(DEFAULT_BLE_NAME);
     cycle_delay = 2000;
     scan_time = 5000;

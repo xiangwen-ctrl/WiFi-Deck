@@ -20,7 +20,7 @@ jobs:
         run: python3 tools/pack_webui.py --check
 
       - name: Install arduino-cli
-        uses: arduino/setup-arduino-cli@v2
+        uses: arduino/setup-arduino-cli@b3cda96fddef6af6c56b4c5efb5c47e2357935db # v2
 
       - name: Cache Realtek AmebaD SDK & toolchain
         uses: actions/cache@v4
