@@ -195,7 +195,7 @@ sequenceDiagram
     FW-->>BM: onDescriptorWrite(GATT_SUCCESS)
     BM->>VM: connectionState = CONNECTED
     BM->>FW: sendCommand("info") + sendCommand("results")
-    FW-->>VM: Notify {"t":"cfg","ver":"2.2.0",...} + {"t":"id",...} + {"t":"sync_begin"..."sync_end"}
+    FW-->>VM: Notify {"t":"cfg","ver":"2.2.1",...} + {"t":"id",...} + {"t":"sync_begin"..."sync_end"}
     Note over BM,FW: On unexpected disconnect: 1x 4.5s direct connect -> up to 5x scan fallback
 ```
 
@@ -220,7 +220,7 @@ sequenceDiagram
 ### 烧录固件
 
 **方式一：Windows 一键烧录（无需安装 Arduino IDE）**  
-前往 [GitHub Releases](https://github.com/xiangwen-ctrl/WiFi-Deck/releases/latest) 下载 **`WiFi-Deck-v2.2.0-FlashTool.zip`** 并完整解压，双击 **`一键烧录固件.bat`**：脚本会自动识别 USB 串口，带自动下载电路的 BW16-Kit 直接回车即可免按键自动烧录；旧版开发板或外接串口模块可选模式 `[2]`，按提示**按住板载 `BURN` 键不放 → 短按一下 `RST` 键 → 松开 `BURN` 键**完成烧录。
+前往 [GitHub Releases](https://github.com/xiangwen-ctrl/WiFi-Deck/releases/latest) 下载 **`WiFi-Deck-v2.2.1-FlashTool.zip`** 并完整解压，双击 **`一键烧录固件.bat`**：脚本会自动识别 USB 串口，带自动下载电路的 BW16-Kit 直接回车即可免按键自动烧录；旧版开发板或外接串口模块可选模式 `[2]`，按提示**按住板载 `BURN` 键不放 → 短按一下 `RST` 键 → 松开 `BURN` 键**完成烧录。
 
 **方式二：Arduino IDE / 命令行源码烧录**
 1. Arduino IDE 打开根目录 `WiFi-Deck.ino`，开发板选 **`Ai-Thinker BW16 (RTL8720DN)`**。
@@ -235,7 +235,7 @@ arduino-cli upload -p COM6 --fqbn realtek:AmebaD:Ai-Thinker_BW16:AutoUploadMode=
 
 ### 连接与使用
 
-- **Android 客户端（推荐）**：前往 [GitHub Releases](https://github.com/xiangwen-ctrl/WiFi-Deck/releases/latest) 或 [Gitee Releases](https://gitee.com/xiangwen-ctrl/WiFi-Deck/releases) 下载 **`WiFi-Deck-v2.2.0.apk`** 安装，按提示授予蓝牙/附近设备权限（Android 8–11 需同时开启定位）后在 App 内点顶部连接按钮即可（不用在系统蓝牙里配对，手机可继续上网，也不影响蓝牙耳机）。
+- **Android 客户端（推荐）**：前往 [GitHub Releases](https://github.com/xiangwen-ctrl/WiFi-Deck/releases/latest) 或 [Gitee Releases](https://gitee.com/xiangwen-ctrl/WiFi-Deck/releases) 下载 **`WiFi-Deck-v2.2.1.apk`** 安装，按提示授予蓝牙/附近设备权限（Android 8–11 需同时开启定位）后在 App 内点顶部连接按钮即可（不用在系统蓝牙里配对，手机可继续上网，也不影响蓝牙耳机）。
 - **板载 WebUI**：手机或电脑连上热点（默认名称 **`WiFi-Deck`**，密码 **`12345678`**），浏览器打开 **`http://192.168.1.1`**。
 - **UART 串口**：波特率 `115200`，发 `help` 可看完整命令列表。
 - **本地编译 App 与跑单元测试**：
@@ -369,6 +369,10 @@ set ble_name <name>         set ap_ssid <ssid>          set ap_pass <pass>      
 
 ## 版本记录
 
+- **v2.2.1**：全仓库 SonarQube Cloud 静态分析与安全加固（Quality Gate 通过，Security / Reliability / Maintainability 全 **A**，0 告警）：
+  - **固件 ABI 与边界安全**：按 Realtek `lib_wlan.a` 真实 `56B` 布局定义 `RltkWlanInfo` 结构体并附 32-bit `static_assert` 保护，消除 `rltk_wlan_info` 越界与严格别名风险；将临界区内 6 处 `volatile` 计数器的复合自增/自减改写为显式读-改-写；新增纯 C++11 零堆分配 `boundedStrLen` / `boundedStrCopy`，统一替换全部 30 处 `strcpy` / `strncpy` / `strlen` 并保持热路径零堆设计。
+  - **板载 WebUI 无障碍与语义规范**：将 11 处交互式 Tab / 筛选 Chip 改为原生 `<button type="button">` 并补齐 10 处表单 `<label>` 绑定，同步重新打包 `webui_gz.h` 并通过 `--check` 校验。
+  - **Android 与 CI 供应链加固**：Android 清单显式禁用 `allowBackup` 与 `usesCleartextTraffic` 并升级至 `v2.2.1`（`versionCode = 221`）；启用跨平台兼容的 `AndroidApp/gradle.lockfile` 依赖锁定；将 CI 第三方 GitHub Actions 全部固定至完整 40 位 Commit SHA，新增 `.sonarcloud.properties` 排除自动生成头与构建产物。
 - **v2.2.0**：根治关闭热点（`ap off`）、双频扫描（`scan`）、混杂抓包（`start sniff`）、双频跳频（`hop on`）、`deauth_sniff` 及 5GHz 发包期间 BLE 超时断连（`0x0108`）与无法重连的底层共存顽疾：
   - **WLAN 热模式切换与 PTA 互斥保护**：`enterStaMode()` 与 `startSoftAP()` 改用 SDK 原生 `wifi_set_mode()` 热切换（配合 `dhcps_deinit()`），彻底消除 `wifi_off()` / `wifi_on()` 反复冷重置射频/PTA 引发蓝牙失联的问题；新增基于驱动内部 `[pcoex+8]` 互斥锁的 `CoexMutexGuard` 保护 `enforceBleCoexPta()` / `restoreBleCoex()`，同步恢复 `0x778=0x01`、`0x6c0/0x6c4=0x55555555`、`0x6c8=0x0000FFFF` 并清除 KM0 `H2C 0x60` PS-TDMA 残留，混杂抓包运行于 `RTW_MODE_STA`；
   - **双频分段扫描与 5GHz BLE 保活**：针对 RTL8720DN 单射频共用本振（`RF_0x18`）特性，将双频扫描重构为 16 批次 `wifi_set_pscan_chan(PSCAN_ENABLE)` 分段扫描（所有 5GHz 批次严格限制为 `≤2` 个信道、批次间回切 2.4GHz `CH 1` 留出 `95ms` BLE 喘息窗口）并移除扫描等待循环内的无锁 PTA 写入；双频跳频重构为 `INTERLEAVED_DUAL_BAND_CHANNELS`（`2:1` 5GHz/2.4GHz 交错，单次 5GHz 驻留 `≤700ms`），新增 5GHz 定频抓包/发包期间的 `maintainBle5GHzKeepalive()` 保活窗口；
